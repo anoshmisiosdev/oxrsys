@@ -918,6 +918,50 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
         EncodeWaitForFrameImage(cmdBuf, frameSource.right);
     }
 
+    // Crop each eye out of its swapchain sub-rectangle (subImage.imageRect). UE packs both eyes
+    // side-by-side in one swapchain, so without this both eyes would receive the full [L|R] frame.
+    // The crop target is cached per-eye and only reallocated when size/format actually changes
+    // (session start, or a resolution/foveation reconfigure) -- not on every single frame.
+    {
+        id<MTLDevice> cropDev = queue.device;
+        auto cropEye = [&](id<MTLTexture> tex, const FrameImageSource& src, void** cachedTexture) -> id<MTLTexture> {
+            if (tex == nil || !src.HasSourceRect()) return tex;
+            if (src.sourceX == 0 && src.sourceY == 0 &&
+                src.sourceWidth == (uint32_t)tex.width &&
+                src.sourceHeight == (uint32_t)tex.height) return tex;
+
+            id<MTLTexture> eye = (__bridge id<MTLTexture>)*cachedTexture;
+            if (eye == nil || eye.pixelFormat != tex.pixelFormat ||
+                eye.width != (NSUInteger)src.sourceWidth ||
+                eye.height != (NSUInteger)src.sourceHeight)
+            {
+                if (eye != nil)
+                {
+                    [eye release];
+                }
+                MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:tex.pixelFormat
+                                                                                              width:src.sourceWidth
+                                                                                             height:src.sourceHeight
+                                                                                          mipmapped:NO];
+                d.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+                d.storageMode = MTLStorageModePrivate;
+                eye = [cropDev newTextureWithDescriptor:d];
+                *cachedTexture = (void*)eye;
+            }
+
+            id<MTLBlitCommandEncoder> cb = [cmdBuf blitCommandEncoder];
+            [cb copyFromTexture:tex sourceSlice:0 sourceLevel:0
+                   sourceOrigin:MTLOriginMake(src.sourceX, src.sourceY, 0)
+                     sourceSize:MTLSizeMake(src.sourceWidth, src.sourceHeight, 1)
+                      toTexture:eye destinationSlice:0 destinationLevel:0
+              destinationOrigin:MTLOriginMake(0, 0, 0)];
+            [cb endEncoding];
+            return eye;
+        };
+        leftTex = cropEye(leftTex, frameSource.left, &slot.leftCropTexture);
+        if (stereo) { rightTex = cropEye(rightTex, frameSource.right, &slot.rightCropTexture); }
+    }
+
     bool forceKeyframe = forceKeyframe_.exchange(false);
     const bool useFoveatedEncoding = stereo &&
         foveationSettings_.enabled &&
@@ -1220,6 +1264,16 @@ void VideoEncoder::DestroySlots()
         {
             [(id<MTLTexture>)slot.foveatedScratchTexture release];
             slot.foveatedScratchTexture = nullptr;
+        }
+        if (slot.leftCropTexture != nullptr)
+        {
+            [(id<MTLTexture>)slot.leftCropTexture release];
+            slot.leftCropTexture = nullptr;
+        }
+        if (slot.rightCropTexture != nullptr)
+        {
+            [(id<MTLTexture>)slot.rightCropTexture release];
+            slot.rightCropTexture = nullptr;
         }
         if (slot.metalTexture != nullptr)
         {
