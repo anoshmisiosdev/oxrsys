@@ -935,21 +935,30 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
                 eye.width != (NSUInteger)src.sourceWidth ||
                 eye.height != (NSUInteger)src.sourceHeight)
             {
-                if (eye != nil)
-                {
-                    [eye release];
-                }
                 MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:tex.pixelFormat
                                                                                               width:src.sourceWidth
                                                                                              height:src.sourceHeight
                                                                                           mipmapped:NO];
                 d.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
                 d.storageMode = MTLStorageModePrivate;
-                eye = [cropDev newTextureWithDescriptor:d];
+                id<MTLTexture> newEye = [cropDev newTextureWithDescriptor:d];
+                if (newEye == nil)
+                {
+                    return nil;
+                }
+                if (eye != nil)
+                {
+                    [eye release];
+                }
+                eye = newEye;
                 *cachedTexture = (void*)eye;
             }
 
             id<MTLBlitCommandEncoder> cb = [cmdBuf blitCommandEncoder];
+            if (cb == nil)
+            {
+                return nil;
+            }
             [cb copyFromTexture:tex sourceSlice:0 sourceLevel:0
                    sourceOrigin:MTLOriginMake(src.sourceX, src.sourceY, 0)
                      sourceSize:MTLSizeMake(src.sourceWidth, src.sourceHeight, 1)
@@ -959,7 +968,18 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
             return eye;
         };
         leftTex = cropEye(leftTex, frameSource.left, &slot.leftCropTexture);
-        if (stereo) { rightTex = cropEye(rightTex, frameSource.right, &slot.rightCropTexture); }
+        if (leftTex == nil)
+        {
+            return dropAcquiredSlot("failed to crop left eye texture");
+        }
+        if (stereo)
+        {
+            rightTex = cropEye(rightTex, frameSource.right, &slot.rightCropTexture);
+            if (rightTex == nil)
+            {
+                return dropAcquiredSlot("failed to crop right eye texture");
+            }
+        }
     }
 
     bool forceKeyframe = forceKeyframe_.exchange(false);
