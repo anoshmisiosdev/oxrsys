@@ -16,9 +16,10 @@ This file tracks user-facing, integration-facing, and runtime-relevant changes f
 - Added conservative codec capability negotiation through `ClientConnect.supportedCodecs`, keeping legacy clients H.265-only while allowing H.264-capable clients to opt in.
 - Added H.264 decode support to the Android VR client and shared Apple streaming path, with Android, Apple simulator, and visionOS clients advertising H.264/H.265 while keeping H.265 preferred.
 - Added a codec-aware VideoToolbox decoder for Apple clients, including H.264 SPS/PPS and H.265 VPS/SPS/PPS parameter-set handling.
-- Added an `OXRSYS_VIDEO_ENCODER` CMake option so macOS can use the default VideoToolbox path or an explicit FFmpeg encoder build for codec/pipeline validation.
-- Added a first Linux OpenGL GLX backend through `XR_KHR_opengl_enable`, including OpenGL swapchain image enumeration and bounded FBO/PBO readback into the shared FFmpeg encode path.
-- Added Windows Direct3D 11 and Direct3D 12 runtime backends through `XR_KHR_D3D11_enable` and `XR_KHR_D3D12_enable`, including DXGI swapchain images, bounded readback snapshots, FFmpeg conversion, and loader-backed WARP tests.
+- Added an `OXRSYS_VIDEO_ENCODER` CMake option for `AUTO`, `VIDEOTOOLBOX`, `VAAPI`, `MEDIAFOUNDATION`, and `STUB` runtime encoder builds.
+- Added a Linux VA-API video encoder path for H.264 and H.265 Main 8-bit, with CMake support for system libva development files or fetched libva headers linked against installed runtime libraries.
+- Added a first Linux OpenGL GLX backend through `XR_KHR_opengl_enable`, including OpenGL swapchain image enumeration and bounded FBO/PBO readback into the shared native encode preparation path.
+- Added Windows Direct3D 11 and Direct3D 12 runtime backends through `XR_KHR_D3D11_enable` and `XR_KHR_D3D12_enable`, including DXGI swapchain images, bounded readback snapshots, Media Foundation H.264/H.265 encode, and loader-backed WARP tests.
 - Added loader-backed tests for host graphics extension exposure, including Vulkan everywhere, OpenGL only on Linux builds, and D3D11/D3D12 only on Windows builds.
 - Added protocol v1.2 stream reconfiguration (`StreamConfigUpdate/Ack`) for reliable USB TCP, dynamic encoded-resolution profiles for `abr_mode = "full"`, global passthrough config with app-driven OpenXR alpha blend/source-alpha detection, headset passthrough support/readiness status, occlusion/spatial config gates, a reserved optional spatial TCP channel on `9948`, and matching SwiftUI/Qt Home controls and status display.
 - Added a native USB ADB backend to SwiftUI Home so Quest USB reverse setup can run without Android Studio, the Android SDK, Homebrew, or an `adb` executable.
@@ -36,8 +37,9 @@ This file tracks user-facing, integration-facing, and runtime-relevant changes f
 - Corrected visionOS streamed-video color conversion by defining a BT.709 SDR encoder contract and expanding VideoToolbox limited-range YCbCr with exact 8-bit and 10-bit code ranges before RGB conversion, restoring proper black levels and color balance without changing stream bandwidth.
 
 - Split non-Apple swapchain implementation by backend so Vulkan, Linux OpenGL, D3D11, and D3D12 resources live in separate files behind explicit platform/API guards.
-- Promoted Linux Vulkan/FFmpeg runtime support from scaffolding to Vulkan swapchains, release-time staging readback, H.264/H.265 encode, and backend readback metadata shared by the existing FFmpeg encoder path.
-- Updated Qt simulator video preview with H.264/H.265 decode selection.
+- Replaced the runtime FFmpeg encoder path with platform-native encoders: VideoToolbox on Apple platforms, VA-API on Linux, and Media Foundation on Windows.
+- Promoted Linux Vulkan runtime support from scaffolding to Vulkan swapchains, release-time staging readback, H.264/H.265 encode through VA-API, and backend readback metadata shared by the native encoder preparation path.
+- Updated the Qt simulator to keep tracking-only preview and video packet/loss/FEC counters after removing its FFmpeg decode path.
 - Updated the Quest/PICO shell to keep passthrough active only when global passthrough is enabled and the headset reports `XR_FB_passthrough` support, key app-requested alpha-blend/source-alpha video backgrounds for current AR demo scenes, and keep the black-key fallback when passthrough is active but no alpha flags have arrived yet.
 - Updated SwiftUI Home and Qt Home setup flows with first-launch runtime registration guidance, automatic USB reverse configuration when USB is selected, packaged-runtime manifest preference, and native ADB host-server protocol support before falling back to an external `adb` executable.
 - Updated documentation for video codec selection, Linux Vulkan/OpenGL streaming, protocol v1.2, passthrough/MR, native ADB setup, and visionOS reprojection.

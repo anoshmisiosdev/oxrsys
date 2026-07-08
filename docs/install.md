@@ -26,9 +26,8 @@ Qt frontends need Qt 6 Core, Widgets, and Network. On macOS, the build helper ch
 MacPorts, `QTDIR`, `Qt6_DIR`, and Qt Online Installer layouts under `~/Qt/<version>/<kit>`, such as
 `~/Qt/6.10.2/macos`.
 
-macOS runtime builds use VideoToolbox by default. Install FFmpeg development libraries on macOS
-only if you want to configure the runtime with `-DOXRSYS_VIDEO_ENCODER=FFMPEG` or build the Qt video
-preview path against a Homebrew/MacPorts FFmpeg.
+macOS runtime builds use VideoToolbox for video encode and do not require an external codec
+library.
 
 For the Swift/Xcode applications and Swift package Metal shaders, install the full Xcode app, not only the Command Line Tools. Finish first-launch setup after installing or updating Xcode:
 
@@ -45,33 +44,29 @@ Linux runtime and Qt frontend builds need equivalent distro packages for:
 - CMake, Ninja, and a C++20 compiler
 - Vulkan headers
 - OpenGL, GLX, and X11 development files
-- FFmpeg development libraries: `libavcodec`, `libavutil`, `libswscale`
+- VA-API libraries: `libva` and `libva-drm`
 - pkg-config
 - Qt 6 Core, Widgets, and Network
 - adb / Android Platform Tools for starting an ADB server, logcat, and USB fallback setup
 
-On Fedora with RPM Fusion FFmpeg packages installed, use the matching RPM Fusion
-development package:
+Install the VA-API development package when available. If only the runtime libraries are installed,
+CMake can fetch libva headers and link the system `libva.so.2` and `libva-drm.so.2` libraries.
+
+On Fedora:
 
 ```bash
 sudo dnf install cmake ninja-build gcc-c++ pkgconf-pkg-config \
   vulkan-headers vulkan-loader-devel mesa-libGL-devel libX11-devel \
-  qt6-qtbase-devel android-tools \
-  ffmpeg-devel
+  libva-devel libva-utils qt6-qtbase-devel android-tools
 ```
-
-On Fedora systems that only use Fedora's free FFmpeg package set, use
-`ffmpeg-free-devel` instead of `ffmpeg-devel`.
 
 Windows runtime builds need:
 
 - CMake, Ninja, and a C++20 compiler such as MSVC
-- Windows SDK headers/libraries for Direct3D 11, Direct3D 12, and DXGI
+- Windows SDK headers/libraries for Media Foundation, Direct3D 11, Direct3D 12, and DXGI
 - Vulkan headers
-- FFmpeg development headers and libraries for `libavcodec`, `libavutil`, and `libswscale`
 
-Set `FFMPEG_ROOT` or pass `-DFFMPEG_ROOT=<prefix>` when FFmpeg is not in a standard prefix. Windows
-OpenGL/WGL is not required until that backend is added.
+Windows OpenGL/WGL is not required until that backend is added.
 
 ## Android SDK And NDK
 

@@ -66,12 +66,12 @@ Key outputs in the selected build directory. With the default build these are un
 - `compile_commands.json` symlinked at the project root for editor integration
 
 All third-party C++ dependencies are fetched through CMake `FetchContent`.
-Linux additionally requires system/toolchain packages for Vulkan headers, OpenGL/GLX/X11 development files, FFmpeg development libraries, and pkg-config.
-Windows additionally requires a Windows SDK with Direct3D 11/12 and DXGI headers/libraries, Vulkan
-headers, and FFmpeg development libraries discoverable with `FFMPEG_ROOT`, `FFMPEG_DIR`, or standard
-prefixes.
-macOS uses VideoToolbox by default; FFmpeg development libraries are only required on macOS when
-configuring the runtime with `-DOXRSYS_VIDEO_ENCODER=FFMPEG`.
+Linux additionally requires system/toolchain packages for Vulkan headers, OpenGL/GLX/X11
+development files, VA-API runtime libraries, and pkg-config. The preferred Linux setup installs
+`libva` and `libva-drm` development files; when those headers are unavailable, CMake can fetch
+libva headers only and link the system `libva.so.2` and `libva-drm.so.2` runtime libraries.
+Windows additionally requires a Windows SDK with Media Foundation, Direct3D 11/12, DXGI, and Vulkan
+headers/libraries. macOS uses VideoToolbox by default.
 
 The runtime video encoder can be selected at configure time:
 
@@ -81,40 +81,44 @@ cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DOXRSYS_VIDEO_ENCODER=AUTO
 
 Accepted values are:
 
-- `AUTO`: VideoToolbox on Apple platforms, FFmpeg on Linux and Windows.
+- `AUTO`: VideoToolbox on Apple platforms, VA-API on Linux, and Media Foundation on Windows.
 - `VIDEOTOOLBOX`: Apple platforms only.
-- `FFMPEG`: FFmpeg on Linux and Windows, or an explicit macOS FFmpeg codec/pipeline validation build.
+- `VAAPI`: Linux only.
+- `MEDIAFOUNDATION`: Windows only.
+- `STUB`: compile the runtime without a working video encoder.
 
-When `FFMPEG` is selected, CMake resolves FFmpeg with `pkg-config`, Homebrew-style prefixes, or
-`-DFFMPEG_ROOT=/path/to/prefix`.
-
-macOS Vulkan/MoltenVK validation builds should use the FFmpeg encoder explicitly:
+Linux VA-API dependency resolution is controlled by `OXRSYS_LIBVA_PROVIDER`:
 
 ```bash
-cmake -B build-vulkan-ffmpeg -G Ninja -DCMAKE_BUILD_TYPE=Debug \
-  -DOXRSYS_VIDEO_ENCODER=FFMPEG
-cmake --build build-vulkan-ffmpeg
-ctest --test-dir build-vulkan-ffmpeg --output-on-failure
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug \
+  -DOXRSYS_VIDEO_ENCODER=VAAPI \
+  -DOXRSYS_LIBVA_PROVIDER=AUTO
 ```
+
+Accepted values are `AUTO`, `SYSTEM`, and `FETCH_HEADERS`. `AUTO` uses `pkg-config` for `libva` and
+`libva-drm` when available; otherwise it fetches the libva source tree for headers only and links
+the installed runtime libraries. `SYSTEM` fails if pkg-config cannot resolve the development
+package. `FETCH_HEADERS` skips pkg-config and uses the headers-only fallback directly.
 
 On Linux, the runtime enables both Vulkan and the first OpenGL GLX backend when the required
 development files are present. Vulkan color swapchains are copied to host-visible staging buffers
-for FFmpeg encode. OpenGL color swapchains are snapshotted through FBO/PBO readback slots; depth
-formats are available for application compatibility but are not video sources.
+for the encoder path. OpenGL color swapchains are snapshotted through FBO/PBO readback slots; depth
+formats are available for application compatibility but are not video sources. The VA-API backend
+supports H.264 and H.265 Main 8-bit streams.
 
 On Windows, the runtime builds Vulkan plus Direct3D 11/12 when the Windows SDK, Vulkan headers, and
-FFmpeg development files are available:
+Media Foundation are available:
 
 ```powershell
 cmake -B build-win -G Ninja -DCMAKE_BUILD_TYPE=Debug `
-  -DOXRSYS_VIDEO_ENCODER=FFMPEG `
-  -DFFMPEG_ROOT=C:\path\to\ffmpeg
+  -DOXRSYS_VIDEO_ENCODER=MEDIAFOUNDATION
 cmake --build build-win
 ctest --test-dir build-win --output-on-failure
 ```
 
-The Windows backend exposes Vulkan, D3D11, and D3D12 in this milestone. OpenGL Win32/WGL is not
-advertised yet; Linux remains the only OpenGL runtime backend.
+The Windows backend exposes Vulkan, D3D11, and D3D12 in this milestone and uses Media Foundation for
+H.264/H.265 encode. OpenGL Win32/WGL is not advertised yet; Linux remains the only OpenGL runtime
+backend.
 
 ## Versioning
 
@@ -285,10 +289,9 @@ ctest --test-dir build-qt --output-on-failure
 ```
 
 The standalone targets are `oxrsys-home` and `oxrsys-simulator`. The Qt Home Developer tab opens
-the same shared simulator widget in a dedicated window. FFmpeg development libraries are optional;
-when they are found at configure time, the Qt simulator decodes video into the preview surface,
-otherwise it stays in tracking-only preview mode with an explicit status message. See
-[qt-home.md](platforms/qt-home.md) for Linux registration/install behavior.
+the same shared simulator widget in a dedicated window. The Qt simulator currently stays in
+tracking-only preview mode with video packet, drop, and FEC statistics; platform decoder wiring is a
+future task. See [qt-home.md](platforms/qt-home.md) for Linux registration/install behavior.
 
 ### Unity Editor And macOS Player Helpers
 

@@ -15,9 +15,9 @@
 /**
  * Low-latency video encoder facade.
  *
- * Apple builds use VideoToolbox with Metal textures by default. Linux builds
- * use FFmpeg and keep backend-specific graphics readback state behind
- * GraphicsContext. macOS can opt into FFmpeg for codec/pipeline testing.
+ * Apple builds use VideoToolbox with Metal textures. Windows builds use
+ * Media Foundation, and Linux builds use VA-API when the platform encoder is
+ * enabled. Backend-specific graphics readback state stays behind GraphicsContext.
  */
 class VideoEncoder
 {
@@ -69,6 +69,7 @@ public:
     // Applies before Initialize(); only the H.265 VideoToolbox path supports Main10.
     void SetTenBitEncoding(bool enabled) { tenBit_ = enabled; }
     static bool SupportsFoveatedEncoding(const GraphicsContext& graphicsContext);
+    static bool SupportsCodec(oxr::protocol::VideoCodec codec);
 
     // Encode one backend-native texture/image source.
     // The callback is invoked for each NAL unit produced
@@ -88,10 +89,7 @@ public:
     uint32_t GetBitrateMbps() const { return bitrateMbps_; }
     oxr::protocol::VideoCodec GetCodec() const { return codec_; }
 
-    bool IsInitialized() const
-    {
-        return videoToolbox_.session != nullptr || ffmpeg_.codecContext != nullptr;
-    }
+    bool IsInitialized() const { return initialized_; }
 
     // Stats
     uint32_t GetEncodedFrameCount() const { return frameCount_; }
@@ -130,17 +128,9 @@ private:
         void* foveationSampler = nullptr;  // id<MTLSamplerState>
     };
 
-    struct FfmpegState
-    {
-        void* codecContext = nullptr; // AVCodecContext*
-        void* frame = nullptr;        // AVFrame*
-        void* packet = nullptr;       // AVPacket*
-        void* readbackState = nullptr;
-    };
-
     GraphicsContext graphicsContext_ = {};
     VideoToolboxState videoToolbox_ = {};
-    FfmpegState ffmpeg_ = {};
+    void* platformEncoder_ = nullptr;
 
     uint32_t width_ = 0;       // Total encoded width (may be 2x eye width for stereo)
     uint32_t height_ = 0;
@@ -150,6 +140,7 @@ private:
     oxr::protocol::VideoCodec codec_ = oxr::protocol::VideoCodec::H265;
     FoveationSettings foveationSettings_ = {};
     bool tenBit_ = false;
+    bool initialized_ = false;
     uint32_t frameCount_ = 0;
     std::atomic<bool> forceKeyframe_{false};
     std::atomic<bool> shuttingDown_{false};

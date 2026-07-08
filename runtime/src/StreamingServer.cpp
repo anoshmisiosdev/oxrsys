@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <limits>
 #include <numeric>
+#include <optional>
 #include <system_error>
 #include <thread>
 #include <utility>
@@ -179,8 +180,7 @@ uint32_t VideoCodecCapabilityFlag(oxr::protocol::VideoCodec codec)
 
 bool RuntimeSupportsVideoCodec(oxr::protocol::VideoCodec codec)
 {
-    return codec == oxr::protocol::VideoCodec::H265 ||
-           codec == oxr::protocol::VideoCodec::H264;
+    return VideoEncoder::SupportsCodec(codec);
 }
 
 bool ClientSupportsVideoCodec(const oxr::protocol::ClientConnect& clientConnect,
@@ -202,8 +202,9 @@ oxr::protocol::VideoCodec ParseConfiguredVideoCodec(const std::string& value)
     return oxr::protocol::VideoCodec::H265;
 }
 
-oxr::protocol::VideoCodec SelectVideoCodec(const ConfigValues& config,
-                                           const oxr::protocol::ClientConnect& clientConnect)
+std::optional<oxr::protocol::VideoCodec> SelectVideoCodec(
+    const ConfigValues& config,
+    const oxr::protocol::ClientConnect& clientConnect)
 {
     if (config.videoCodec == "auto")
     {
@@ -212,15 +213,17 @@ oxr::protocol::VideoCodec SelectVideoCodec(const ConfigValues& config,
         {
             return preferred;
         }
-        if (ClientSupportsVideoCodec(clientConnect, oxr::protocol::VideoCodec::H265))
+        if (RuntimeSupportsVideoCodec(oxr::protocol::VideoCodec::H265) &&
+            ClientSupportsVideoCodec(clientConnect, oxr::protocol::VideoCodec::H265))
         {
             return oxr::protocol::VideoCodec::H265;
         }
-        if (ClientSupportsVideoCodec(clientConnect, oxr::protocol::VideoCodec::H264))
+        if (RuntimeSupportsVideoCodec(oxr::protocol::VideoCodec::H264) &&
+            ClientSupportsVideoCodec(clientConnect, oxr::protocol::VideoCodec::H264))
         {
             return oxr::protocol::VideoCodec::H264;
         }
-        return oxr::protocol::VideoCodec::H265;
+        return std::nullopt;
     }
 
     const oxr::protocol::VideoCodec requested = ParseConfiguredVideoCodec(config.videoCodec);
@@ -228,15 +231,17 @@ oxr::protocol::VideoCodec SelectVideoCodec(const ConfigValues& config,
     {
         return requested;
     }
-    if (ClientSupportsVideoCodec(clientConnect, oxr::protocol::VideoCodec::H265))
+    if (RuntimeSupportsVideoCodec(oxr::protocol::VideoCodec::H265) &&
+        ClientSupportsVideoCodec(clientConnect, oxr::protocol::VideoCodec::H265))
     {
         return oxr::protocol::VideoCodec::H265;
     }
-    if (ClientSupportsVideoCodec(clientConnect, oxr::protocol::VideoCodec::H264))
+    if (RuntimeSupportsVideoCodec(oxr::protocol::VideoCodec::H264) &&
+        ClientSupportsVideoCodec(clientConnect, oxr::protocol::VideoCodec::H264))
     {
         return oxr::protocol::VideoCodec::H264;
     }
-    return oxr::protocol::VideoCodec::H265;
+    return std::nullopt;
 }
 
 bool IsGraphicsContextValid(const GraphicsContext& context);
@@ -1696,81 +1701,91 @@ void StreamingServer::HandleClientConnect(const oxr::protocol::ClientConnect& cl
         {
             RenewCallbackAccess();
             const ConfigValues config = Config::Get().GetValues();
-            const oxr::protocol::VideoCodec selectedCodec = SelectVideoCodec(config, clientConnect);
-            if (config.videoCodec != "auto" &&
-                selectedCodec != ParseConfiguredVideoCodec(config.videoCodec))
+            const auto selectedCodecOpt = SelectVideoCodec(config, clientConnect);
+            if (!selectedCodecOpt.has_value())
             {
-                spdlog::warn("StreamingServer: client '{}' does not support configured video_codec='{}'; using {}",
-                             clientName,
-                             config.videoCodec,
-                             VideoCodecName(selectedCodec));
-            }
-            activeVideoCodec_.store(selectedCodec);
-            uint32_t bitrateMbps =
-                (clientConnect.maxBitrateMbps != oxr::protocol::CLIENT_MAX_BITRATE_USE_SERVER_CONFIG)
-                ? std::min(config.bitrateMbps, clientConnect.maxBitrateMbps)
-                : config.bitrateMbps;
-            configMaxBitrateMbps_.store(bitrateMbps);
-            currentBitrateMbps_.store(bitrateMbps);
-            lastKeyframeRequestCountForAbr_ = 0;
-            lastVideoSendDroppedFrameCountForAbr_ = 0;
-            lastEncoderDroppedFrameCountForAbr_ = 0;
-            requestKeyframeTotalForAbr_.store(0);
-            videoSendDroppedFramesTotalForAbr_.store(0);
-            encoderDroppedFramesTotalForAbr_.store(0);
-            abrController_.Reset(oxrsys::streaming_abr::ParseMode(config.abrMode),
-                                 bitrateMbps,
-                                 bitrateMbps,
-                                 config.resolutionScale,
-                                 config.dynamicResolutionMinScale);
-            {
-                std::lock_guard<std::mutex> abrLock(abrStateMutex_);
-                abrModeName_ = oxrsys::streaming_abr::ToString(
-                    oxrsys::streaming_abr::ParseMode(config.abrMode));
-                abrStateName_ = "stable";
-                abrProfileName_ = config.abrMode == "full" ? "balanced" : "bitrate";
-            }
-            const StreamLayoutState layoutState = GetStreamLayoutState();
-            const oxr::protocol::FoveationPreset foveationPreset =
-                layoutState.foveatedEncodingActive
-                    ? ParseFoveationPreset(config.foveatedEncodingPreset)
-                    : oxr::protocol::FoveationPreset::Off;
-            const oxr::protocol::FoveationLayout layout =
-                oxr::protocol::CalculateFoveationLayout(layoutState.foveatedTargetEyeWidth,
-                                                        layoutState.foveatedTargetEyeHeight,
-                                                        foveationPreset);
-            const bool clientSupportsFoveatedEncoding =
-                HasClientCapability(clientConnect, oxr::protocol::CLIENT_CAPABILITY_FOVEATED_ENCODING);
-            clientSupportsFoveatedEncoding_.store(clientSupportsFoveatedEncoding);
-            const bool useFoveatedEncoding =
-                layoutState.foveatedEncodingActive && clientSupportsFoveatedEncoding;
-            clientFoveatedEncodingActive_.store(useFoveatedEncoding);
-            encoder_->SetFoveationSettings(BuildEncoderFoveationSettings(
-                useFoveatedEncoding, layout));
-            const bool useTenBit = config.encoder10Bit &&
-                selectedCodec == oxr::protocol::VideoCodec::H265 &&
-                HasClientCapability(clientConnect, oxr::protocol::CLIENT_CAPABILITY_TEN_BIT_ENCODING);
-            tenBitEncodingActive_.store(useTenBit);
-            encoder_->SetTenBitEncoding(useTenBit);
-            if (layoutState.foveatedEncodingActive && !clientSupportsFoveatedEncoding)
-            {
-                spdlog::warn("StreamingServer: client '{}' did not advertise foveated encoding support; sending reduced normal video",
-                             clientName);
-            }
-            if (encoder_->Initialize(layoutState.encodedWidth, layoutState.encodedHeight, negotiatedRefresh,
-                                     bitrateMbps, graphicsContext_, selectedCodec))
-            {
-                encoder_->ForceKeyframe();
-                frameIndex_ = 0;
-                encoderReady = true;
-                spdlog::info("StreamingServer: Client connected via WiFi: {} ({}:{}) refresh={}Hz codec={}",
-                              clientName, clientIp_, clientPort_, negotiatedRefresh, VideoCodecName(selectedCodec));
-                RuntimeStatus::SetStreaming("wifi", clientName);
+                spdlog::error("StreamingServer: client '{}' has no compatible video codec for this runtime backend",
+                              clientName);
+                encoder_.reset();
             }
             else
             {
-                spdlog::error("StreamingServer: Failed to initialize VideoEncoder");
-                encoder_.reset();
+                const oxr::protocol::VideoCodec selectedCodec = *selectedCodecOpt;
+                if (config.videoCodec != "auto" &&
+                    selectedCodec != ParseConfiguredVideoCodec(config.videoCodec))
+                {
+                    spdlog::warn("StreamingServer: configured video_codec='{}' is not available for client '{}' and this runtime backend; using {}",
+                                 config.videoCodec,
+                                 clientName,
+                                 VideoCodecName(selectedCodec));
+                }
+                activeVideoCodec_.store(selectedCodec);
+                uint32_t bitrateMbps =
+                    (clientConnect.maxBitrateMbps != oxr::protocol::CLIENT_MAX_BITRATE_USE_SERVER_CONFIG)
+                    ? std::min(config.bitrateMbps, clientConnect.maxBitrateMbps)
+                    : config.bitrateMbps;
+                configMaxBitrateMbps_.store(bitrateMbps);
+                currentBitrateMbps_.store(bitrateMbps);
+                lastKeyframeRequestCountForAbr_ = 0;
+                lastVideoSendDroppedFrameCountForAbr_ = 0;
+                lastEncoderDroppedFrameCountForAbr_ = 0;
+                requestKeyframeTotalForAbr_.store(0);
+                videoSendDroppedFramesTotalForAbr_.store(0);
+                encoderDroppedFramesTotalForAbr_.store(0);
+                abrController_.Reset(oxrsys::streaming_abr::ParseMode(config.abrMode),
+                                     bitrateMbps,
+                                     bitrateMbps,
+                                     config.resolutionScale,
+                                     config.dynamicResolutionMinScale);
+                {
+                    std::lock_guard<std::mutex> abrLock(abrStateMutex_);
+                    abrModeName_ = oxrsys::streaming_abr::ToString(
+                        oxrsys::streaming_abr::ParseMode(config.abrMode));
+                    abrStateName_ = "stable";
+                    abrProfileName_ = config.abrMode == "full" ? "balanced" : "bitrate";
+                }
+                const StreamLayoutState layoutState = GetStreamLayoutState();
+                const oxr::protocol::FoveationPreset foveationPreset =
+                    layoutState.foveatedEncodingActive
+                        ? ParseFoveationPreset(config.foveatedEncodingPreset)
+                        : oxr::protocol::FoveationPreset::Off;
+                const oxr::protocol::FoveationLayout layout =
+                    oxr::protocol::CalculateFoveationLayout(layoutState.foveatedTargetEyeWidth,
+                                                            layoutState.foveatedTargetEyeHeight,
+                                                            foveationPreset);
+                const bool clientSupportsFoveatedEncoding =
+                    HasClientCapability(clientConnect, oxr::protocol::CLIENT_CAPABILITY_FOVEATED_ENCODING);
+                clientSupportsFoveatedEncoding_.store(clientSupportsFoveatedEncoding);
+                const bool useFoveatedEncoding =
+                    layoutState.foveatedEncodingActive && clientSupportsFoveatedEncoding;
+                clientFoveatedEncodingActive_.store(useFoveatedEncoding);
+                encoder_->SetFoveationSettings(BuildEncoderFoveationSettings(
+                    useFoveatedEncoding, layout));
+                const bool useTenBit = config.encoder10Bit &&
+                    selectedCodec == oxr::protocol::VideoCodec::H265 &&
+                    HasClientCapability(clientConnect, oxr::protocol::CLIENT_CAPABILITY_TEN_BIT_ENCODING);
+                tenBitEncodingActive_.store(useTenBit);
+                encoder_->SetTenBitEncoding(useTenBit);
+                if (layoutState.foveatedEncodingActive && !clientSupportsFoveatedEncoding)
+                {
+                    spdlog::warn("StreamingServer: client '{}' did not advertise foveated encoding support; sending reduced normal video",
+                                 clientName);
+                }
+                if (encoder_->Initialize(layoutState.encodedWidth, layoutState.encodedHeight, negotiatedRefresh,
+                                         bitrateMbps, graphicsContext_, selectedCodec))
+                {
+                    encoder_->ForceKeyframe();
+                    frameIndex_ = 0;
+                    encoderReady = true;
+                    spdlog::info("StreamingServer: Client connected via WiFi: {} ({}:{}) refresh={}Hz codec={}",
+                                  clientName, clientIp_, clientPort_, negotiatedRefresh, VideoCodecName(selectedCodec));
+                    RuntimeStatus::SetStreaming("wifi", clientName);
+                }
+                else
+                {
+                    spdlog::error("StreamingServer: Failed to initialize VideoEncoder");
+                    encoder_.reset();
+                }
             }
         }
         else
@@ -1854,81 +1869,91 @@ void StreamingServer::HandleUsbClientConnect(const oxr::protocol::ClientConnect&
         {
             RenewCallbackAccess();
             const ConfigValues config = Config::Get().GetValues();
-            const oxr::protocol::VideoCodec selectedCodec = SelectVideoCodec(config, clientConnect);
-            if (config.videoCodec != "auto" &&
-                selectedCodec != ParseConfiguredVideoCodec(config.videoCodec))
+            const auto selectedCodecOpt = SelectVideoCodec(config, clientConnect);
+            if (!selectedCodecOpt.has_value())
             {
-                spdlog::warn("StreamingServer: USB client '{}' does not support configured video_codec='{}'; using {}",
-                             clientName,
-                             config.videoCodec,
-                             VideoCodecName(selectedCodec));
-            }
-            activeVideoCodec_.store(selectedCodec);
-            uint32_t bitrateMbps =
-                (clientConnect.maxBitrateMbps != oxr::protocol::CLIENT_MAX_BITRATE_USE_SERVER_CONFIG)
-                ? std::min(config.bitrateMbps, clientConnect.maxBitrateMbps)
-                : config.bitrateMbps;
-            configMaxBitrateMbps_.store(bitrateMbps);
-            currentBitrateMbps_.store(bitrateMbps);
-            lastKeyframeRequestCountForAbr_ = 0;
-            lastVideoSendDroppedFrameCountForAbr_ = 0;
-            lastEncoderDroppedFrameCountForAbr_ = 0;
-            requestKeyframeTotalForAbr_.store(0);
-            videoSendDroppedFramesTotalForAbr_.store(0);
-            encoderDroppedFramesTotalForAbr_.store(0);
-            abrController_.Reset(oxrsys::streaming_abr::ParseMode(config.abrMode),
-                                 bitrateMbps,
-                                 bitrateMbps,
-                                 config.resolutionScale,
-                                 config.dynamicResolutionMinScale);
-            {
-                std::lock_guard<std::mutex> abrLock(abrStateMutex_);
-                abrModeName_ = oxrsys::streaming_abr::ToString(
-                    oxrsys::streaming_abr::ParseMode(config.abrMode));
-                abrStateName_ = "stable";
-                abrProfileName_ = config.abrMode == "full" ? "balanced" : "bitrate";
-            }
-            const StreamLayoutState layoutState = GetStreamLayoutState();
-            const oxr::protocol::FoveationPreset foveationPreset =
-                layoutState.foveatedEncodingActive
-                    ? ParseFoveationPreset(config.foveatedEncodingPreset)
-                    : oxr::protocol::FoveationPreset::Off;
-            const oxr::protocol::FoveationLayout layout =
-                oxr::protocol::CalculateFoveationLayout(layoutState.foveatedTargetEyeWidth,
-                                                        layoutState.foveatedTargetEyeHeight,
-                                                        foveationPreset);
-            const bool clientSupportsFoveatedEncoding =
-                HasClientCapability(clientConnect, oxr::protocol::CLIENT_CAPABILITY_FOVEATED_ENCODING);
-            clientSupportsFoveatedEncoding_.store(clientSupportsFoveatedEncoding);
-            const bool useFoveatedEncoding =
-                layoutState.foveatedEncodingActive && clientSupportsFoveatedEncoding;
-            clientFoveatedEncodingActive_.store(useFoveatedEncoding);
-            encoder_->SetFoveationSettings(BuildEncoderFoveationSettings(
-                useFoveatedEncoding, layout));
-            const bool useTenBit = config.encoder10Bit &&
-                selectedCodec == oxr::protocol::VideoCodec::H265 &&
-                HasClientCapability(clientConnect, oxr::protocol::CLIENT_CAPABILITY_TEN_BIT_ENCODING);
-            tenBitEncodingActive_.store(useTenBit);
-            encoder_->SetTenBitEncoding(useTenBit);
-            if (layoutState.foveatedEncodingActive && !clientSupportsFoveatedEncoding)
-            {
-                spdlog::warn("StreamingServer: USB client '{}' did not advertise foveated encoding support; sending reduced normal video",
-                             clientName);
-            }
-            if (encoder_->Initialize(layoutState.encodedWidth, layoutState.encodedHeight, negotiatedRefresh,
-                                     bitrateMbps, graphicsContext_, selectedCodec))
-            {
-                encoder_->ForceKeyframe();
-                frameIndex_ = 0;
-                encoderReady = true;
-                spdlog::info("StreamingServer: Client connected via usb_adb: {} refresh={}Hz codec={}",
-                              clientName, negotiatedRefresh, VideoCodecName(selectedCodec));
-                RuntimeStatus::SetStreaming("usb_adb", clientName);
+                spdlog::error("StreamingServer: USB client '{}' has no compatible video codec for this runtime backend",
+                              clientName);
+                encoder_.reset();
             }
             else
             {
-                spdlog::error("StreamingServer: Failed to initialize VideoEncoder for USB ADB");
-                encoder_.reset();
+                const oxr::protocol::VideoCodec selectedCodec = *selectedCodecOpt;
+                if (config.videoCodec != "auto" &&
+                    selectedCodec != ParseConfiguredVideoCodec(config.videoCodec))
+                {
+                    spdlog::warn("StreamingServer: configured video_codec='{}' is not available for USB client '{}' and this runtime backend; using {}",
+                                 config.videoCodec,
+                                 clientName,
+                                 VideoCodecName(selectedCodec));
+                }
+                activeVideoCodec_.store(selectedCodec);
+                uint32_t bitrateMbps =
+                    (clientConnect.maxBitrateMbps != oxr::protocol::CLIENT_MAX_BITRATE_USE_SERVER_CONFIG)
+                    ? std::min(config.bitrateMbps, clientConnect.maxBitrateMbps)
+                    : config.bitrateMbps;
+                configMaxBitrateMbps_.store(bitrateMbps);
+                currentBitrateMbps_.store(bitrateMbps);
+                lastKeyframeRequestCountForAbr_ = 0;
+                lastVideoSendDroppedFrameCountForAbr_ = 0;
+                lastEncoderDroppedFrameCountForAbr_ = 0;
+                requestKeyframeTotalForAbr_.store(0);
+                videoSendDroppedFramesTotalForAbr_.store(0);
+                encoderDroppedFramesTotalForAbr_.store(0);
+                abrController_.Reset(oxrsys::streaming_abr::ParseMode(config.abrMode),
+                                     bitrateMbps,
+                                     bitrateMbps,
+                                     config.resolutionScale,
+                                     config.dynamicResolutionMinScale);
+                {
+                    std::lock_guard<std::mutex> abrLock(abrStateMutex_);
+                    abrModeName_ = oxrsys::streaming_abr::ToString(
+                        oxrsys::streaming_abr::ParseMode(config.abrMode));
+                    abrStateName_ = "stable";
+                    abrProfileName_ = config.abrMode == "full" ? "balanced" : "bitrate";
+                }
+                const StreamLayoutState layoutState = GetStreamLayoutState();
+                const oxr::protocol::FoveationPreset foveationPreset =
+                    layoutState.foveatedEncodingActive
+                        ? ParseFoveationPreset(config.foveatedEncodingPreset)
+                        : oxr::protocol::FoveationPreset::Off;
+                const oxr::protocol::FoveationLayout layout =
+                    oxr::protocol::CalculateFoveationLayout(layoutState.foveatedTargetEyeWidth,
+                                                            layoutState.foveatedTargetEyeHeight,
+                                                            foveationPreset);
+                const bool clientSupportsFoveatedEncoding =
+                    HasClientCapability(clientConnect, oxr::protocol::CLIENT_CAPABILITY_FOVEATED_ENCODING);
+                clientSupportsFoveatedEncoding_.store(clientSupportsFoveatedEncoding);
+                const bool useFoveatedEncoding =
+                    layoutState.foveatedEncodingActive && clientSupportsFoveatedEncoding;
+                clientFoveatedEncodingActive_.store(useFoveatedEncoding);
+                encoder_->SetFoveationSettings(BuildEncoderFoveationSettings(
+                    useFoveatedEncoding, layout));
+                const bool useTenBit = config.encoder10Bit &&
+                    selectedCodec == oxr::protocol::VideoCodec::H265 &&
+                    HasClientCapability(clientConnect, oxr::protocol::CLIENT_CAPABILITY_TEN_BIT_ENCODING);
+                tenBitEncodingActive_.store(useTenBit);
+                encoder_->SetTenBitEncoding(useTenBit);
+                if (layoutState.foveatedEncodingActive && !clientSupportsFoveatedEncoding)
+                {
+                    spdlog::warn("StreamingServer: USB client '{}' did not advertise foveated encoding support; sending reduced normal video",
+                                 clientName);
+                }
+                if (encoder_->Initialize(layoutState.encodedWidth, layoutState.encodedHeight, negotiatedRefresh,
+                                         bitrateMbps, graphicsContext_, selectedCodec))
+                {
+                    encoder_->ForceKeyframe();
+                    frameIndex_ = 0;
+                    encoderReady = true;
+                    spdlog::info("StreamingServer: Client connected via usb_adb: {} refresh={}Hz codec={}",
+                                  clientName, negotiatedRefresh, VideoCodecName(selectedCodec));
+                    RuntimeStatus::SetStreaming("usb_adb", clientName);
+                }
+                else
+                {
+                    spdlog::error("StreamingServer: Failed to initialize VideoEncoder for USB ADB");
+                    encoder_.reset();
+                }
             }
         }
         else

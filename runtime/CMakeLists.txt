@@ -19,15 +19,28 @@ set(OXRSYS_RUNTIME_SOURCES
     src/VulkanDispatch.cpp
 )
 
-set(OXRSYS_VIDEO_ENCODER "AUTO" CACHE STRING "Runtime video encoder: AUTO, VIDEOTOOLBOX, or FFMPEG")
-set_property(CACHE OXRSYS_VIDEO_ENCODER PROPERTY STRINGS AUTO VIDEOTOOLBOX FFMPEG)
+set(OXRSYS_VIDEO_ENCODER "AUTO" CACHE STRING "Runtime video encoder: AUTO, VIDEOTOOLBOX, MEDIAFOUNDATION, VAAPI, or STUB")
+set_property(CACHE OXRSYS_VIDEO_ENCODER PROPERTY STRINGS AUTO VIDEOTOOLBOX MEDIAFOUNDATION VAAPI STUB)
 string(TOUPPER "${OXRSYS_VIDEO_ENCODER}" OXRSYS_VIDEO_ENCODER_NORMALIZED)
-if(NOT OXRSYS_VIDEO_ENCODER_NORMALIZED MATCHES "^(AUTO|VIDEOTOOLBOX|FFMPEG)$")
-    message(FATAL_ERROR "OXRSYS_VIDEO_ENCODER must be AUTO, VIDEOTOOLBOX, or FFMPEG")
+if(NOT OXRSYS_VIDEO_ENCODER_NORMALIZED MATCHES "^(AUTO|VIDEOTOOLBOX|MEDIAFOUNDATION|VAAPI|STUB)$")
+    message(FATAL_ERROR "OXRSYS_VIDEO_ENCODER must be AUTO, VIDEOTOOLBOX, MEDIAFOUNDATION, VAAPI, or STUB")
 endif()
 
-set(OXRSYS_RUNTIME_NEEDS_FFMPEG OFF)
+set(OXRSYS_VIDEO_ENCODER_SELECTED "${OXRSYS_VIDEO_ENCODER_NORMALIZED}")
+if(OXRSYS_VIDEO_ENCODER_SELECTED STREQUAL "AUTO")
+    if(APPLE)
+        set(OXRSYS_VIDEO_ENCODER_SELECTED "VIDEOTOOLBOX")
+    elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        set(OXRSYS_VIDEO_ENCODER_SELECTED "VAAPI")
+    elseif(WIN32)
+        set(OXRSYS_VIDEO_ENCODER_SELECTED "MEDIAFOUNDATION")
+    else()
+        set(OXRSYS_VIDEO_ENCODER_SELECTED "STUB")
+    endif()
+endif()
+
 set(OXRSYS_RUNTIME_ENABLE_OPENGL OFF)
+set(OXRSYS_RUNTIME_NEEDS_VAAPI OFF)
 
 if(APPLE)
     list(APPEND OXRSYS_RUNTIME_SOURCES
@@ -35,40 +48,60 @@ if(APPLE)
         src/SwapchainVulkan.cpp
         src/SwapchainMetal.mm
     )
-    if(OXRSYS_VIDEO_ENCODER_NORMALIZED STREQUAL "FFMPEG")
-        list(APPEND OXRSYS_RUNTIME_SOURCES
-            src/FfmpegVideoEncoder.cpp
-        )
-        set(OXRSYS_RUNTIME_NEEDS_FFMPEG ON)
-    else()
+    if(OXRSYS_VIDEO_ENCODER_SELECTED STREQUAL "VIDEOTOOLBOX")
         list(APPEND OXRSYS_RUNTIME_SOURCES
             src/VideoEncoder.mm
         )
+    elseif(OXRSYS_VIDEO_ENCODER_SELECTED STREQUAL "STUB")
+        list(APPEND OXRSYS_RUNTIME_SOURCES
+            src/StubVideoEncoder.cpp
+        )
+    else()
+        message(FATAL_ERROR "OXRSYS_VIDEO_ENCODER=${OXRSYS_VIDEO_ENCODER_SELECTED} is not supported on Apple platforms")
     endif()
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    if(OXRSYS_VIDEO_ENCODER_NORMALIZED STREQUAL "VIDEOTOOLBOX")
-        message(FATAL_ERROR "OXRSYS_VIDEO_ENCODER=VIDEOTOOLBOX is only supported on Apple platforms")
+    if(OXRSYS_VIDEO_ENCODER_SELECTED STREQUAL "VIDEOTOOLBOX" OR
+       OXRSYS_VIDEO_ENCODER_SELECTED STREQUAL "MEDIAFOUNDATION")
+        message(FATAL_ERROR "OXRSYS_VIDEO_ENCODER=${OXRSYS_VIDEO_ENCODER_SELECTED} is not supported on Linux")
     endif()
     list(APPEND OXRSYS_RUNTIME_SOURCES
         src/SwapchainCommon.cpp
         src/SwapchainVulkan.cpp
         src/SwapchainOpenGL.cpp
-        src/FfmpegVideoEncoder.cpp
     )
-    set(OXRSYS_RUNTIME_NEEDS_FFMPEG ON)
     set(OXRSYS_RUNTIME_ENABLE_OPENGL ON)
+    if(OXRSYS_VIDEO_ENCODER_SELECTED STREQUAL "VAAPI")
+        list(APPEND OXRSYS_RUNTIME_SOURCES
+            src/VideoFramePreparation.cpp
+            src/VaapiVideoEncoder.cpp
+        )
+        set(OXRSYS_RUNTIME_NEEDS_VAAPI ON)
+    else()
+        list(APPEND OXRSYS_RUNTIME_SOURCES
+            src/StubVideoEncoder.cpp
+        )
+    endif()
 elseif(WIN32)
-    if(OXRSYS_VIDEO_ENCODER_NORMALIZED STREQUAL "VIDEOTOOLBOX")
-        message(FATAL_ERROR "OXRSYS_VIDEO_ENCODER=VIDEOTOOLBOX is only supported on Apple platforms")
+    if(OXRSYS_VIDEO_ENCODER_SELECTED STREQUAL "VIDEOTOOLBOX" OR
+       OXRSYS_VIDEO_ENCODER_SELECTED STREQUAL "VAAPI")
+        message(FATAL_ERROR "OXRSYS_VIDEO_ENCODER=${OXRSYS_VIDEO_ENCODER_SELECTED} is not supported on Windows")
     endif()
     list(APPEND OXRSYS_RUNTIME_SOURCES
         src/SwapchainCommon.cpp
         src/SwapchainVulkan.cpp
         src/SwapchainD3D11.cpp
         src/SwapchainD3D12.cpp
-        src/FfmpegVideoEncoder.cpp
     )
-    set(OXRSYS_RUNTIME_NEEDS_FFMPEG ON)
+    if(OXRSYS_VIDEO_ENCODER_SELECTED STREQUAL "MEDIAFOUNDATION")
+        list(APPEND OXRSYS_RUNTIME_SOURCES
+            src/VideoFramePreparation.cpp
+            src/MediaFoundationVideoEncoder.cpp
+        )
+    else()
+        list(APPEND OXRSYS_RUNTIME_SOURCES
+            src/StubVideoEncoder.cpp
+        )
+    endif()
 else()
     message(FATAL_ERROR
         "The ${CMAKE_SYSTEM_NAME} runtime backend is not supported in this pass. "
@@ -92,93 +125,90 @@ set(OXRSYS_RUNTIME_LINK_LIBRARIES
     ${CMAKE_DL_LIBS}
 )
 
-set(FFMPEG_ROOT "" CACHE PATH "Root directory containing FFmpeg include/ and lib/ directories")
-set(OXRSYS_FFMPEG_INCLUDE_DIRS)
+set(OXRSYS_LIBVA_PROVIDER "AUTO" CACHE STRING "Linux VA-API dependency provider: AUTO, SYSTEM, or FETCH_HEADERS")
+set_property(CACHE OXRSYS_LIBVA_PROVIDER PROPERTY STRINGS AUTO SYSTEM FETCH_HEADERS)
+string(TOUPPER "${OXRSYS_LIBVA_PROVIDER}" OXRSYS_LIBVA_PROVIDER_NORMALIZED)
+if(NOT OXRSYS_LIBVA_PROVIDER_NORMALIZED MATCHES "^(AUTO|SYSTEM|FETCH_HEADERS)$")
+    message(FATAL_ERROR "OXRSYS_LIBVA_PROVIDER must be AUTO, SYSTEM, or FETCH_HEADERS")
+endif()
 
-if(OXRSYS_RUNTIME_NEEDS_FFMPEG)
-    set(OXRSYS_FFMPEG_FOUND FALSE)
-    set(OXRSYS_FFMPEG_LIBRARIES)
-
+if(OXRSYS_RUNTIME_NEEDS_VAAPI)
+    set(OXRSYS_VAAPI_TARGET)
     find_package(PkgConfig QUIET)
-    if(PkgConfig_FOUND AND NOT FFMPEG_ROOT AND NOT "$ENV{FFMPEG_ROOT}" AND NOT "$ENV{FFMPEG_DIR}")
-        pkg_check_modules(OXRSYS_FFMPEG_PKG QUIET IMPORTED_TARGET
-            libavcodec
-            libavutil
-            libswscale
+    if(PkgConfig_FOUND AND NOT OXRSYS_LIBVA_PROVIDER_NORMALIZED STREQUAL "FETCH_HEADERS")
+        pkg_check_modules(OXRSYS_VAAPI_PKG QUIET IMPORTED_TARGET
+            libva
+            libva-drm
         )
-        if(OXRSYS_FFMPEG_PKG_FOUND)
-            set(OXRSYS_FFMPEG_FOUND TRUE)
-            set(OXRSYS_FFMPEG_INCLUDE_DIRS ${OXRSYS_FFMPEG_PKG_INCLUDE_DIRS})
-            set(OXRSYS_FFMPEG_LIBRARIES PkgConfig::OXRSYS_FFMPEG_PKG)
-            message(STATUS "Using FFmpeg through pkg-config")
+        if(OXRSYS_VAAPI_PKG_FOUND)
+            set(OXRSYS_VAAPI_TARGET PkgConfig::OXRSYS_VAAPI_PKG)
+            message(STATUS "Using VA-API through pkg-config")
         endif()
     endif()
 
-    set(_oxrsys_ffmpeg_root_hints
-        "${FFMPEG_ROOT}"
-        "$ENV{FFMPEG_ROOT}"
-        "$ENV{FFMPEG_DIR}"
-        "/opt/homebrew"
-        "/usr/local"
-        "/usr"
-    )
-    set(_oxrsys_ffmpeg_include_hints)
-    set(_oxrsys_ffmpeg_library_hints)
-    foreach(_oxrsys_ffmpeg_root IN LISTS _oxrsys_ffmpeg_root_hints)
-        if(_oxrsys_ffmpeg_root)
-            list(APPEND _oxrsys_ffmpeg_include_hints
-                "${_oxrsys_ffmpeg_root}/include"
-            )
-            list(APPEND _oxrsys_ffmpeg_library_hints
-                "${_oxrsys_ffmpeg_root}/lib"
-                "${_oxrsys_ffmpeg_root}/lib/x64"
+    if(NOT OXRSYS_VAAPI_TARGET)
+        if(OXRSYS_LIBVA_PROVIDER_NORMALIZED STREQUAL "SYSTEM")
+            message(FATAL_ERROR "VA-API development files were not found through pkg-config")
+        endif()
+        include(FetchContent)
+        FetchContent_Declare(
+            libva_headers
+            GIT_REPOSITORY https://github.com/intel/libva.git
+            GIT_TAG 2.24.0
+            GIT_SHALLOW ON
+        )
+        FetchContent_GetProperties(libva_headers)
+        if(NOT libva_headers_POPULATED)
+            FetchContent_Populate(libva_headers)
+        endif()
+        find_library(OXRSYS_VA_LIBRARY
+            NAMES va libva.so.2
+            PATHS /usr/lib64 /usr/lib /lib64 /lib
+        )
+        find_library(OXRSYS_VA_DRM_LIBRARY
+            NAMES va-drm libva-drm.so.2
+            PATHS /usr/lib64 /usr/lib /lib64 /lib
+        )
+        if(NOT OXRSYS_VA_LIBRARY OR NOT OXRSYS_VA_DRM_LIBRARY)
+            message(FATAL_ERROR
+                "VA-API runtime libraries were not found. Install libva and libva-drm, "
+                "or install libva development packages so pkg-config can resolve them."
             )
         endif()
-    endforeach()
-
-    if(NOT OXRSYS_FFMPEG_FOUND)
-        find_path(OXRSYS_FFMPEG_INCLUDE_DIR
-            NAMES libavcodec/avcodec.h
-            HINTS ${_oxrsys_ffmpeg_include_hints}
+        set(OXRSYS_LIBVA_GENERATED_INCLUDE_DIR
+            "${CMAKE_CURRENT_BINARY_DIR}/generated/libva/include"
         )
-        find_library(OXRSYS_FFMPEG_AVCODEC_LIBRARY
-            NAMES avcodec
-            HINTS ${_oxrsys_ffmpeg_library_hints}
+        file(MAKE_DIRECTORY "${OXRSYS_LIBVA_GENERATED_INCLUDE_DIR}/va")
+        set(VA_API_MAJOR_VERSION 1)
+        set(VA_API_MINOR_VERSION 24)
+        set(VA_API_MICRO_VERSION 0)
+        set(VA_API_VERSION "1.24.0")
+        configure_file(
+            "${libva_headers_SOURCE_DIR}/va/va_version.h.in"
+            "${OXRSYS_LIBVA_GENERATED_INCLUDE_DIR}/va/va_version.h"
+            @ONLY
         )
-        find_library(OXRSYS_FFMPEG_AVUTIL_LIBRARY
-            NAMES avutil
-            HINTS ${_oxrsys_ffmpeg_library_hints}
+        configure_file(
+            "${libva_headers_SOURCE_DIR}/va/drm/va_drm.h"
+            "${OXRSYS_LIBVA_GENERATED_INCLUDE_DIR}/va/va_drm.h"
+            COPYONLY
         )
-        find_library(OXRSYS_FFMPEG_SWSCALE_LIBRARY
-            NAMES swscale
-            HINTS ${_oxrsys_ffmpeg_library_hints}
+        add_library(oxrsys_vaapi_headers INTERFACE)
+        target_include_directories(oxrsys_vaapi_headers INTERFACE
+            ${OXRSYS_LIBVA_GENERATED_INCLUDE_DIR}
+            ${libva_headers_SOURCE_DIR}
         )
-
-        if(OXRSYS_FFMPEG_INCLUDE_DIR AND
-           OXRSYS_FFMPEG_AVCODEC_LIBRARY AND
-           OXRSYS_FFMPEG_AVUTIL_LIBRARY AND
-           OXRSYS_FFMPEG_SWSCALE_LIBRARY)
-            set(OXRSYS_FFMPEG_FOUND TRUE)
-            set(OXRSYS_FFMPEG_INCLUDE_DIRS "${OXRSYS_FFMPEG_INCLUDE_DIR}")
-            set(OXRSYS_FFMPEG_LIBRARIES
-                "${OXRSYS_FFMPEG_AVCODEC_LIBRARY}"
-                "${OXRSYS_FFMPEG_AVUTIL_LIBRARY}"
-                "${OXRSYS_FFMPEG_SWSCALE_LIBRARY}"
-            )
-            message(STATUS "Using FFmpeg headers from ${OXRSYS_FFMPEG_INCLUDE_DIR}")
-        endif()
-    endif()
-
-    if(NOT OXRSYS_FFMPEG_FOUND)
-        message(FATAL_ERROR
-            "FFmpeg development files were not found. Install FFmpeg with pkg-config "
-            "metadata or set -DFFMPEG_ROOT=<path> to a prefix containing "
-            "include/libavcodec/avcodec.h and avcodec, avutil, swscale libraries."
+        target_link_libraries(oxrsys_vaapi_headers INTERFACE
+            ${OXRSYS_VA_LIBRARY}
+            ${OXRSYS_VA_DRM_LIBRARY}
         )
+        add_library(OXRSYS::VAAPI ALIAS oxrsys_vaapi_headers)
+        set(OXRSYS_VAAPI_TARGET OXRSYS::VAAPI)
+        message(STATUS "Using fetched libva headers with system VA-API runtime libraries")
     endif()
 
     list(APPEND OXRSYS_RUNTIME_LINK_LIBRARIES
-        ${OXRSYS_FFMPEG_LIBRARIES}
+        ${OXRSYS_VAAPI_TARGET}
     )
 endif()
 
@@ -187,6 +217,12 @@ if(WIN32)
         d3d11
         d3d12
         dxgi
+        mf
+        mfplat
+        mfuuid
+        wmcodecdspuuid
+        propsys
+        ole32
         ws2_32
     )
 endif()
@@ -197,12 +233,12 @@ target_include_directories(oxrsys_runtime PRIVATE
     ${openxr_SOURCE_DIR}/include
     ${openxr_SOURCE_DIR}/src/common
     ${Vulkan_INCLUDE_DIRS}
-    ${OXRSYS_FFMPEG_INCLUDE_DIRS}
 )
 
 target_compile_definitions(oxrsys_runtime PRIVATE
     XR_USE_GRAPHICS_API_VULKAN
     OXRSYS_USE_VULKAN
+    OXRSYS_VIDEO_ENCODER_${OXRSYS_VIDEO_ENCODER_SELECTED}
     OXRSYS_VERSION_MAJOR=${OXRSYS_VERSION_MAJOR}
     OXRSYS_VERSION_MINOR=${OXRSYS_VERSION_MINOR}
     OXRSYS_VERSION_PATCH=${OXRSYS_VERSION_PATCH}

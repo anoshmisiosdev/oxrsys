@@ -489,6 +489,12 @@ bool VideoEncoder::SupportsFoveatedEncoding(const GraphicsContext& graphicsConte
     return supported;
 }
 
+bool VideoEncoder::SupportsCodec(oxr::protocol::VideoCodec codec)
+{
+    return codec == oxr::protocol::VideoCodec::H264 ||
+           codec == oxr::protocol::VideoCodec::H265;
+}
+
 bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
                                uint32_t bitrateMbps, const GraphicsContext& graphicsContext,
                                oxr::protocol::VideoCodec codec)
@@ -759,6 +765,7 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
 
     VTCompressionSessionPrepareToEncodeFrames(compressionSession);
     videoToolbox_.session = compressionSession;
+    initialized_ = true;
 
     spdlog::info("VideoEncoder: Initialized {} encoder {}x{} @ {}fps, {}Mbps (slots={}, keyframe={}s, preset={})",
                   VideoCodecName(codec_), width, height, fps, bitrateMbps, SlotCount, keyframeIntervalSec, preset);
@@ -768,6 +775,7 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
 void VideoEncoder::Shutdown()
 {
     shuttingDown_.store(true);
+    initialized_ = false;
 
     if (videoToolbox_.session != nullptr)
     {

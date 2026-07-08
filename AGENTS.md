@@ -7,8 +7,8 @@ client, and Linux-first Qt frontends.
 The repository also includes a native SwiftUI macOS Home app and a Qt Home app for compatible app
 launching, runtime selection, runtime configuration, and runtime registration workflows.
 
-**Current state:** Metal/core runtime, Vulkan interop, Linux Vulkan/FFmpeg streaming,
-first-pass Linux OpenGL GLX backend, Windows Vulkan + Direct3D 11/12 runtime backends,
+**Current state:** Metal/core runtime, Vulkan interop, Linux Vulkan/OpenGL streaming through VA-API,
+Windows Vulkan + Direct3D 11/12 runtime backends with Media Foundation encode,
 typed internal graphics/frame plumbing, release-time Metal streaming snapshots,
 runtime-selectable H.264/H.265 video codecs and negotiated H.265 Main10 streaming,
 portable platform/socket helpers,
@@ -54,9 +54,9 @@ adding a client-side cap.
 The Home app can enable a Developer tab from its Settings tab, open the macOS simulator in a
 same-process window backed by the shared `OXRSysSimulator` Swift package, and show live runtime
 streaming statistics from the existing telemetry path. The Qt Home Developer tab opens the shared
-Qt simulator widget in a dedicated window with UDP video preview, mouse-driven synthetic head
-tracking, simulator-owned vertical FOV sent through tracking eye-FOV metadata, explicit
-FFmpeg-disabled fallback, H.264/H.265 decode selection, frame-loss/FEC status, and keyframe recovery requests.
+Qt simulator widget in a dedicated window with tracking-only preview, video packet/drop/FEC status,
+mouse-driven synthetic head tracking, simulator-owned vertical FOV sent through tracking eye-FOV
+metadata, and keyframe recovery requests.
 The macOS package helper builds the runtime dylib and Home app into one local folder with a complete
 `runtime/` directory; the distribution helper signs that package, creates a combined archive, and can
 submit that archive for notarization with Apple Developer account credentials.
@@ -71,7 +71,7 @@ As of March 17, 2026, the pinned non-interactive OpenXR-CTS baseline is fully gr
 - **Always build and verify before declaring success** — run the macOS build + tests and/or Android build as appropriate before saying everything works
 - **Always update `README.md`, `AGENTS.md`, and the relevant files in `docs/` when making significant project changes**
 - Keep SwiftUI Home and Qt Home companion behavior in sync when changing shared Home workflows; only diverge for frontend-specific changes or when the user explicitly asks for a feature to be limited to one frontend.
-- Core C++ dependencies are fetched via CMake FetchContent; Qt, FFmpeg, Vulkan SDKs, and platform SDKs are system/toolchain dependencies.
+- Core C++ dependencies are fetched via CMake FetchContent; Qt, Vulkan SDKs, VA-API runtime/development files on Linux, and platform SDKs are system/toolchain dependencies.
 - Product versions are centralized in `config/OXRSysVersion.xcconfig`; do not hardcode
   marketing versions or build numbers in CMake, Xcode, Gradle, or native client code.
 - Commit messages must read naturally, must not mention Codex, and must never include `[codex]`.
@@ -101,13 +101,14 @@ Avoid duplicating the same guidance in multiple files. If commands, platform sta
 - Metal streaming must snapshot dynamic swapchain images through the app-provided command queue and GPU-side shared-event waits; if no staging slot is safe to reuse, drop that streaming frame instead of reading a live reused swapchain slot.
 - Vulkan streaming must snapshot released color swapchain layers through app-dispatched Vulkan functions into bounded host-visible staging buffers; wait/map/conversion belongs to the encoder path, not `Session::EndFrame()`.
 - Linux OpenGL streaming is GLX/Xlib-only for now and must use bounded FBO/PBO readback; macOS must not advertise `XR_KHR_opengl_enable` because the extension has no standard CGL binding.
-- Windows D3D11/D3D12 streaming must keep Direct3D headers and code behind Windows-only preprocessor guards; snapshots may enqueue GPU copies during swapchain release, but fence waits, mapping, conversion, and encode must stay outside `Session::EndFrame()`.
+- Linux VA-API streaming supports H.264 and H.265 Main 8-bit; VA surface upload, encode submission, waits, mapping, and encoded-buffer copies must stay outside `Session::EndFrame()`.
+- Windows D3D11/D3D12 streaming must keep Direct3D and Media Foundation headers/code behind Windows-only preprocessor guards; snapshots may enqueue GPU copies during swapchain release, but fence waits, mapping, conversion, and encode must stay outside `Session::EndFrame()`.
 - Quest USB streaming uses reconnecting ADB reverse TCP on localhost ports `9944`, `9945`, `9946`, and the reserved reliable spatial port `9948`; app-level Android USB permission dialogs are only for `UsbManager`-visible devices and are not required for ADB reverse streaming.
 - Home USB setup should prefer the native ADB host-server protocol on `127.0.0.1:5037` when available, fall back to a selected or auto-detected `adb` executable only when needed, and configure missing reverse mappings automatically when the user selects USB.
 - Quest USB TCP sockets must keep bounded send behavior; failed video sends must clear stale TCP dispatch state and must not block the encoded-frame sender, VideoToolbox callback, or `Session::EndFrame()`.
 - Encoded video dispatch is latest-frame-oriented and bounded; stale queued frames may be dropped instead of building latency when the transport cannot keep up.
 - The advertised per-eye render resolution comes from the `render_device` preset (quest2/quest3/avp). It is fixed when the app queries view configs (before any client connects), so it is a server-config choice, not per-client automatic; `resolution_scale` is a separate encode-only downscale (also driven by ABR), not a render-target change.
-- Video codec negotiation must stay conservative: `ClientConnect.supportedCodecs = 0` means a legacy H.265-only client, H.265 remains the default, and H.264 must only be selected for clients that explicitly advertise H.264 support.
+- Video codec negotiation must stay conservative and respect the compiled encoder backend: `ClientConnect.supportedCodecs = 0` means a legacy H.265-only client, H.265 remains the default where the backend supports it, and H.264 must only be selected for clients that explicitly advertise H.264 support.
 - 10-bit streaming is HEVC Main10 only: enable it only for H.265 when `encoder_10bit` is configured and the client advertises `CLIENT_CAPABILITY_TEN_BIT_ENCODING`; H.264 and legacy clients must remain 8-bit.
 - Apple VideoToolbox streams use a BT.709 SDR, limited-range YCbCr color contract. Keep encoder metadata and client conversion aligned, including exact normalized code ranges for 8-bit and 10-bit bi-planar decoder surfaces.
 - `ServerAnnounce.clientSharpeningPercent` (0-100, a repurposed reserved slot) carries the headset sharpen strength from the server's `client_sharpening` config; the visionOS client applies it as a display-space contrast-adaptive sharpen pass. Keep the C++/Swift announce layout in sync (ProtocolLayoutTests).
@@ -221,7 +222,7 @@ cmake -B build-qt -G Ninja -DCMAKE_BUILD_TYPE=Debug -DOXRSYS_BUILD_QT_FRONTENDS=
 cmake --build build-qt
 ctest --test-dir build-qt --output-on-failure
 
-cmake -B build-win -G Ninja -DCMAKE_BUILD_TYPE=Debug -DOXRSYS_VIDEO_ENCODER=FFMPEG -DFFMPEG_ROOT=<ffmpeg-prefix>
+cmake -B build-win -G Ninja -DCMAKE_BUILD_TYPE=Debug -DOXRSYS_VIDEO_ENCODER=MEDIAFOUNDATION
 cmake --build build-win
 ctest --test-dir build-win --output-on-failure
 ```

@@ -33,22 +33,20 @@ The viewer connects to the runtime as a streaming client, using the same UDP pro
 `Simulator` mode:
 
 - Discovers the runtime via UDP broadcast (port 9943)
-- Receives encoded video frames and decodes them locally
+- Receives encoded video frames; Apple simulator/viewer targets decode them locally
 - Captures keyboard and mouse input and sends simulated tracking data to the runtime
 - Displays a single-eye preview across the full screen
 
-The Qt simulator uses the same UDP discovery, video, control, and tracking ports. With FFmpeg
-development libraries available at build time, the Qt widget advertises H.265 and H.264 support and
-decodes the selected stream into its preview surface. That surface is also the interaction target
-for click, drag, scroll, keyboard focus, and mouse capture. If no decoded frame is available yet, it
-shows a synthetic pose preview with a `Waiting for video` status. If FFmpeg was not enabled, it
-shows `Video preview unavailable: FFmpeg support was not enabled` and keeps synthetic tracking
-available.
+The Qt simulator uses the same UDP discovery, video, control, and tracking ports. It currently keeps
+a tracking-only preview surface with an `Encoded video preview unavailable` status while still
+receiving video packets for packet/drop/FEC counters. That surface remains the interaction target
+for click, drag, scroll, keyboard focus, and mouse capture. Platform decoder wiring for the Qt
+simulator is follow-up work now that the runtime uses native platform encoders.
 
 The Qt video path uses an internal UDP frame assembler with duplicate-packet filtering, partial-frame
 timeouts, existing XOR FEC recovery, dropped-frame counters, and keyframe requests after repeated
-loss or decode failures. After a successful decode, the Qt client sends the existing latency report
-with receive-to-submit, decode, compositor `0`, and total client latency fields.
+loss. Decoded-frame latency reports are not sent by the Qt simulator until a platform decoder path is
+attached.
 
 The settings sheet also lets you:
 

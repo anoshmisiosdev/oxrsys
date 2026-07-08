@@ -40,7 +40,7 @@ keyframe_interval_sec = 2
 
 # Video codec: "h265", "h264", or "auto".
 # H.265 remains the default for headset compatibility; H.264 is useful for
-# FFmpeg/Qt simulator validation and clients that advertise H.264 support.
+# clients that advertise H.264 support. Linux VA-API supports H.264 and H.265 Main.
 video_codec = "h265"
 
 # Encoder speed preset: "quality", "balanced", "speed"

@@ -15,13 +15,6 @@
 
 #include <oxrsys/protocol/Protocol.h>
 
-#if OXRSYS_QT_SIMULATOR_HAS_FFMPEG
-struct AVCodecContext;
-struct AVFrame;
-struct AVPacket;
-struct SwsContext;
-#endif
-
 class QLabel;
 class QPushButton;
 class QSlider;
@@ -89,11 +82,6 @@ private:
                            int64_t decodeStartNs,
                            int64_t decodeEndNs);
     int64_t monotonicNowNs() const;
-#if OXRSYS_QT_SIMULATOR_HAS_FFMPEG
-    bool ensureVideoDecoder(oxr::protocol::VideoCodec codec);
-    void resetVideoDecoder();
-    bool decodeVideoFrame(const AssembledVideoFrame& frame);
-#endif
     void setMouseCaptured(bool captured);
     void toggleMouseCaptured();
     void accumulateMouseDelta(const QPointF& delta);
@@ -130,13 +118,6 @@ private:
     int consecutiveDecodeErrors_ = 0;
     uint64_t lastKeyframeRequestTimeNs_ = 0;
     VideoFrameAssembler videoAssembler_;
-#if OXRSYS_QT_SIMULATOR_HAS_FFMPEG
-    AVCodecContext* videoDecoder_ = nullptr;
-    AVFrame* decodedFrame_ = nullptr;
-    AVPacket* decodePacket_ = nullptr;
-    SwsContext* swsContext_ = nullptr;
-    oxr::protocol::VideoCodec decoderCodec_ = oxr::protocol::VideoCodec::H265;
-#endif
     QElapsedTimer poseClock_;
     QSet<int> pressedKeys_;
     QPointF lastMousePosition_;

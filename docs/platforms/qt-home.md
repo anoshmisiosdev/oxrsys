@@ -22,8 +22,7 @@ Current responsibilities:
 - register the selected OpenXR runtime on Linux through `${XDG_CONFIG_HOME:-~/.config}/openxr/1/active_runtime.json`
 - launch apps with the manually selected runtime manifest
 - open the shared Qt simulator widget from the Developer tab in a reusable `1280x720` window,
-  including H.265/H.264 video preview when FFmpeg is available and mouse-driven synthetic head
-  tracking
+  including video packet/drop/FEC counters and mouse-driven synthetic head tracking
 
 Build with the top-level CMake project:
 

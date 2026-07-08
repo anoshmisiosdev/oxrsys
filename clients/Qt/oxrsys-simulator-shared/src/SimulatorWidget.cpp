@@ -24,16 +24,6 @@
 #include <QVBoxLayout>
 #include <QWheelEvent>
 
-#if OXRSYS_QT_SIMULATOR_HAS_FFMPEG
-extern "C"
-{
-#include <libavcodec/avcodec.h>
-#include <libavutil/error.h>
-#include <libavutil/imgutils.h>
-#include <libswscale/swscale.h>
-}
-#endif
-
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -62,48 +52,6 @@ QString platformSimulatorDeviceName()
     return "OXRSys Qt Simulator";
 #endif
 }
-
-QString ffmpegErrorString(int error)
-{
-#if OXRSYS_QT_SIMULATOR_HAS_FFMPEG
-    char buffer[AV_ERROR_MAX_STRING_SIZE] = {};
-    av_strerror(error, buffer, sizeof(buffer));
-    return QString::fromUtf8(buffer);
-#else
-    Q_UNUSED(error);
-    return "FFmpeg support is not enabled";
-#endif
-}
-
-#if OXRSYS_QT_SIMULATOR_HAS_FFMPEG
-AVCodecID avCodecId(oxr::protocol::VideoCodec codec)
-{
-    switch (codec)
-    {
-        case oxr::protocol::VideoCodec::H264:
-            return AV_CODEC_ID_H264;
-        case oxr::protocol::VideoCodec::H265:
-            return AV_CODEC_ID_HEVC;
-        case oxr::protocol::VideoCodec::AV1:
-        default:
-            return AV_CODEC_ID_NONE;
-    }
-}
-
-QString videoCodecDisplayName(oxr::protocol::VideoCodec codec)
-{
-    switch (codec)
-    {
-        case oxr::protocol::VideoCodec::H264:
-            return "H.264";
-        case oxr::protocol::VideoCodec::AV1:
-            return "AV1";
-        case oxr::protocol::VideoCodec::H265:
-        default:
-            return "H.265";
-    }
-}
-#endif
 
 QLabel* makeSecondaryLabel(const QString& text, QWidget* parent)
 {
@@ -378,9 +326,6 @@ SimulatorWidget::~SimulatorWidget()
 {
     trackingTimer_->stop();
     disconnectFromRuntime();
-#if OXRSYS_QT_SIMULATOR_HAS_FFMPEG
-    resetVideoDecoder();
-#endif
 }
 
 QString SimulatorWidget::stateText() const
@@ -809,23 +754,7 @@ void SimulatorWidget::updatePreviewStatus()
         return;
     }
 
-    QString status;
-#if !OXRSYS_QT_SIMULATOR_HAS_FFMPEG
-    status = "Video preview unavailable: FFmpeg support was not enabled";
-#else
-    if (state_ == State::Streaming && videoFramesDecoded_ == 0)
-    {
-        status = "Waiting for video";
-    }
-    else if (videoFramesDecoded_ > 0)
-    {
-        status = "Video";
-    }
-    else
-    {
-        status = "Waiting for video";
-    }
-#endif
+    const QString status = "Encoded video preview unavailable";
     previewWidget_->setStatusOverlay(status,
                                      videoPacketsReceived_,
                                      videoFramesDecoded_,
@@ -875,17 +804,10 @@ float SimulatorWidget::simulatorPerEyeAspect() const
 
 bool SimulatorWidget::startVideoReceiver()
 {
-#if !OXRSYS_QT_SIMULATOR_HAS_FFMPEG
-    videoAssembler_.reset();
-    videoPacketsReceived_ = 0;
-    videoFramesDecoded_ = 0;
-    videoFramesDropped_ = 0;
-    videoFecRecoveries_ = 0;
-    decodeErrors_ = 0;
-    updatePreviewStatus();
-    return true;
-#else
-    stopVideoReceiver();
+    if (videoSocket_ != nullptr)
+    {
+        videoSocket_->close();
+    }
     videoAssembler_.reset();
     videoPacketsReceived_ = 0;
     videoFramesDecoded_ = 0;
@@ -908,8 +830,7 @@ bool SimulatorWidget::startVideoReceiver()
                      .arg(videoSocket_->errorString()));
         return false;
     }
-    return ensureVideoDecoder(oxr::protocol::VideoCodec::H265);
-#endif
+    return true;
 }
 
 void SimulatorWidget::stopVideoReceiver()
@@ -931,9 +852,6 @@ void SimulatorWidget::stopVideoReceiver()
     consecutiveDecodeErrors_ = 0;
     lastKeyframeRequestTimeNs_ = 0;
     updatePreviewStatus();
-#if OXRSYS_QT_SIMULATOR_HAS_FFMPEG
-    resetVideoDecoder();
-#endif
 }
 
 void SimulatorWidget::handleVideoPacket(const oxr::protocol::VideoPacketHeader& header,
@@ -963,27 +881,7 @@ void SimulatorWidget::processAssembledVideoFrames(const QList<AssembledVideoFram
 
     for (const AssembledVideoFrame& frame : frames)
     {
-#if OXRSYS_QT_SIMULATOR_HAS_FFMPEG
-        const int64_t decodeStartNs = monotonicNowNs();
-        if (decodeVideoFrame(frame))
-        {
-            consecutiveDecodeErrors_ = 0;
-            sendLatencyReport(frame, decodeStartNs, monotonicNowNs());
-        }
-        else
-        {
-            ++decodeErrors_;
-            ++consecutiveDecodeErrors_;
-            if (consecutiveDecodeErrors_ >= 3)
-            {
-                sendKeyframeRequest(oxr::protocol::KEYFRAME_REASON_DECODE_STALL,
-                                    static_cast<uint32_t>(consecutiveDecodeErrors_));
-                consecutiveDecodeErrors_ = 0;
-            }
-        }
-#else
         Q_UNUSED(frame);
-#endif
     }
     updatePreviewStatus();
 }
@@ -1047,154 +945,6 @@ int64_t SimulatorWidget::monotonicNowNs() const
                clock::now().time_since_epoch())
         .count();
 }
-
-#if OXRSYS_QT_SIMULATOR_HAS_FFMPEG
-bool SimulatorWidget::ensureVideoDecoder(oxr::protocol::VideoCodec codec)
-{
-    if (videoDecoder_ != nullptr && decoderCodec_ == codec)
-    {
-        return true;
-    }
-    if (videoDecoder_ != nullptr)
-    {
-        resetVideoDecoder();
-    }
-
-    const AVCodecID codecId = avCodecId(codec);
-    if (codecId == AV_CODEC_ID_NONE)
-    {
-        setState(State::Discovered, videoCodecDisplayName(codec) + " decoder is not supported");
-        return false;
-    }
-
-    const AVCodec* avCodec = avcodec_find_decoder(codecId);
-    if (avCodec == nullptr)
-    {
-        setState(State::Discovered, videoCodecDisplayName(codec) + " decoder not found");
-        return false;
-    }
-
-    decoderCodec_ = codec;
-    videoDecoder_ = avcodec_alloc_context3(avCodec);
-    decodedFrame_ = av_frame_alloc();
-    decodePacket_ = av_packet_alloc();
-    if (videoDecoder_ == nullptr || decodedFrame_ == nullptr || decodePacket_ == nullptr)
-    {
-        resetVideoDecoder();
-        setState(State::Discovered, "Failed to allocate video decoder");
-        return false;
-    }
-
-    const int result = avcodec_open2(videoDecoder_, avCodec, nullptr);
-    if (result < 0)
-    {
-        const QString error = ffmpegErrorString(result);
-        resetVideoDecoder();
-        setState(State::Discovered, "Failed to open " + videoCodecDisplayName(codec) + " decoder: " + error);
-        return false;
-    }
-    return true;
-}
-
-void SimulatorWidget::resetVideoDecoder()
-{
-    if (swsContext_ != nullptr)
-    {
-        sws_freeContext(swsContext_);
-        swsContext_ = nullptr;
-    }
-    if (decodePacket_ != nullptr)
-    {
-        av_packet_free(&decodePacket_);
-    }
-    if (decodedFrame_ != nullptr)
-    {
-        av_frame_free(&decodedFrame_);
-    }
-    if (videoDecoder_ != nullptr)
-    {
-        avcodec_free_context(&videoDecoder_);
-    }
-    decoderCodec_ = oxr::protocol::VideoCodec::H265;
-}
-
-bool SimulatorWidget::decodeVideoFrame(const AssembledVideoFrame& frame)
-{
-    if (!ensureVideoDecoder(frame.codec) || frame.nalUnit.isEmpty())
-    {
-        return false;
-    }
-
-    av_packet_unref(decodePacket_);
-    const int packetResult = av_new_packet(decodePacket_, static_cast<int>(frame.nalUnit.size()));
-    if (packetResult < 0)
-    {
-        return false;
-    }
-    std::memcpy(decodePacket_->data,
-                frame.nalUnit.constData(),
-                static_cast<size_t>(frame.nalUnit.size()));
-    decodePacket_->pts = frame.presentationTimeNs;
-
-    const int sendResult = avcodec_send_packet(videoDecoder_, decodePacket_);
-    av_packet_unref(decodePacket_);
-    if (sendResult < 0)
-    {
-        return false;
-    }
-
-    bool decodedAnyFrame = false;
-    while (true)
-    {
-        const int receiveResult = avcodec_receive_frame(videoDecoder_, decodedFrame_);
-        if (receiveResult == AVERROR(EAGAIN) || receiveResult == AVERROR_EOF)
-        {
-            break;
-        }
-        if (receiveResult < 0)
-        {
-            return decodedAnyFrame;
-        }
-
-        QImage image(decodedFrame_->width, decodedFrame_->height, QImage::Format_RGB888);
-        uint8_t* destinationData[4] = {image.bits(), nullptr, nullptr, nullptr};
-        int destinationLinesize[4] = {static_cast<int>(image.bytesPerLine()), 0, 0, 0};
-        swsContext_ = sws_getCachedContext(swsContext_,
-                                            decodedFrame_->width,
-                                            decodedFrame_->height,
-                                            static_cast<AVPixelFormat>(decodedFrame_->format),
-                                            decodedFrame_->width,
-                                            decodedFrame_->height,
-                                            AV_PIX_FMT_RGB24,
-                                            SWS_BILINEAR,
-                                            nullptr,
-                                            nullptr,
-                                            nullptr);
-        if (swsContext_ == nullptr)
-        {
-            av_frame_unref(decodedFrame_);
-            return decodedAnyFrame;
-        }
-
-        sws_scale(swsContext_,
-                  decodedFrame_->data,
-                  decodedFrame_->linesize,
-                  0,
-                  decodedFrame_->height,
-                  destinationData,
-                  destinationLinesize);
-
-        if (previewWidget_ != nullptr)
-        {
-            previewWidget_->setVideoFrame(image.copy());
-        }
-        ++videoFramesDecoded_;
-        decodedAnyFrame = true;
-        av_frame_unref(decodedFrame_);
-    }
-    return decodedAnyFrame;
-}
-#endif
 
 void SimulatorWidget::setMouseCaptured(bool captured)
 {

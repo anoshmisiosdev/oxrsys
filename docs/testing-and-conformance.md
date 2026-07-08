@@ -78,12 +78,12 @@ Before considering a change ready:
 
 - run the macOS build and tests
 - run the Linux/Qt build on a Linux host when touching Linux runtime or Qt frontend code
-- manually validate Vulkan streaming on Linux or MoltenVK when touching Vulkan readback or FFmpeg
-  conversion, including H.264 and H.265
+- manually validate Vulkan streaming on Linux or MoltenVK when touching Vulkan readback or encoder
+  conversion; Linux VA-API covers H.264 and H.265 Main 8-bit
 - manually validate OpenGL GLX streaming on Linux when touching `XR_KHR_opengl_enable`,
   OpenGL swapchains, or PBO readback
 - manually validate D3D11 and D3D12 streaming on Windows hardware or WARP when touching Direct3D
-  swapchains, readback, FFmpeg conversion, or Windows graphics extension exposure
+  swapchains, readback, Media Foundation conversion, or Windows graphics extension exposure
 - run the Home Swift test runner when changing the Home launcher, preferences, or server config helpers
 - run the Android build if Android code changed
 - run the CTS lane when runtime API, extension behavior, swapchain handling, action handling, or conformance-sensitive behavior changed
