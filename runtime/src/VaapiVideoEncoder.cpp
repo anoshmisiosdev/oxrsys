@@ -3,6 +3,7 @@
 #include "VideoEncoder.h"
 
 #include "Config.h"
+#include "VideoBitstream.h"
 #include "VideoFramePreparation.h"
 
 #include <spdlog/spdlog.h>
@@ -15,6 +16,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <iterator>
@@ -128,6 +130,10 @@ struct VaapiEncoderState
     uint32_t bitrateMbps = 0;
     uint32_t frameIndex = 0;
     uint32_t keyframeInterval = 1;
+    bool hasReference = false;
+    VASurfaceID lastReconSurface = InvalidSurface;
+    uint32_t lastReferenceFrameIndex = 0;
+    int32_t lastReferencePoc = 0;
     oxr::protocol::VideoCodec codec = oxr::protocol::VideoCodec::H264;
     VideoFramePreparer preparer;
     PreparedVideoFrame preparedFrame;
@@ -218,15 +224,21 @@ bool HasEntrypoint(VADisplay display, VAProfile profile, VAEntrypoint entrypoint
 
 bool OpenVaDisplay(VaapiEncoderState& state)
 {
-    static constexpr const char* DevicePaths[] = {
-        "/dev/dri/renderD128",
-        "/dev/dri/renderD129",
-        "/dev/dri/card0",
-    };
-
-    for (const char* path : DevicePaths)
+    std::vector<std::string> devicePaths;
+    if (const char* overridePath = std::getenv("OXRSYS_VAAPI_DRM_DEVICE");
+        overridePath != nullptr && overridePath[0] != '\0')
     {
-        int fd = open(path, O_RDWR | O_CLOEXEC);
+        devicePaths.emplace_back(overridePath);
+    }
+    for (int index = 128; index < 144; ++index)
+    {
+        devicePaths.push_back("/dev/dri/renderD" + std::to_string(index));
+    }
+    devicePaths.emplace_back("/dev/dri/card0");
+
+    for (const std::string& path : devicePaths)
+    {
+        int fd = open(path.c_str(), O_RDWR | O_CLOEXEC);
         if (fd < 0)
         {
             continue;
@@ -492,7 +504,7 @@ bool EncodeH264Frame(VaapiEncoderState& state,
     }
 
     const bool keyframe =
-        forceKeyframe || state.frameIndex == 0 ||
+        forceKeyframe || state.frameIndex == 0 || !state.hasReference ||
         (state.keyframeInterval > 0 && (state.frameIndex % state.keyframeInterval) == 0);
     const uint16_t mbWidth = static_cast<uint16_t>((state.width + 15u) / 16u);
     const uint16_t mbHeight = static_cast<uint16_t>((state.height + 15u) / 16u);
@@ -534,6 +546,12 @@ bool EncodeH264Frame(VaapiEncoderState& state,
     pic.CurrPic.frame_idx = frameNum;
     pic.CurrPic.flags = VA_PICTURE_H264_SHORT_TERM_REFERENCE;
     FillInvalidReferences(pic.ReferenceFrames, std::size(pic.ReferenceFrames));
+    if (!keyframe && state.lastReconSurface != InvalidSurface)
+    {
+        pic.ReferenceFrames[0].picture_id = state.lastReconSurface;
+        pic.ReferenceFrames[0].frame_idx = state.lastReferenceFrameIndex;
+        pic.ReferenceFrames[0].flags = VA_PICTURE_H264_SHORT_TERM_REFERENCE;
+    }
     pic.coded_buf = slot.codedBuffer;
     pic.pic_parameter_set_id = 0;
     pic.seq_parameter_set_id = 0;
@@ -547,11 +565,19 @@ bool EncodeH264Frame(VaapiEncoderState& state,
     slice.macroblock_address = 0;
     slice.num_macroblocks = static_cast<uint32_t>(mbWidth) * mbHeight;
     slice.macroblock_info = VA_INVALID_ID;
-    slice.slice_type = keyframe ? 2 : 2; // First pass: all-intra for deterministic decoder recovery.
+    slice.slice_type = keyframe ? 2 : 0; // I or P, no B frames for low latency.
     slice.pic_parameter_set_id = 0;
     slice.idr_pic_id = static_cast<uint16_t>(frameNum);
     slice.pic_order_cnt_lsb = static_cast<uint16_t>((state.frameIndex * 2u) & 0xffu);
     slice.disable_deblocking_filter_idc = 0;
+    FillInvalidReferences(slice.RefPicList0, std::size(slice.RefPicList0));
+    FillInvalidReferences(slice.RefPicList1, std::size(slice.RefPicList1));
+    if (!keyframe && state.lastReconSurface != InvalidSurface)
+    {
+        slice.RefPicList0[0].picture_id = state.lastReconSurface;
+        slice.RefPicList0[0].frame_idx = state.lastReferenceFrameIndex;
+        slice.RefPicList0[0].flags = VA_PICTURE_H264_SHORT_TERM_REFERENCE;
+    }
 
     VAEncMiscParameterRateControl rateControl = {};
     rateControl.bits_per_second = state.bitrateMbps * 1000u * 1000u;
@@ -630,6 +656,10 @@ bool EncodeH264Frame(VaapiEncoderState& state,
     }
     vaUnmapBuffer(state.display, slot.codedBuffer);
 
+    state.hasReference = true;
+    state.lastReconSurface = slot.reconSurface;
+    state.lastReferenceFrameIndex = frameNum;
+    state.lastReferencePoc = static_cast<int32_t>(state.frameIndex * 2u);
     state.frameIndex++;
     return !encoded.empty();
 }
@@ -645,7 +675,7 @@ bool EncodeH265Frame(VaapiEncoderState& state,
     }
 
     const bool keyframe =
-        forceKeyframe || state.frameIndex == 0 ||
+        forceKeyframe || state.frameIndex == 0 || !state.hasReference ||
         (state.keyframeInterval > 0 && (state.frameIndex % state.keyframeInterval) == 0);
     const uint32_t ctbWidth = (state.width + 63u) / 64u;
     const uint32_t ctbHeight = (state.height + 63u) / 64u;
@@ -683,6 +713,12 @@ bool EncodeH265Frame(VaapiEncoderState& state,
     pic.decoded_curr_pic.pic_order_cnt = pictureOrderCount;
     pic.decoded_curr_pic.flags = 0;
     FillInvalidReferences(pic.reference_frames, std::size(pic.reference_frames));
+    if (!keyframe && state.lastReconSurface != InvalidSurface)
+    {
+        pic.reference_frames[0].picture_id = state.lastReconSurface;
+        pic.reference_frames[0].pic_order_cnt = state.lastReferencePoc;
+        pic.reference_frames[0].flags = 0;
+    }
     pic.coded_buf = slot.codedBuffer;
     pic.collocated_ref_pic_index = 0xff;
     pic.pic_init_qp = 26;
@@ -693,19 +729,25 @@ bool EncodeH265Frame(VaapiEncoderState& state,
     pic.slice_pic_parameter_set_id = 0;
     pic.nal_unit_type = keyframe ? 19 : 1; // IDR_W_RADL or trailing non-IRAP.
     pic.pic_fields.bits.idr_pic_flag = keyframe ? 1 : 0;
-    pic.pic_fields.bits.coding_type = 1; // I picture.
+    pic.pic_fields.bits.coding_type = keyframe ? 1 : 2; // I or P picture, no B frames.
     pic.pic_fields.bits.reference_pic_flag = 1;
     pic.pic_fields.bits.pps_loop_filter_across_slices_enabled_flag = 1;
 
     VAEncSliceParameterBufferHEVC slice = {};
     slice.slice_segment_address = 0;
     slice.num_ctu_in_slice = ctbWidth * ctbHeight;
-    slice.slice_type = 2; // I slice.
+    slice.slice_type = keyframe ? 2 : 1; // I or P slice.
     slice.slice_pic_parameter_set_id = 0;
     slice.num_ref_idx_l0_active_minus1 = 0;
     slice.num_ref_idx_l1_active_minus1 = 0;
     FillInvalidReferences(slice.ref_pic_list0, std::size(slice.ref_pic_list0));
     FillInvalidReferences(slice.ref_pic_list1, std::size(slice.ref_pic_list1));
+    if (!keyframe && state.lastReconSurface != InvalidSurface)
+    {
+        slice.ref_pic_list0[0].picture_id = state.lastReconSurface;
+        slice.ref_pic_list0[0].pic_order_cnt = state.lastReferencePoc;
+        slice.ref_pic_list0[0].flags = 0;
+    }
     slice.max_num_merge_cand = 5;
     slice.slice_qp_delta = 0;
     slice.slice_fields.bits.last_slice_of_pic_flag = 1;
@@ -788,6 +830,10 @@ bool EncodeH265Frame(VaapiEncoderState& state,
     }
     vaUnmapBuffer(state.display, slot.codedBuffer);
 
+    state.hasReference = true;
+    state.lastReconSurface = slot.reconSurface;
+    state.lastReferenceFrameIndex = state.frameIndex & 0xffu;
+    state.lastReferencePoc = pictureOrderCount;
     state.frameIndex++;
     return !encoded.empty();
 }
@@ -806,10 +852,48 @@ bool VideoEncoder::SupportsFoveatedEncoding(const GraphicsContext& /*graphicsCon
     return false;
 }
 
+VideoEncoder::BackendCapabilities VideoEncoder::QueryBackendCapabilities(
+    const GraphicsContext* /*graphicsContext*/)
+{
+    BackendCapabilities capabilities = {};
+    capabilities.backendName = "VA-API";
+    capabilities.hardwareEncoder = true;
+
+    VaapiEncoderState state = {};
+    if (!OpenVaDisplay(state))
+    {
+        capabilities.unsupportedReason = "no VA-API DRM render node could be initialized";
+        if (state.display != nullptr)
+        {
+            vaTerminate(state.display);
+        }
+        if (state.drmFd >= 0)
+        {
+            close(state.drmFd);
+        }
+        return capabilities;
+    }
+
+    capabilities.supportsH264 =
+        HasEntrypoint(state.display, VAProfileH264High, VAEntrypointEncSlice);
+    capabilities.supportsH265 =
+        HasEntrypoint(state.display, VAProfileHEVCMain, VAEntrypointEncSlice);
+    if (!capabilities.supportsH264 && !capabilities.supportsH265)
+    {
+        capabilities.unsupportedReason = "driver exposes no H.264/H.265 encode entrypoint";
+    }
+
+    vaTerminate(state.display);
+    if (state.drmFd >= 0)
+    {
+        close(state.drmFd);
+    }
+    return capabilities;
+}
+
 bool VideoEncoder::SupportsCodec(oxr::protocol::VideoCodec codec)
 {
-    return codec == oxr::protocol::VideoCodec::H264 ||
-           codec == oxr::protocol::VideoCodec::H265;
+    return QueryBackendCapabilities(nullptr).SupportsCodec(codec);
 }
 
 bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
@@ -970,22 +1054,39 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
         return finishDroppedFrame("VA-API encode failed");
     }
     metrics.encodeSubmitMs = ToMilliseconds(Clock::now() - submitStart);
-    metrics.keyframe = requestedKeyframe || frameCount_ == 0 ||
+    const bool expectedKeyframe = requestedKeyframe || frameCount_ == 0 ||
         (state->keyframeInterval > 0 && (frameCount_ % state->keyframeInterval) == 0);
 
+    bool emittedOutput = false;
+    bool emittedKeyframe = false;
     if (callback && !encoded.empty())
     {
-        callback(encoded.data(), encoded.size(), metrics.keyframe, timestampNs);
+        emittedOutput = oxrsys::video_bitstream::VisitAnnexBUnits(
+            codec_, encoded.data(), encoded.size(), expectedKeyframe,
+            [&](const uint8_t* data, size_t size, bool keyframe) {
+                emittedKeyframe = emittedKeyframe || keyframe;
+                callback(data, size, keyframe, timestampNs);
+            });
     }
+    else
+    {
+        emittedOutput = !encoded.empty();
+    }
+    metrics.keyframe = emittedKeyframe || expectedKeyframe;
 
     frameCount_++;
     metrics.totalLatencyMs = ToMilliseconds(Clock::now() - encodeStart);
     inFlightFrameCount_.fetch_sub(1);
+    if (!emittedOutput)
+    {
+        droppedFrameCount_.fetch_add(1);
+        metrics.frameDropped = true;
+    }
     if (frameCallback)
     {
         frameCallback(metrics);
     }
-    return !encoded.empty();
+    return emittedOutput;
 }
 
 void VideoEncoder::ForceKeyframe()

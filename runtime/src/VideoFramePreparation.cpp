@@ -435,55 +435,54 @@ bool FinalizeNv12Chroma(PreparedVideoFrame& output,
     return true;
 }
 
-} // namespace
-
-bool VideoFramePreparer::FillBlack(uint32_t outputWidth,
-                                   uint32_t outputHeight,
-                                   PreparedVideoFrame& output)
+PixelLayout ToInternalLayout(VideoSourcePixelLayout layout)
 {
-    if (!AllocateNv12(outputWidth, outputHeight, output))
+    return layout == VideoSourcePixelLayout::Bgra ? PixelLayout::Bgra : PixelLayout::Rgba;
+}
+
+bool CopySourcePixels(const VideoSourcePixels& input, SourceImage& output)
+{
+    if (input.pixels == nullptr || input.width == 0 || input.height == 0)
     {
         return false;
     }
-    std::memset(output.YPlane(), 16, static_cast<size_t>(output.yStride) * output.height);
-    std::memset(output.UVPlane(), 128, static_cast<size_t>(output.uvStride) * (output.height / 2u));
+    const uint32_t rowBytes = input.width * 4u;
+    const uint32_t strideBytes = input.strideBytes != 0 ? input.strideBytes : rowBytes;
+    if (strideBytes < rowBytes)
+    {
+        return false;
+    }
+
+    output.width = input.width;
+    output.height = input.height;
+    output.layout = ToInternalLayout(input.layout);
+    output.pixels.resize(static_cast<size_t>(rowBytes) * input.height);
+    for (uint32_t y = 0; y < input.height; ++y)
+    {
+        std::memcpy(output.pixels.data() + static_cast<size_t>(rowBytes) * y,
+                    input.pixels + static_cast<size_t>(strideBytes) * y,
+                    rowBytes);
+    }
     return true;
 }
 
-bool VideoFramePreparer::PrepareStereo(FrameSource frameSource,
-                                       bool stereo,
-                                       const GraphicsContext& graphicsContext,
-                                       uint32_t outputWidth,
-                                       uint32_t outputHeight,
-                                       PreparedVideoFrame& output)
+bool PrepareStereoImages(const SourceImage& leftImage,
+                         const FrameImageSource& leftMetadata,
+                         const SourceImage& rightImage,
+                         const FrameImageSource& rightMetadata,
+                         bool stereo,
+                         uint32_t outputWidth,
+                         uint32_t outputHeight,
+                         PreparedVideoFrame& output)
 {
     if (!AllocateNv12(outputWidth, outputHeight, output))
     {
         return false;
     }
 
-    SourceImage leftImage;
-    SourceImage rightImage;
-    if (!frameSource.left.IsValid() || (stereo && !frameSource.right.IsValid()) ||
-        !ReadFrameImage(frameSource.left, graphicsContext, leftImage))
-    {
-        return false;
-    }
-    if (stereo)
-    {
-        if (!ReadFrameImage(frameSource.right, graphicsContext, rightImage))
-        {
-            return false;
-        }
-    }
-    else
-    {
-        rightImage = leftImage;
-    }
-
-    const auto leftRect = ResolveSourceRect(frameSource.left, leftImage.width, leftImage.height);
+    const auto leftRect = ResolveSourceRect(leftMetadata, leftImage.width, leftImage.height);
     const auto rightRect = stereo
-        ? ResolveSourceRect(frameSource.right, rightImage.width, rightImage.height)
+        ? ResolveSourceRect(rightMetadata, rightImage.width, rightImage.height)
         : leftRect;
     if (!leftRect.has_value() || !rightRect.has_value())
     {
@@ -507,4 +506,82 @@ bool VideoFramePreparer::PrepareStereo(FrameSource frameSource,
     }
 
     return FinalizeNv12Chroma(output, uAccum, vAccum, uvCount);
+}
+
+} // namespace
+
+bool VideoFramePreparer::FillBlack(uint32_t outputWidth,
+                                   uint32_t outputHeight,
+                                   PreparedVideoFrame& output)
+{
+    if (!AllocateNv12(outputWidth, outputHeight, output))
+    {
+        return false;
+    }
+    std::memset(output.YPlane(), 16, static_cast<size_t>(output.yStride) * output.height);
+    std::memset(output.UVPlane(), 128, static_cast<size_t>(output.uvStride) * (output.height / 2u));
+    return true;
+}
+
+bool VideoFramePreparer::PrepareStereo(FrameSource frameSource,
+                                       bool stereo,
+                                       const GraphicsContext& graphicsContext,
+                                       uint32_t outputWidth,
+                                       uint32_t outputHeight,
+                                       PreparedVideoFrame& output)
+{
+    SourceImage leftImage;
+    SourceImage rightImage;
+    if (!frameSource.left.IsValid() || (stereo && !frameSource.right.IsValid()) ||
+        !ReadFrameImage(frameSource.left, graphicsContext, leftImage))
+    {
+        return false;
+    }
+    if (stereo)
+    {
+        if (!ReadFrameImage(frameSource.right, graphicsContext, rightImage))
+        {
+            return false;
+        }
+    }
+    else
+    {
+        rightImage = leftImage;
+    }
+
+    return PrepareStereoImages(leftImage, frameSource.left, rightImage, frameSource.right,
+                               stereo, outputWidth, outputHeight, output);
+}
+
+bool VideoFramePreparer::PrepareStereoPixels(const VideoSourcePixels& leftPixels,
+                                             const FrameImageSource& leftMetadata,
+                                             const VideoSourcePixels* rightPixels,
+                                             const FrameImageSource* rightMetadata,
+                                             bool stereo,
+                                             uint32_t outputWidth,
+                                             uint32_t outputHeight,
+                                             PreparedVideoFrame& output)
+{
+    SourceImage leftImage;
+    SourceImage rightImage;
+    if (!CopySourcePixels(leftPixels, leftImage))
+    {
+        return false;
+    }
+    FrameImageSource effectiveRightMetadata = leftMetadata;
+    if (stereo)
+    {
+        if (rightPixels == nullptr || rightMetadata == nullptr ||
+            !CopySourcePixels(*rightPixels, rightImage))
+        {
+            return false;
+        }
+        effectiveRightMetadata = *rightMetadata;
+    }
+    else
+    {
+        rightImage = leftImage;
+    }
+    return PrepareStereoImages(leftImage, leftMetadata, rightImage, effectiveRightMetadata,
+                               stereo, outputWidth, outputHeight, output);
 }

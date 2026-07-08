@@ -104,7 +104,15 @@ On Linux, the runtime enables both Vulkan and the first OpenGL GLX backend when 
 development files are present. Vulkan color swapchains are copied to host-visible staging buffers
 for the encoder path. OpenGL color swapchains are snapshotted through FBO/PBO readback slots; depth
 formats are available for application compatibility but are not video sources. The VA-API backend
-supports H.264 and H.265 Main 8-bit streams.
+probes `/dev/dri/renderD128` through `/dev/dri/renderD143`, then `/dev/dri/card0`, and supports
+H.264 plus H.265 Main 8-bit when the selected driver exposes encode entry points. Override device
+selection for multi-GPU/debug setups with:
+
+```bash
+OXRSYS_VAAPI_DRM_DEVICE=/dev/dri/renderD129 ./your-openxr-app
+```
+
+Server-side 10-bit and foveated encoding remain VideoToolbox-only in this pass.
 
 On Windows, the runtime builds Vulkan plus Direct3D 11/12 when the Windows SDK, Vulkan headers, and
 Media Foundation are available:
@@ -117,8 +125,14 @@ ctest --test-dir build-win --output-on-failure
 ```
 
 The Windows backend exposes Vulkan, D3D11, and D3D12 in this milestone and uses Media Foundation for
-H.264/H.265 encode. OpenGL Win32/WGL is not advertised yet; Linux remains the only OpenGL runtime
-backend.
+hardware H.264/H.265 encode. Software encoder MFTs are not used by default because they are not a VR
+latency target. For local debugging only, opt into software fallback with:
+
+```powershell
+$env:OXRSYS_MF_ALLOW_SOFTWARE_ENCODER = "1"
+```
+
+OpenGL Win32/WGL is not advertised yet; Linux remains the only OpenGL runtime backend.
 
 ## Versioning
 

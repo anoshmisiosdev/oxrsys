@@ -154,6 +154,9 @@ add_executable(oxrsys_runtime_tests
     tests/TestStreamingAbr.cpp
     tests/TestStreamingFrameQueue.cpp
     tests/TestStreamingReconfigure.cpp
+    tests/TestVideoBitstream.cpp
+    tests/TestVideoCodecSelection.cpp
+    tests/TestVideoFramePreparation.cpp
     tests/TestVulkanDispatch.cpp
     tests/TestCompositionLayerAlpha.cpp
     tests/TestProtocolLayout.cpp
@@ -167,6 +170,9 @@ add_executable(oxrsys_runtime_tests
     runtime/src/RuntimePlatform.cpp
     runtime/src/RuntimeSockets.cpp
     runtime/src/StreamingFrameQueue.cpp
+    runtime/src/VideoBitstream.cpp
+    runtime/src/VideoCodecSelection.cpp
+    runtime/src/VideoFramePreparation.cpp
     runtime/src/VulkanDispatch.cpp
 )
 target_include_directories(oxrsys_runtime_tests PRIVATE
@@ -317,6 +323,94 @@ if(WIN32)
         TIMEOUT 120
     )
     list(APPEND OXRSYS_RUNTIME_TEST_TARGETS oxrsys_runtime_d3d_tests)
+endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND OXRSYS_RUNTIME_SELECTED_VIDEO_ENCODER STREQUAL "VAAPI")
+    add_executable(oxrsys_native_video_encoder_smoke_tests
+        tests/TestNativeVideoEncoderSmoke.cpp
+        runtime/src/Config.cpp
+        runtime/src/RuntimePlatform.cpp
+        runtime/src/VaapiVideoEncoder.cpp
+        runtime/src/VideoBitstream.cpp
+        runtime/src/VideoFramePreparation.cpp
+    )
+    target_include_directories(oxrsys_native_video_encoder_smoke_tests PRIVATE
+        runtime/src
+        common/protocol/include
+        ${openxr_SOURCE_DIR}/include
+        ${Vulkan_INCLUDE_DIRS}
+    )
+    target_compile_definitions(oxrsys_native_video_encoder_smoke_tests PRIVATE
+        XR_USE_GRAPHICS_API_VULKAN
+        OXRSYS_VIDEO_ENCODER_VAAPI
+    )
+    target_link_libraries(oxrsys_native_video_encoder_smoke_tests PRIVATE
+        Catch2::Catch2WithMain
+        glm::glm
+        spdlog::spdlog
+        ${OXRSYS_RUNTIME_VAAPI_TARGET}
+        ${CMAKE_DL_LIBS}
+    )
+    add_test(NAME oxrsys_native_video_encoder_smoke_tests
+        COMMAND oxrsys_native_video_encoder_smoke_tests
+    )
+    set_tests_properties(oxrsys_native_video_encoder_smoke_tests PROPERTIES
+        ENVIRONMENT "${OXRSYS_ISOLATED_TEST_ENV}"
+        TIMEOUT 120
+    )
+    list(APPEND OXRSYS_RUNTIME_TEST_TARGETS oxrsys_native_video_encoder_smoke_tests)
+endif()
+
+if(WIN32 AND OXRSYS_RUNTIME_SELECTED_VIDEO_ENCODER STREQUAL "MEDIAFOUNDATION")
+    add_executable(oxrsys_native_video_encoder_smoke_tests
+        tests/TestNativeVideoEncoderSmoke.cpp
+        runtime/src/Config.cpp
+        runtime/src/RuntimePlatform.cpp
+        runtime/src/MediaFoundationVideoEncoder.cpp
+        runtime/src/VideoBitstream.cpp
+        runtime/src/VideoFramePreparation.cpp
+    )
+    target_include_directories(oxrsys_native_video_encoder_smoke_tests PRIVATE
+        runtime/src
+        common/protocol/include
+        ${openxr_SOURCE_DIR}/include
+        ${Vulkan_INCLUDE_DIRS}
+    )
+    target_compile_definitions(oxrsys_native_video_encoder_smoke_tests PRIVATE
+        XR_USE_PLATFORM_WIN32
+        XR_USE_GRAPHICS_API_VULKAN
+        XR_USE_GRAPHICS_API_D3D11
+        XR_USE_GRAPHICS_API_D3D12
+        OXRSYS_USE_D3D11
+        OXRSYS_USE_D3D12
+        OXRSYS_VIDEO_ENCODER_MEDIAFOUNDATION
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+    )
+    target_link_libraries(oxrsys_native_video_encoder_smoke_tests PRIVATE
+        Catch2::Catch2WithMain
+        glm::glm
+        spdlog::spdlog
+        d3d11
+        d3d12
+        dxgi
+        mf
+        mfplat
+        mfuuid
+        wmcodecdspuuid
+        propsys
+        ole32
+        ws2_32
+        ${CMAKE_DL_LIBS}
+    )
+    add_test(NAME oxrsys_native_video_encoder_smoke_tests
+        COMMAND oxrsys_native_video_encoder_smoke_tests
+    )
+    set_tests_properties(oxrsys_native_video_encoder_smoke_tests PROPERTIES
+        ENVIRONMENT "${OXRSYS_ISOLATED_TEST_ENV}"
+        TIMEOUT 120
+    )
+    list(APPEND OXRSYS_RUNTIME_TEST_TARGETS oxrsys_native_video_encoder_smoke_tests)
 endif()
 
 add_dependencies(oxrsys_runtime_sync_compile_commands

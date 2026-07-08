@@ -21,6 +21,8 @@ This file tracks user-facing, integration-facing, and runtime-relevant changes f
 - Added a first Linux OpenGL GLX backend through `XR_KHR_opengl_enable`, including OpenGL swapchain image enumeration and bounded FBO/PBO readback into the shared native encode preparation path.
 - Added Windows Direct3D 11 and Direct3D 12 runtime backends through `XR_KHR_D3D11_enable` and `XR_KHR_D3D12_enable`, including DXGI swapchain images, bounded readback snapshots, Media Foundation H.264/H.265 encode, and loader-backed WARP tests.
 - Added loader-backed tests for host graphics extension exposure, including Vulkan everywhere, OpenGL only on Linux builds, and D3D11/D3D12 only on Windows builds.
+- Added native video backend capability probing, runtime codec fallback candidate selection, and an Annex B bitstream normalizer shared by VA-API and Media Foundation.
+- Added Linux/Windows native encoder smoke tests that skip when no hardware encoder is available, plus unit tests for bitstream parsing, codec fallback ordering, and CPU NV12 frame preparation.
 - Added protocol v1.2 stream reconfiguration (`StreamConfigUpdate/Ack`) for reliable USB TCP, dynamic encoded-resolution profiles for `abr_mode = "full"`, global passthrough config with app-driven OpenXR alpha blend/source-alpha detection, headset passthrough support/readiness status, occlusion/spatial config gates, a reserved optional spatial TCP channel on `9948`, and matching SwiftUI/Qt Home controls and status display.
 - Added runtime status fields for configured bitrate versus effective client-capped bitrate, and for requested/active foveated encoding state so Home can show when a preset is inactive because of `resolution_scale` or client support.
 - Added a native USB ADB backend to SwiftUI Home so Quest USB reverse setup can run without Android Studio, the Android SDK, Homebrew, or an `adb` executable.
@@ -40,7 +42,10 @@ This file tracks user-facing, integration-facing, and runtime-relevant changes f
 
 - Split non-Apple swapchain implementation by backend so Vulkan, Linux OpenGL, D3D11, and D3D12 resources live in separate files behind explicit platform/API guards.
 - Replaced the runtime FFmpeg encoder path with platform-native encoders: VideoToolbox on Apple platforms, VA-API on Linux, and Media Foundation on Windows.
+- Changed Linux and Windows codec selection from compile-time `SupportsCodec()` checks to runtime backend/client negotiation with automatic retry on the next compatible codec when initialization fails.
 - Promoted Linux Vulkan runtime support from scaffolding to Vulkan swapchains, release-time staging readback, H.264/H.265 encode through VA-API, and backend readback metadata shared by the native encoder preparation path.
+- Updated the Linux VA-API path to probe DRM render nodes, allow `OXRSYS_VAAPI_DRM_DEVICE`, use low-latency IP GOPs instead of intra-only output, force IDR frames on request, and keep bitrate updates live.
+- Updated the Windows Media Foundation path to probe hardware H.264/H.265 MFTs, keep software encoders opt-in only for debugging, configure low-latency/no-B-frame encoding, force keyframes, and normalize output for transport.
 - Updated the Qt simulator to keep tracking-only preview and video packet/loss/FEC counters after removing its FFmpeg decode path.
 - Updated the Quest/PICO shell to keep passthrough active only when global passthrough is enabled and the headset reports `XR_FB_passthrough` support, while keeping app alpha-blend passthrough behind the explicit `app_alpha_blend_passthrough` opt-in instead of the normal passthrough toggle. Protocol alpha/source-alpha frames can reveal the passthrough underlay; black-key alpha is limited to an explicit compatibility fallback.
 - Updated SwiftUI Home and Qt Home setup flows with first-launch runtime registration guidance, automatic USB reverse configuration when USB is selected, packaged-runtime manifest preference, and native ADB host-server protocol support before falling back to an external `adb` executable.
@@ -64,7 +69,7 @@ This file tracks user-facing, integration-facing, and runtime-relevant changes f
 
 ### Known Limits
 
-- Vulkan, OpenGL, and D3D desktop streaming still need regular manual validation on real Linux/Windows hardware and with MoltenVK apps; Windows OpenGL/WGL remains separate follow-up work.
+- Linux and Windows native streaming are experimental validated paths: unit tests and conditional hardware smoke tests cover core encode plumbing, but regular Quest VR validation over USB and WiFi on real Linux/Windows hardware is still required. Windows OpenGL/WGL remains separate follow-up work.
 
 ## 1.2.0 - 2026-06-19
 

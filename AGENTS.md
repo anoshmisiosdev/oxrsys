@@ -9,6 +9,7 @@ launching, runtime selection, runtime configuration, and runtime registration wo
 
 **Current state:** Metal/core runtime, Vulkan interop, Linux Vulkan/OpenGL streaming through VA-API,
 Windows Vulkan + Direct3D 11/12 runtime backends with Media Foundation encode,
+runtime backend capability probes, runtime codec fallback negotiation, Annex B bitstream normalization,
 typed internal graphics/frame plumbing, release-time Metal streaming snapshots,
 runtime-selectable H.264/H.265 video codecs and negotiated H.265 Main10 streaming,
 portable platform/socket helpers,
@@ -101,14 +102,14 @@ Avoid duplicating the same guidance in multiple files. If commands, platform sta
 - Metal streaming must snapshot dynamic swapchain images through the app-provided command queue and GPU-side shared-event waits; if no staging slot is safe to reuse, drop that streaming frame instead of reading a live reused swapchain slot.
 - Vulkan streaming must snapshot released color swapchain layers through app-dispatched Vulkan functions into bounded host-visible staging buffers; wait/map/conversion belongs to the encoder path, not `Session::EndFrame()`.
 - Linux OpenGL streaming is GLX/Xlib-only for now and must use bounded FBO/PBO readback; macOS must not advertise `XR_KHR_opengl_enable` because the extension has no standard CGL binding.
-- Linux VA-API streaming supports H.264 and H.265 Main 8-bit; VA surface upload, encode submission, waits, mapping, and encoded-buffer copies must stay outside `Session::EndFrame()`.
-- Windows D3D11/D3D12 streaming must keep Direct3D and Media Foundation headers/code behind Windows-only preprocessor guards; snapshots may enqueue GPU copies during swapchain release, but fence waits, mapping, conversion, and encode must stay outside `Session::EndFrame()`.
+- Linux VA-API streaming supports H.264 and H.265 Main 8-bit; probe hardware encode entry points before advertising support, honor `OXRSYS_VAAPI_DRM_DEVICE`, and keep VA surface upload, encode submission, waits, mapping, and encoded-buffer copies outside `Session::EndFrame()`.
+- Windows D3D11/D3D12 streaming must keep Direct3D and Media Foundation headers/code behind Windows-only preprocessor guards; probe hardware H.264/H.265 encoder MFTs before advertising support, keep software MFTs opt-in/debug-only, and keep fence waits, mapping, conversion, and encode outside `Session::EndFrame()`.
 - Quest USB streaming uses reconnecting ADB reverse TCP on localhost ports `9944`, `9945`, `9946`, and the reserved reliable spatial port `9948`; app-level Android USB permission dialogs are only for `UsbManager`-visible devices and are not required for ADB reverse streaming.
 - Home USB setup should prefer the native ADB host-server protocol on `127.0.0.1:5037` when available, fall back to a selected or auto-detected `adb` executable only when needed, configure missing reverse mappings automatically when the user selects USB, and keep Settings ADB mode (`Internal`/`Custom`) from silently changing fallback behavior.
 - Quest USB TCP sockets must keep bounded send behavior; failed video sends must clear stale TCP dispatch state and must not block the encoded-frame sender, VideoToolbox callback, or `Session::EndFrame()`.
 - Encoded video dispatch is latest-frame-oriented and bounded; stale queued frames may be dropped instead of building latency when the transport cannot keep up.
 - The advertised per-eye render resolution comes from the `render_device` preset (quest2/quest3/avp). It is fixed when the app queries view configs (before any client connects), so it is a server-config choice, not per-client automatic; `resolution_scale` is a separate encode-only downscale (also driven by ABR), not a render-target change.
-- Video codec negotiation must stay conservative and respect the compiled encoder backend: `ClientConnect.supportedCodecs = 0` means a legacy H.265-only client, H.265 remains the default where the backend supports it, and H.264 must only be selected for clients that explicitly advertise H.264 support.
+- Video codec negotiation must stay conservative and respect runtime backend capabilities: `ClientConnect.supportedCodecs = 0` means a legacy H.265-only client, H.265 remains the default where the backend supports it, H.264 must only be selected for clients that explicitly advertise H.264 support, and encoder initialization failure should retry the next compatible codec.
 - 10-bit streaming is HEVC Main10 only: enable it only for H.265 when `encoder_10bit` is configured and the client advertises `CLIENT_CAPABILITY_TEN_BIT_ENCODING`; H.264 and legacy clients must remain 8-bit.
 - Apple VideoToolbox streams use a BT.709 SDR, limited-range YCbCr color contract. Keep encoder metadata and client conversion aligned, including exact normalized code ranges for 8-bit and 10-bit bi-planar decoder surfaces.
 - `ServerAnnounce.clientSharpeningPercent` (0-100, a repurposed reserved slot) carries the headset sharpen strength from the server's `client_sharpening` config; the visionOS client applies it as a display-space contrast-adaptive sharpen pass. Keep the C++/Swift announce layout in sync (ProtocolLayoutTests).
@@ -175,6 +176,10 @@ oxrsys_runtime/
 │   ├── TestInputManager.cpp
 │   ├── TestRuntimePlatform.cpp
 │   ├── TestStreamingFrameQueue.cpp
+│   ├── TestVideoBitstream.cpp
+│   ├── TestVideoCodecSelection.cpp
+│   ├── TestVideoFramePreparation.cpp
+│   ├── TestNativeVideoEncoderSmoke.cpp
 │   ├── TestVulkanDispatch.cpp
 │   ├── TestWindowsD3D.cpp
 │   ├── HomeLauncherTests.swift

@@ -489,10 +489,23 @@ bool VideoEncoder::SupportsFoveatedEncoding(const GraphicsContext& graphicsConte
     return supported;
 }
 
+VideoEncoder::BackendCapabilities VideoEncoder::QueryBackendCapabilities(
+    const GraphicsContext* graphicsContext)
+{
+    BackendCapabilities capabilities = {};
+    capabilities.backendName = "VideoToolbox";
+    capabilities.hardwareEncoder = true;
+    capabilities.supportsH264 = true;
+    capabilities.supportsH265 = true;
+    capabilities.supportsTenBitH265 = true;
+    capabilities.supportsFoveatedEncoding =
+        graphicsContext != nullptr && SupportsFoveatedEncoding(*graphicsContext);
+    return capabilities;
+}
+
 bool VideoEncoder::SupportsCodec(oxr::protocol::VideoCodec codec)
 {
-    return codec == oxr::protocol::VideoCodec::H264 ||
-           codec == oxr::protocol::VideoCodec::H265;
+    return QueryBackendCapabilities(nullptr).SupportsCodec(codec);
 }
 
 bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,

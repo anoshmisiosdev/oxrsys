@@ -8,6 +8,8 @@ set(OXRSYS_RUNTIME_SOURCES
     src/RuntimePlatform.cpp
     src/RuntimeSockets.cpp
     src/StreamingFrameQueue.cpp
+    src/VideoBitstream.cpp
+    src/VideoCodecSelection.cpp
     src/Instance.cpp
     src/Session.cpp
     src/Space.cpp
@@ -341,3 +343,11 @@ add_custom_command(TARGET oxrsys_runtime POST_BUILD
         ${CMAKE_CURRENT_BINARY_DIR}/oxrsys-runtime.toml
     COMMENT "Copying oxrsys-runtime.toml to build directory"
 )
+
+get_directory_property(OXRSYS_RUNTIME_HAS_PARENT PARENT_DIRECTORY)
+if(OXRSYS_RUNTIME_HAS_PARENT)
+    set(OXRSYS_RUNTIME_SELECTED_VIDEO_ENCODER "${OXRSYS_VIDEO_ENCODER_SELECTED}" PARENT_SCOPE)
+    if(OXRSYS_RUNTIME_NEEDS_VAAPI)
+        set(OXRSYS_RUNTIME_VAAPI_TARGET "${OXRSYS_VAAPI_TARGET}" PARENT_SCOPE)
+    endif()
+endif()

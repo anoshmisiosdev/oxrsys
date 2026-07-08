@@ -21,12 +21,20 @@ The default test layers are:
 - `oxrsys_runtime_loader_extension_tests`
 - `oxrsys_runtime_api_tests`
 - `oxrsys_runtime_d3d_tests` on Windows
+- `oxrsys_native_video_encoder_smoke_tests` on Linux VA-API and Windows Media Foundation builds
 
 `oxrsys_runtime_loader_extension_tests` runs through the OpenXR loader on host builds and verifies
 host graphics extension exposure. `oxrsys_runtime_api_tests` is Apple-only in this pass because it
 exercises the loader-backed Metal path. Linux builds still run the runtime, config, input, protocol,
 status, and loader extension tests. Windows builds additionally run loader-backed D3D11/D3D12 WARP
-session and swapchain tests.
+session and swapchain tests. The shared runtime tests also cover `VideoBitstream` Annex B and
+length-prefixed parsing, runtime codec fallback ordering, and synthetic `VideoFramePreparation`
+NV12 conversion for black, crop, scale, RGBA, and BGRA inputs.
+
+`oxrsys_native_video_encoder_smoke_tests` compiles the native encoder backend directly on platforms
+that can run it. It probes hardware support first, skips clearly when no H.264/H.265 hardware encoder
+is available, and otherwise encodes synthetic black frames to verify Annex B output, parameter-set
+headers, an IDR/keyframe, and at least one non-keyframe slice.
 
 ## Home Tests
 
@@ -78,10 +86,14 @@ Before considering a change ready:
 
 - run the macOS build and tests
 - run the Linux/Qt build on a Linux host when touching Linux runtime or Qt frontend code
+- run the Linux VA-API build with `-DOXRSYS_VIDEO_ENCODER=VAAPI`; the native encoder smoke test
+  should pass when a render node exposes hardware encode, or skip with a clear reason otherwise
 - manually validate Vulkan streaming on Linux or MoltenVK when touching Vulkan readback or encoder
   conversion; Linux VA-API covers H.264 and H.265 Main 8-bit
 - manually validate OpenGL GLX streaming on Linux when touching `XR_KHR_opengl_enable`,
   OpenGL swapchains, or PBO readback
+- run the Windows Media Foundation build with `-DOXRSYS_VIDEO_ENCODER=MEDIAFOUNDATION`; the native
+  encoder smoke test should pass on hardware MFT systems, or skip with a clear reason otherwise
 - manually validate D3D11 and D3D12 streaming on Windows hardware or WARP when touching Direct3D
   swapchains, readback, Media Foundation conversion, or Windows graphics extension exposure
 - run the Home Swift test runner when changing the Home launcher, preferences, or server config helpers

@@ -3,6 +3,7 @@
 #include "VideoEncoder.h"
 
 #include "Config.h"
+#include "VideoBitstream.h"
 #include "VideoFramePreparation.h"
 
 #include <spdlog/spdlog.h>
@@ -20,6 +21,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -95,6 +97,7 @@ struct MediaFoundationEncoderState
     uint32_t fps = 0;
     uint32_t bitrateMbps = 0;
     uint32_t frameIndex = 0;
+    oxr::protocol::VideoCodec codec = oxr::protocol::VideoCodec::H264;
     bool comInitialized = false;
     bool mfStarted = false;
     VideoFramePreparer preparer;
@@ -215,7 +218,9 @@ HRESULT ActivateEncoder(MediaFoundationEncoderState& state,
         &outputInfo,
         &activates,
         &activateCount);
-    if (FAILED(result) || activateCount == 0)
+    const bool allowSoftware =
+        std::getenv("OXRSYS_MF_ALLOW_SOFTWARE_ENCODER") != nullptr;
+    if ((FAILED(result) || activateCount == 0) && allowSoftware)
     {
         if (activates != nullptr)
         {
@@ -267,6 +272,7 @@ HRESULT ConfigureEncoder(MediaFoundationEncoderState& state,
                           state.bitrateMbps * 1000u * 1000u);
         SetCodecApiUInt32(state.codecApi.Get(), CODECAPI_AVEncMPVGOPSize,
                           std::max(Config::Get().GetValues().keyframeIntervalSec * state.fps, 1u));
+        SetCodecApiUInt32(state.codecApi.Get(), CODECAPI_AVEncMPVDefaultBPictureCount, 0);
     }
 
     state.transform->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
@@ -303,9 +309,11 @@ bool DrainOutput(MediaFoundationEncoderState& state,
                  bool keyframe,
                  int64_t timestampNs,
                  const VideoEncoder::OnNalUnitCallback& callback,
-                 bool& emittedOutput)
+                 bool& emittedOutput,
+                 bool& emittedKeyframe)
 {
     emittedOutput = false;
+    emittedKeyframe = false;
     MFT_OUTPUT_STREAM_INFO streamInfo = {};
     HRESULT result = state.transform->GetOutputStreamInfo(state.outputStreamId, &streamInfo);
     if (FAILED(result))
@@ -374,7 +382,16 @@ bool DrainOutput(MediaFoundationEncoderState& state,
         {
             if (callback)
             {
-                callback(data, currentLength, keyframe, timestampNs);
+                oxrsys::video_bitstream::VisitAnnexBUnits(
+                    state.codec, data, currentLength, keyframe,
+                    [&](const uint8_t* nalData, size_t nalSize, bool nalKeyframe) {
+                        emittedKeyframe = emittedKeyframe || nalKeyframe;
+                        callback(nalData, nalSize, nalKeyframe, timestampNs);
+                    });
+            }
+            else
+            {
+                emittedKeyframe = emittedKeyframe || keyframe;
             }
             emittedOutput = true;
         }
@@ -399,10 +416,81 @@ bool VideoEncoder::SupportsFoveatedEncoding(const GraphicsContext& /*graphicsCon
     return false;
 }
 
+VideoEncoder::BackendCapabilities VideoEncoder::QueryBackendCapabilities(
+    const GraphicsContext* /*graphicsContext*/)
+{
+    BackendCapabilities capabilities = {};
+    capabilities.backendName = "Media Foundation";
+    capabilities.hardwareEncoder = true;
+
+    bool comInitialized = false;
+    HRESULT result = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (SUCCEEDED(result))
+    {
+        comInitialized = true;
+    }
+    else if (result != RPC_E_CHANGED_MODE)
+    {
+        capabilities.unsupportedReason = "COM initialization failed: " + HResultString(result);
+        return capabilities;
+    }
+
+    result = MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET);
+    if (FAILED(result))
+    {
+        capabilities.unsupportedReason = "MFStartup failed: " + HResultString(result);
+        if (comInitialized)
+        {
+            CoUninitialize();
+        }
+        return capabilities;
+    }
+
+    auto probeCodec = [](oxr::protocol::VideoCodec codec) {
+        MFT_REGISTER_TYPE_INFO inputInfo = {};
+        inputInfo.guidMajorType = MFMediaType_Video;
+        inputInfo.guidSubtype = MFVideoFormat_NV12;
+        MFT_REGISTER_TYPE_INFO outputInfo = {};
+        outputInfo.guidMajorType = MFMediaType_Video;
+        outputInfo.guidSubtype = MediaFoundationSubtype(codec);
+        IMFActivate** activates = nullptr;
+        UINT32 activateCount = 0;
+        HRESULT probeResult = MFTEnumEx(
+            MFT_CATEGORY_VIDEO_ENCODER,
+            MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
+            &inputInfo,
+            &outputInfo,
+            &activates,
+            &activateCount);
+        if (activates != nullptr)
+        {
+            for (UINT32 i = 0; i < activateCount; ++i)
+            {
+                activates[i]->Release();
+            }
+            CoTaskMemFree(activates);
+        }
+        return SUCCEEDED(probeResult) && activateCount > 0;
+    };
+
+    capabilities.supportsH264 = probeCodec(oxr::protocol::VideoCodec::H264);
+    capabilities.supportsH265 = probeCodec(oxr::protocol::VideoCodec::H265);
+    if (!capabilities.supportsH264 && !capabilities.supportsH265)
+    {
+        capabilities.unsupportedReason = "no hardware H.264/H.265 encoder MFT available";
+    }
+
+    MFShutdown();
+    if (comInitialized)
+    {
+        CoUninitialize();
+    }
+    return capabilities;
+}
+
 bool VideoEncoder::SupportsCodec(oxr::protocol::VideoCodec codec)
 {
-    return codec == oxr::protocol::VideoCodec::H264 ||
-           codec == oxr::protocol::VideoCodec::H265;
+    return QueryBackendCapabilities(nullptr).SupportsCodec(codec);
 }
 
 bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
@@ -445,6 +533,7 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
     state->height = height;
     state->fps = std::max(fps, 1u);
     state->bitrateMbps = bitrateMbps;
+    state->codec = codec;
 
     result = ActivateEncoder(*state, codec);
     if (FAILED(result))
@@ -588,13 +677,15 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
     }
 
     bool emittedOutput = false;
-    if (!DrainOutput(*state, requestedKeyframe || frameCount_ == 0, timestampNs, callback, emittedOutput))
+    bool emittedKeyframe = false;
+    if (!DrainOutput(*state, requestedKeyframe || frameCount_ == 0, timestampNs, callback,
+                     emittedOutput, emittedKeyframe))
     {
         return finishDroppedFrame("Media Foundation output drain failed");
     }
 
     frameCount_++;
-    metrics.keyframe = requestedKeyframe || frameCount_ == 1;
+    metrics.keyframe = emittedKeyframe || requestedKeyframe || frameCount_ == 1;
     metrics.totalLatencyMs = ToMilliseconds(Clock::now() - encodeStart);
     inFlightFrameCount_.fetch_sub(1);
     if (!emittedOutput)

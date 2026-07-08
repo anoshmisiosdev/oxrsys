@@ -18,6 +18,15 @@ bool VideoEncoder::SupportsFoveatedEncoding(const GraphicsContext& /*graphicsCon
     return false;
 }
 
+VideoEncoder::BackendCapabilities VideoEncoder::QueryBackendCapabilities(
+    const GraphicsContext* /*graphicsContext*/)
+{
+    BackendCapabilities capabilities = {};
+    capabilities.backendName = "stub";
+    capabilities.unsupportedReason = "no platform encoder backend was built";
+    return capabilities;
+}
+
 bool VideoEncoder::SupportsCodec(oxr::protocol::VideoCodec /*codec*/)
 {
     return false;

@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <functional>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include "GraphicsTypes.h"
@@ -49,6 +50,31 @@ public:
         float edgeRatioY = 1.0f;
     };
 
+    struct BackendCapabilities
+    {
+        std::string backendName;
+        bool hardwareEncoder = false;
+        bool supportsH264 = false;
+        bool supportsH265 = false;
+        bool supportsTenBitH265 = false;
+        bool supportsFoveatedEncoding = false;
+        std::string unsupportedReason;
+
+        bool SupportsCodec(oxr::protocol::VideoCodec codec) const
+        {
+            switch (codec)
+            {
+                case oxr::protocol::VideoCodec::H264:
+                    return supportsH264;
+                case oxr::protocol::VideoCodec::H265:
+                    return supportsH265;
+                case oxr::protocol::VideoCodec::AV1:
+                default:
+                    return false;
+            }
+        }
+    };
+
     // Callback for each encoded NAL unit
     using OnNalUnitCallback = std::function<void(const uint8_t* data, size_t size,
                                                   bool isKeyframe, int64_t timestampNs)>;
@@ -69,6 +95,7 @@ public:
     // Applies before Initialize(); only the H.265 VideoToolbox path supports Main10.
     void SetTenBitEncoding(bool enabled) { tenBit_ = enabled; }
     static bool SupportsFoveatedEncoding(const GraphicsContext& graphicsContext);
+    static BackendCapabilities QueryBackendCapabilities(const GraphicsContext* graphicsContext = nullptr);
     static bool SupportsCodec(oxr::protocol::VideoCodec codec);
 
     // Encode one backend-native texture/image source.

@@ -77,6 +77,27 @@ Direct3D support is Windows-only through `XR_KHR_D3D11_enable` and `XR_KHR_D3D12
 
 D3D11 snapshots copy the released array layer into a staging texture. D3D12 snapshots enqueue a copy into a readback buffer and signal a fence. The Media Foundation encoder waits/maps outside `Session::EndFrame()`, converts DXGI RGBA/BGRA readback data through the shared NV12 preparation path, and encodes H.264 or H.265.
 
+## Video Encoding
+
+`VideoEncoder::QueryBackendCapabilities()` exposes the compiled backend, hardware availability,
+supported H.264/H.265 codecs, 10-bit support, foveated-encoding support, and an unsupported reason
+for diagnostics. The Apple implementation is a thin wrapper over the existing VideoToolbox behavior.
+Linux VA-API probes DRM render nodes, or `OXRSYS_VAAPI_DRM_DEVICE` when set, and checks encode
+entry points before advertising H.264/H.265. Windows probes hardware Media Foundation encoder MFTs;
+software MFTs are only used when `OXRSYS_MF_ALLOW_SOFTWARE_ENCODER` is explicitly set for debugging.
+
+Streaming codec negotiation is runtime-driven. The server builds a unique candidate list in this
+order: configured codec, client preferred codec, H.265, then H.264. Candidates are filtered by client
+advertisement and backend capabilities; legacy clients with `ClientConnect.supportedCodecs = 0`
+remain H.265-only. If encoder initialization fails for the first candidate, the server automatically
+tries the next compatible codec and logs the fallback.
+
+`VideoBitstream` normalizes encoder output to Annex B for transport. It accepts Annex B and common
+length-prefixed samples, detects H.264 SPS/PPS and H.265 VPS/SPS/PPS parameter sets, marks H.264 IDR
+and H.265 IRAP keyframes, and provides the same splitting path to VA-API and Media Foundation.
+Server-side 10-bit HEVC Main10 and AADT foveated encoding remain VideoToolbox-only until Linux and
+Windows have dedicated GPU-side preprocessing paths.
+
 ## Input And Actions
 
 The input system is profile-aware. The runtime currently supports:
