@@ -29,6 +29,7 @@ client_upscaling = true
 client_reprojection = "pose_warp"
 abr_mode = "full"
 passthrough_enabled = true
+app_alpha_blend_passthrough = true
 occlusion_mode = "environment_depth"
 headset_audio = true
 
@@ -61,6 +62,7 @@ quest_logcat = yes
     CHECK(values.clientReprojectionMode == "pose_warp");
     CHECK(values.abrMode == "full");
     CHECK(values.passthroughEnabled == true);
+    CHECK(values.appAlphaBlendPassthrough == true);
     CHECK(values.occlusionMode == "environment_depth");
     CHECK(values.headsetAudio == true);
     CHECK(values.spatialEnabled == true);
@@ -106,6 +108,7 @@ occlusion_mode = "magic"
     defaults.clientReprojectionMode = "pose";
     defaults.abrMode = "bitrate";
     defaults.passthroughEnabled = true;
+    defaults.appAlphaBlendPassthrough = true;
     defaults.occlusionMode = "scene_mesh";
 
     const ConfigValues values = ParseConfigToml(input, defaults);
@@ -124,6 +127,7 @@ occlusion_mode = "magic"
     CHECK(values.clientReprojectionMode == "pose");
     CHECK(values.abrMode == "bitrate");
     CHECK(values.passthroughEnabled == true);
+    CHECK(values.appAlphaBlendPassthrough == true);
     CHECK(values.occlusionMode == "scene_mesh");
 }
 
@@ -136,6 +140,21 @@ mixed_reality_mode = "alpha"
 
     const ConfigValues values = ParseConfigToml(input);
     CHECK(values.passthroughEnabled == true);
+    CHECK(values.appAlphaBlendPassthrough == true);
+}
+
+TEST_CASE("Config parser lets explicit passthrough keys override legacy mixed reality mode", "[config]")
+{
+    std::istringstream input(R"TOML(
+[streaming]
+passthrough_enabled = false
+app_alpha_blend_passthrough = false
+mixed_reality_mode = "alpha"
+)TOML");
+
+    const ConfigValues values = ParseConfigToml(input);
+    CHECK(values.passthroughEnabled == false);
+    CHECK(values.appAlphaBlendPassthrough == false);
 }
 
 TEST_CASE("Config parser accepts streaming transport", "[config]")

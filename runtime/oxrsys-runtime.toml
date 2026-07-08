@@ -80,9 +80,12 @@ client_reprojection = "pose"
 # "full" may select live streaming resolution profiles on reliable USB TCP.
 abr_mode = "bitrate"
 
-# Enable headset passthrough as a runtime feature. Apps still choose opaque or
-# alpha blend through OpenXR environment blend modes.
+# Enable headset passthrough as a runtime feature.
 passthrough_enabled = false
+
+# Advanced MR opt-in: expose OpenXR alpha-blend environment modes to apps.
+# Keep false for normal VR apps so dark reflective content stays opaque.
+app_alpha_blend_passthrough = false
 
 # Occlusion mode: "off", "scene_mesh", or "environment_depth".
 # Occlusion is enabled only when a compatible depth or scene source is available.

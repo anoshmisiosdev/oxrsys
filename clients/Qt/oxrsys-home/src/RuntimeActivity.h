@@ -12,6 +12,7 @@ struct RuntimeStreamingStats
     int refreshRateHz = 0;
     int currentBitrateMbps = 0;
     int maxBitrateMbps = 0;
+    int configuredBitrateMbps = 0;
     int renderWidth = 0;
     int renderHeight = 0;
     int encodedWidth = 0;
@@ -19,6 +20,9 @@ struct RuntimeStreamingStats
     QString videoCodec;
     QString encoderPreset;
     QString foveatedEncodingPreset;
+    QString foveatedEncodingRequestedPreset;
+    QString foveatedEncodingStatus;
+    bool foveatedEncodingActive = false;
     QString clientFoveationPreset;
     bool clientUpscaling = false;
     QString clientReprojectionMode;

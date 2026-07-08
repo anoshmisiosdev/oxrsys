@@ -38,12 +38,14 @@ with `required="false"` so the APK remains installable on PICO and on devices wi
 At runtime the client enables `XR_FB_passthrough` only when the headset advertises support and the
 passthrough objects can be created; otherwise the shell keeps the 3D grid fallback. During streaming,
 `streaming.passthrough_enabled = true` lets the server keep the Quest passthrough layer active while
-releasing only the local shell GL resources. Apps still choose opaque or alpha-blend presentation via
-OpenXR environment blend modes or source-alpha projection layer flags. Alpha-capable frames are
-marked in the video stream. Until a real alpha or depth transport exists, the Quest shader uses a
-conservative black-key path for transparent-clear AR demo backgrounds; when passthrough is active
-and a stream has not yet sent any alpha flags, the client also enables that black-key fallback so
-transparent Unity clears do not become an opaque black projection layer.
+releasing only the local shell GL resources. It does not by itself expose OpenXR alpha-blend
+environment modes to desktop apps. Apps can opt into streamed alpha passthrough only when the
+advanced `streaming.app_alpha_blend_passthrough = true` setting is enabled before the OpenXR instance
+is created; normal VR apps should leave it disabled so dark reflections and black content stay
+opaque. Alpha-capable frames are marked in the video stream. Until a real alpha or depth transport
+exists, the Quest shader only applies black-key alpha when an explicit compatibility/debug path
+allows it; the default path uses protocol alpha flags and never treats ordinary dark pixels as
+transparent.
 
 This support is negotiated, not hardcoded by model name. The client advertises
 `CLIENT_CAPABILITY_MIXED_REALITY_PASSTHROUGH` only after the headset OpenXR runtime exposes
@@ -57,9 +59,11 @@ USB diagnostics use Android's official `UsbManager` host-device intents and filt
 ## Display Refresh
 
 The runtime announces the preferred display refresh selected in Home/config. The Android client
-requests that value through `XR_FB_display_refresh_rate` when the extension is available, then reports
-the active headset rate back in `ClientConnect.refreshRateHz`. Home exposes `60`, `72`, `80`, `90`,
-and `120` Hz.
+requests that value through `XR_FB_display_refresh_rate` when the extension is available, reads the
+active headset rate again immediately before `ClientConnect`, then reports that value in
+`ClientConnect.refreshRateHz`. Home exposes `60`, `72`, `80`, `90`, and `120` Hz. Client and server
+logs include the requested/server target and the active/negotiated rate so USB cadence mismatches can
+be diagnosed from logs.
 
 The repository still keeps a build-configured fallback used before a server is discovered. The
 default value is `72`, and you can override it per build with a Gradle property:
@@ -123,7 +127,9 @@ The video blit shader supports two server-announced post-processing modes:
   and an intended source factor of `1.5`
 
 The shader path does not depend on the proprietary Snapdragon SDK. It keeps the plain bilinear path
-when the server does not announce upscaling or foveated encoding.
+when the server does not announce upscaling or foveated encoding. Upscaling neighbor taps are clamped
+inside each eye's visible decoded source region so edge sharpening cannot sample the other eye,
+decoder padding, or cropped-out pixels.
 
 ## Client Reprojection
 
@@ -231,7 +237,7 @@ adb -s <serial> reverse tcp:9948 tcp:9948
 
 With `streaming.transport = "auto"`, the Quest app connects to `127.0.0.1:9946` first. If the ADB reverse control channel answers, the client receives `ServerAnnounce`, opens TCP video, tracking, and optional spatial channels, and sends `ClientConnect`. Port `9948` is optional while spatial remains reserved; missing it must not prevent USB video/tracking streaming. If USB is unavailable, it falls back to WiFi UDP discovery while continuing to retry USB periodically so launch order is not critical. When the runtime closes the USB control/video sockets or video stalls after an app exits, the Quest client resets connection state and returns to the same retry loop without requiring the Android app to be relaunched. With `streaming.transport = "usb_adb"`, the runtime disables WiFi discovery fallback.
 
-The Quest client sends `ClientConnect.maxBitrateMbps = 0` on USB ADB, so USB quality is controlled by the server/Home bitrate setting rather than an extra headset-side cap. WiFi keeps its client-side ceiling. It advertises H.264 and H.265 support in `ClientConnect.supportedCodecs` while keeping H.265 in `ClientConnect.preferredCodec`; `supportedCodecs = 0` remains the legacy H.265-only behavior for older clients.
+The Quest client sends `ClientConnect.maxBitrateMbps = 0` on USB ADB, so USB quality is controlled by the server/Home bitrate setting rather than an extra headset-side cap. WiFi keeps its client-side ceiling, currently `100` Mbps for Quest-class clients; runtime status reports both `configured_bitrate_mbps` and the effective `max_bitrate_mbps` so Home can show when WiFi caps a higher server setting. It advertises H.264 and H.265 support in `ClientConnect.supportedCodecs` while keeping H.265 in `ClientConnect.preferredCodec`; `supportedCodecs = 0` remains the legacy H.265-only behavior for older clients.
 
 The runtime configures accepted USB TCP sockets with `TCP_NODELAY`, `SO_NOSIGPIPE` where available, and a bounded send timeout. Encoded video is handed to a bounded sender queue before TCP writes, so socket backpressure cannot run inside the VideoToolbox callback. If a TCP video send fails or times out, the runtime disables the stale TCP video dispatch path and the Android client can reconnect through its existing retry loop. The client also keeps USB tracking TCP sends best-effort/non-blocking so tracking backpressure does not stall the XR frame.
 

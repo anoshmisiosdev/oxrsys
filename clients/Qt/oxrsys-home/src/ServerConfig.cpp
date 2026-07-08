@@ -265,6 +265,7 @@ QString ServerConfig::defaultText()
         "client_reprojection = \"pose\"\n"
         "abr_mode = \"bitrate\"\n"
         "passthrough_enabled = false\n"
+        "app_alpha_blend_passthrough = false\n"
         "occlusion_mode = \"off\"\n"
         "headset_audio = false\n"
         "\n"
@@ -388,18 +389,30 @@ ServerConfig ServerConfig::parse(const QString& text)
         config.abrMode = abrMode;
     }
 
-    ok = false;
     const bool passthroughEnabled = boolValue("passthrough_enabled", text, &ok);
+    const bool hasPassthroughEnabled = ok;
     if (ok)
     {
         config.passthroughEnabled = passthroughEnabled;
     }
-    else
+
+    const bool appAlphaBlendPassthrough = boolValue("app_alpha_blend_passthrough", text, &ok);
+    const bool hasAppAlphaBlendPassthrough = ok;
+    if (ok)
     {
-        const QString mixedRealityMode = stringValue("mixed_reality_mode", text);
-        if (mixedRealityMode == "passthrough" || mixedRealityMode == "alpha")
+        config.appAlphaBlendPassthrough = appAlphaBlendPassthrough;
+    }
+
+    const QString mixedRealityMode = stringValue("mixed_reality_mode", text);
+    if (mixedRealityMode == "passthrough" || mixedRealityMode == "alpha" || mixedRealityMode == "off")
+    {
+        if (!hasPassthroughEnabled)
         {
-            config.passthroughEnabled = true;
+            config.passthroughEnabled = mixedRealityMode != "off";
+        }
+        if (!hasAppAlphaBlendPassthrough)
+        {
+            config.appAlphaBlendPassthrough = mixedRealityMode == "alpha";
         }
     }
 
@@ -458,7 +471,10 @@ QString ServerConfig::mergedInto(const QString& currentText) const
     {
         text = defaultText().trimmed();
     }
-    text = removeSectionKeys(text, "streaming", QStringList{QStringLiteral("fov_degrees")});
+    text = removeSectionKeys(text, "streaming", QStringList{
+        QStringLiteral("fov_degrees"),
+        QStringLiteral("mixed_reality_mode"),
+    });
 
     text = upsertSection(text, "general", {
         {"runtime_enabled", boolString(runtimeEnabled)},
@@ -481,6 +497,7 @@ QString ServerConfig::mergedInto(const QString& currentText) const
         {"client_reprojection", QString("\"%1\"").arg(clientReprojection)},
         {"abr_mode", QString("\"%1\"").arg(abrMode)},
         {"passthrough_enabled", boolString(passthroughEnabled)},
+        {"app_alpha_blend_passthrough", boolString(appAlphaBlendPassthrough)},
         {"occlusion_mode", QString("\"%1\"").arg(occlusionMode)},
         {"headset_audio", boolString(headsetAudio)},
     });

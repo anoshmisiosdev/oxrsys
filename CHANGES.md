@@ -21,7 +21,9 @@ This file tracks user-facing, integration-facing, and runtime-relevant changes f
 - Added Windows Direct3D 11 and Direct3D 12 runtime backends through `XR_KHR_D3D11_enable` and `XR_KHR_D3D12_enable`, including DXGI swapchain images, bounded readback snapshots, FFmpeg conversion, and loader-backed WARP tests.
 - Added loader-backed tests for host graphics extension exposure, including Vulkan everywhere, OpenGL only on Linux builds, and D3D11/D3D12 only on Windows builds.
 - Added protocol v1.2 stream reconfiguration (`StreamConfigUpdate/Ack`) for reliable USB TCP, dynamic encoded-resolution profiles for `abr_mode = "full"`, global passthrough config with app-driven OpenXR alpha blend/source-alpha detection, headset passthrough support/readiness status, occlusion/spatial config gates, a reserved optional spatial TCP channel on `9948`, and matching SwiftUI/Qt Home controls and status display.
+- Added runtime status fields for configured bitrate versus effective client-capped bitrate, and for requested/active foveated encoding state so Home can show when a preset is inactive because of `resolution_scale` or client support.
 - Added a native USB ADB backend to SwiftUI Home so Quest USB reverse setup can run without Android Studio, the Android SDK, Homebrew, or an `adb` executable.
+- Added Settings-based Internal/Custom ADB selection to SwiftUI Home and Qt Home, including editable custom executable paths and auto-detected external `adb` prefills.
 - Added world-space rotational reprojection to the visionOS viewer, reprojecting each streamed frame from its runtime render pose into the live head pose every vsync so the view stays locked to the world while turning.
 
 ### Changed
@@ -38,7 +40,7 @@ This file tracks user-facing, integration-facing, and runtime-relevant changes f
 - Split non-Apple swapchain implementation by backend so Vulkan, Linux OpenGL, D3D11, and D3D12 resources live in separate files behind explicit platform/API guards.
 - Promoted Linux Vulkan/FFmpeg runtime support from scaffolding to Vulkan swapchains, release-time staging readback, H.264/H.265 encode, and backend readback metadata shared by the existing FFmpeg encoder path.
 - Updated Qt simulator video preview with H.264/H.265 decode selection.
-- Updated the Quest/PICO shell to keep passthrough active only when global passthrough is enabled and the headset reports `XR_FB_passthrough` support, key app-requested alpha-blend/source-alpha video backgrounds for current AR demo scenes, and keep the black-key fallback when passthrough is active but no alpha flags have arrived yet.
+- Updated the Quest/PICO shell to keep passthrough active only when global passthrough is enabled and the headset reports `XR_FB_passthrough` support, while keeping app alpha-blend passthrough behind the explicit `app_alpha_blend_passthrough` opt-in instead of the normal passthrough toggle.
 - Updated SwiftUI Home and Qt Home setup flows with first-launch runtime registration guidance, automatic USB reverse configuration when USB is selected, packaged-runtime manifest preference, and native ADB host-server protocol support before falling back to an external `adb` executable.
 - Updated documentation for video codec selection, Linux Vulkan/OpenGL streaming, protocol v1.2, passthrough/MR, native ADB setup, and visionOS reprojection.
 
@@ -46,6 +48,10 @@ This file tracks user-facing, integration-facing, and runtime-relevant changes f
 
 - Contained decode-error corruption on the Apple streaming clients: after a decode failure the decoder drops inter frames and re-requests a keyframe until an IRAP (H.265) or IDR (H.264) arrives, so packet loss shows a brief clean freeze instead of propagating green/blocky corruption.
 - Fixed a potential visionOS black screen when the server streams 8-bit H.265 while the client requests a 10-bit decode surface, by falling back to an 8-bit output surface when 10-bit session creation is rejected; the renderer already selects its color conversion from the buffer's actual pixel format.
+- Fixed SwiftUI Home USB ADB readiness oscillation by moving USB refresh/setup off the view update path, ignoring stale ADB results after source or device changes, preserving verified reverse ports across transient mapping-read failures, and running persisted USB startup reverse setup only once.
+- Fixed Quest shader upscaling sampling so edge-aware neighbor taps stay inside the visible decoded region for each eye instead of sampling the opposite eye, decoder padding, or cropped pixels.
+- Fixed Quest passthrough alpha handling so black/dark VR content is no longer treated as transparent by default; only protocol alpha frames use shader alpha unless an explicit compatibility fallback is added.
+- Fixed Quest refresh-rate reporting before `ClientConnect` by reading the active display rate after the async Meta refresh request and logging requested versus negotiated rates on both client and server.
 - Fixed a Unity editor crash on session shutdown by invalidating stale VideoToolbox encode callbacks before the streaming server is destroyed and by catching callback exceptions inside the encoder.
 - Fixed the visionOS viewer black screen and doubled AR view by sharing one ARKit world-tracking session between the tracking manager and the immersive renderer, and clearing the drawable depth buffer so the visionOS compositor has a surface to reproject.
 - Fixed visionOS eye projection by sending the device's real per-eye FOV and IPD to the runtime, so it renders a matching frustum instead of the symmetric fallback that made the projection look wrong.

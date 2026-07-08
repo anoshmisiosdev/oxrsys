@@ -88,7 +88,7 @@ std::filesystem::path RuntimeConfigPath()
            "Library/Application Support/OXRSys/oxrsys-runtime.toml";
 }
 
-void WriteRuntimeConfig(bool passthroughEnabled)
+void WriteRuntimeConfig(bool passthroughEnabled, bool appAlphaBlendPassthrough = false)
 {
     const std::filesystem::path path = RuntimeConfigPath();
     std::filesystem::create_directories(path.parent_path());
@@ -97,6 +97,9 @@ void WriteRuntimeConfig(bool passthroughEnabled)
     file << "[streaming]\n"
          << "passthrough_enabled = "
          << (passthroughEnabled ? "true" : "false")
+         << "\n"
+         << "app_alpha_blend_passthrough = "
+         << (appAlphaBlendPassthrough ? "true" : "false")
          << "\n"
          << "[logging]\n"
          << "file_logging = false\n";
@@ -414,9 +417,9 @@ TEST_CASE("Instance view and blend APIs reject missing output pointers", "[runti
     xrDestroyInstance(instance);
 }
 
-TEST_CASE("Environment blend modes are stable for an instance after config reload", "[runtime][passthrough]")
+TEST_CASE("Alpha blend modes are stable for an instance after config reload", "[runtime][passthrough]")
 {
-    WriteRuntimeConfig(true);
+    WriteRuntimeConfig(true, true);
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
     std::strncpy(createInfo.applicationInfo.applicationName, "stable_blend_modes_test",
@@ -450,6 +453,30 @@ TEST_CASE("Environment blend modes are stable for an instance after config reloa
                     XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND) == modes.end());
 
     xrDestroyInstance(nextInstance);
+}
+
+TEST_CASE("Passthrough underlay alone does not advertise alpha blend", "[runtime][passthrough]")
+{
+    WriteRuntimeConfig(true, false);
+
+    XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
+    std::strncpy(createInfo.applicationInfo.applicationName, "passthrough_underlay_test",
+                 XR_MAX_APPLICATION_NAME_SIZE);
+    createInfo.applicationInfo.apiVersion = XR_CURRENT_API_VERSION;
+
+    XrInstance instance = XR_NULL_HANDLE;
+    XR_CHECK(xrCreateInstance(&createInfo, &instance));
+
+    XrSystemGetInfo systemGetInfo = {XR_TYPE_SYSTEM_GET_INFO};
+    systemGetInfo.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
+    XrSystemId systemId = XR_NULL_SYSTEM_ID;
+    XR_CHECK(xrGetSystem(instance, &systemGetInfo, &systemId));
+
+    std::vector<XrEnvironmentBlendMode> modes = EnumerateBlendModes(instance, systemId);
+    CHECK(std::find(modes.begin(), modes.end(),
+                    XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND) == modes.end());
+
+    xrDestroyInstance(instance);
 }
 
 TEST_CASE("Runtime accepts Unity metal extension alias", "[runtime][loader]")

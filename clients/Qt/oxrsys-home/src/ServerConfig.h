@@ -31,6 +31,7 @@ struct ServerConfig
     QString clientReprojection = "pose";
     QString abrMode = "bitrate";
     bool passthroughEnabled = false;
+    bool appAlphaBlendPassthrough = false;
     QString occlusionMode = "off";
     bool headsetAudio = false;
     bool spatialEnabled = false;

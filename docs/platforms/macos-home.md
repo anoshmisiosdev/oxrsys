@@ -7,7 +7,7 @@ The native macOS Home app lives in `clients/Apple/oxrsys-home/` and provides thr
 - `Apps`: scans for compatible apps, manages manually added apps, launches them with
   `XR_RUNTIME_JSON`, and captures stdout/stderr logs.
 - `Settings`: registers the selected OpenXR runtime manifest for the current user and exposes
-  Home preferences.
+  Home preferences, including ADB setup.
 - `Streaming`: autosaves edits to `~/Library/Application Support/OXRSys/oxrsys-runtime.toml`.
 
 When `Developer Mode` is enabled from the `Settings` tab, the main window also shows a `Developer`
@@ -121,12 +121,14 @@ per second from the existing encode telemetry callback and is omitted when the r
 idle. The fields are:
 
 - `sample_unix_ms`
-- `refresh_rate_hz`, `current_bitrate_mbps`, `max_bitrate_mbps`
+- `refresh_rate_hz`, `current_bitrate_mbps`, `max_bitrate_mbps`, `configured_bitrate_mbps`
 - `render_width`, `render_height`, `encoded_width`, `encoded_height`
-- `video_codec`, `encoder_preset`, `foveated_encoding_preset`, `client_foveation_preset`,
-  `client_upscaling`, `client_reprojection_mode`, `abr_mode`, `abr_state`,
-  `abr_profile`, `resolution_scale`, `dynamic_resolution_min_scale`,
-  `stream_reconfigure`, `stream_config_sequence`, `passthrough_enabled`,
+- `video_codec`, `encoder_preset`, `foveated_encoding_preset`,
+  `foveated_encoding_requested_preset`, `foveated_encoding_status`,
+  `foveated_encoding_active`, `client_foveation_preset`, `client_upscaling`,
+  `client_reprojection_mode`, `abr_mode`, `abr_state`, `abr_profile`,
+  `resolution_scale`, `dynamic_resolution_min_scale`, `stream_reconfigure`,
+  `stream_config_sequence`, `passthrough_enabled`,
   `passthrough_supported`, `passthrough_ready`, `occlusion_mode`, `spatial_enabled`,
   `headset_audio`
 - `latency_ms.server_pipeline`, `latency_ms.client_pipeline`,
@@ -148,16 +150,18 @@ missing reverse mappings on `9944`, `9945`, `9946`, and `9948`. The Home app wri
 `streaming.transport = "usb_adb"` only after USB validation or reverse setup succeeds. If multiple
 authorized devices are visible, Home asks the user to pick one before configuring reverse mappings.
 If setup fails, Home keeps the previous persisted transport and leaves the USB action available for
-retry.
+retry. On startup, Home performs this automatic reverse setup only when the persisted transport is
+already `usb_adb`; the default `auto` transport only refreshes readiness until the user selects USB
+or presses `Configure USB Reverse`.
 
-The Quest USB ADB section can also store a custom `adb` executable path in the SwiftUI Home
-`UserDefaults`. Without a custom path, Home first claims the headset's USB ADB interface directly,
-performs ADB authentication with a Home-managed host key, and configures reverse mappings without
-Android Studio, the Android SDK, Homebrew, or an `adb` executable. If the native USB path is
-unavailable, Home falls back to a running local ADB server on `127.0.0.1:5037`, then to SDK,
-Homebrew, and `PATH` executable candidates. A selected custom path is tried directly and must be
-executable and pass `adb version`; if it becomes invalid, Home reports that path and does not
-silently fall back until `Auto Detect` clears it.
+The Settings ADB section stores an ADB mode and optional custom `adb` executable path in SwiftUI Home
+`UserDefaults`. `Internal` mode first claims the headset's USB ADB interface directly, performs ADB
+authentication with a Home-managed host key, and configures reverse mappings without Android Studio,
+the Android SDK, Homebrew, or an `adb` executable. If the native USB path is unavailable, Home falls
+back to a running local ADB server on `127.0.0.1:5037`, then to SDK, Homebrew, and `PATH` executable
+candidates. `Custom` mode tries only the configured executable path; `Auto Detect` pre-fills that
+path from the detected external `adb` executable when one is available. If the selected custom path
+is empty or invalid, Home reports that path and does not silently fall back to Internal mode.
 
 ## Runtime Registration
 
@@ -192,6 +196,7 @@ The structured editor covers the current runtime keys:
 - `streaming.client_reprojection`
 - `streaming.abr_mode`
 - `streaming.passthrough_enabled`
+- `streaming.app_alpha_blend_passthrough`
 - `streaming.occlusion_mode`
 - `streaming.headset_audio`
 - `spatial.enabled`
@@ -201,10 +206,11 @@ The structured editor covers the current runtime keys:
 - `logging.file_logging`
 - `logging.quest_logcat`
 
-The bitrate control accepts the shared runtime range, `1` to `200` Mbps. Apple
-and Qt simulator clients do not add their own bitrate ceiling, so the runtime
-status `max_bitrate_mbps` should reflect the configured value when those
-clients connect.
+The bitrate control accepts the shared runtime range, `1` to `200` Mbps.
+`configured_bitrate_mbps` reports the Home/server value, while `max_bitrate_mbps`
+reports the effective ceiling after a headset client cap. Apple and Qt simulator
+clients do not add their own bitrate ceiling, so those values should match when
+the simulators connect.
 
 The video codec control writes `h265`, `h264`, or `auto`. H.265 remains the default and legacy
 clients that do not advertise codec capabilities are treated as H.265-only. H.264 is selected only
@@ -222,7 +228,10 @@ not write `streaming.fov_degrees`; the runtime only keeps that key as a legacy
 fallback for clients that do not send `TrackingPacket.eyeFov`.
 
 `foveated_encoding_preset` controls the server-side ALVR-style AADT video
-compression path on supported server/client combinations.
+compression path on supported server/client combinations. Runtime status keeps
+the requested preset separately from the active preset and reports
+`inactive_resolution_scale` when foveated encoding was requested but cannot be
+announced coherently because `resolution_scale < 1`.
 
 The Headset Client section owns client-side headset options. `client_foveation_preset = "auto"`
 does not send an `XR_FB_foveation` override to the headset client; `off`, `light`, `medium`,
@@ -245,12 +254,12 @@ version. `quality` and `balanced` use `resolution_scale`, `smooth` uses
 `max(dynamic_resolution_min_scale, resolution_scale * 0.85)`, and `wifi_smooth` uses
 `max(dynamic_resolution_min_scale, resolution_scale * 0.70)`.
 
-`passthrough_enabled` controls whether the runtime exposes app-requested passthrough support.
-When enabled, compatible headset clients keep a passthrough underlay active while streaming and
-the runtime can expose `XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND`; the application still chooses
-the blend path through OpenXR environment blend mode or source-alpha projection layer flags. The
-runtime snapshots blend-mode support when an OpenXR instance is created, so changing this setting
-requires restarting the OpenXR app/runtime session to change advertised blend modes.
+`passthrough_enabled` controls whether compatible headset clients keep a passthrough underlay active
+while streaming. It does not expose OpenXR alpha-blend environment modes to normal VR apps.
+`app_alpha_blend_passthrough` is an advanced opt-in for explicit MR apps that need
+`XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND` or source-alpha projection streaming. The runtime snapshots
+blend-mode support when an OpenXR instance is created, so changing the alpha opt-in requires
+restarting the OpenXR app/runtime session to change advertised blend modes.
 `passthrough_supported` is the connected headset capability reported by the Android client after
 querying its local OpenXR runtime, and `passthrough_ready` is true only when the global setting
 and headset support are both present.
@@ -274,9 +283,9 @@ The runtime reloads config file changes opportunistically:
   clears headset logcat best-effort with a timeout before capture and continues if that clear fails
 - `bitrate_mbps`, `resolution_scale`, `dynamic_resolution_min_scale`, `refresh_rate_hz`, `encoder_preset`, `transport`,
   `foveated_encoding_preset`, `client_foveation_preset`, `client_upscaling`,
-  `client_reprojection`, `abr_mode`, `passthrough_enabled`, `occlusion_mode`, `[spatial]`,
-  and `headset_audio` apply when streaming or the
+  `client_reprojection`, `abr_mode`, `passthrough_enabled`,
+  `app_alpha_blend_passthrough`, `occlusion_mode`, `[spatial]`, and `headset_audio` apply when streaming or the
   encoder/client connection is recreated
 - file logger sink setup still requires a restart
 
-The Quest USB ADB section detects authorized ADB devices, applies reverse mappings for ports `9944`, `9945`, `9946`, and `9948`, then verifies them through the native USB ADB protocol, the local ADB server protocol, or `adb reverse --list` fallback. This prepares the USB TCP transport and the reserved reliable spatial channel; it is separate from Android `UsbManager` app permission prompts.
+The Settings ADB section detects authorized ADB devices, applies reverse mappings for ports `9944`, `9945`, `9946`, and `9948`, then verifies them through the native USB ADB protocol, the local ADB server protocol, or `adb reverse --list` fallback. USB refresh/setup results are request-scoped so stale results after ADB mode, path, selected device, or transport changes are ignored. If a periodic refresh cannot read reverse mappings for the same still-authorized device, Home preserves previously verified reverse ports instead of flipping the main readiness pill to not ready. This prepares the USB TCP transport and the reserved reliable spatial channel; it is separate from Android `UsbManager` app permission prompts.

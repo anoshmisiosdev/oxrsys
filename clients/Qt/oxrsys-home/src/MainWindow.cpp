@@ -354,6 +354,48 @@ QString registrationButtonTitle(const HomeModel& model)
     return "Enable Registration";
 }
 
+QString bitrateSubtitleText(const RuntimeStreamingStats& stats)
+{
+    if (stats.configuredBitrateMbps > 0 &&
+        stats.maxBitrateMbps > 0 &&
+        stats.configuredBitrateMbps != stats.maxBitrateMbps)
+    {
+        return QString("configured %1").arg(stats.configuredBitrateMbps);
+    }
+    return "effective max";
+}
+
+QString encodedStatusText(const RuntimeStreamingStats& stats)
+{
+    const QString codec = stats.videoCodec.isEmpty()
+        ? QStringLiteral("stream")
+        : stats.videoCodec.toUpper();
+    const QString requested = stats.foveatedEncodingRequestedPreset.isEmpty()
+        ? stats.foveatedEncodingPreset
+        : stats.foveatedEncodingRequestedPreset;
+    if (requested.isEmpty() || requested == "off")
+    {
+        return codec;
+    }
+    if (stats.foveatedEncodingStatus == "active")
+    {
+        return QString("FFE %1").arg(requested);
+    }
+    if (stats.foveatedEncodingStatus == "inactive_resolution_scale")
+    {
+        return "FFE off: scale < 1";
+    }
+    if (stats.foveatedEncodingStatus == "client_unsupported")
+    {
+        return "FFE unsupported";
+    }
+    if (stats.foveatedEncodingStatus == "unavailable")
+    {
+        return "FFE unavailable";
+    }
+    return stats.foveatedEncodingActive ? QString("FFE %1").arg(requested) : codec;
+}
+
 } // namespace
 
 class RuntimeStatsChart final : public QFrame
@@ -794,6 +836,54 @@ QWidget* MainWindow::buildSettingsTab()
     registrationLayout->addLayout(registrationButtons);
     layout->addWidget(registrationBox);
 
+    auto* usbBox = new QGroupBox("ADB", content);
+    auto* usbLayout = new QVBoxLayout(usbBox);
+    auto* adbForm = new QFormLayout();
+    adbModeCombo_ = new QComboBox(usbBox);
+    adbModeCombo_->addItem("Internal", "internal");
+    adbModeCombo_->addItem("Custom", "custom");
+    customAdbPathLineEdit_ = new QLineEdit(usbBox);
+    customAdbPathLineEdit_->setPlaceholderText("Path to adb");
+    usbDeviceCombo_ = new QComboBox(usbBox);
+    adbForm->addRow("ADB mode", adbModeCombo_);
+    adbForm->addRow("Custom path", customAdbPathLineEdit_);
+    adbForm->addRow("Quest device", usbDeviceCombo_);
+    usbLayout->addLayout(adbForm);
+    adbStatusLabel_ = secondaryLabel();
+    adbStatusLabel_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    usbLayout->addWidget(adbStatusLabel_);
+    auto* adbButtons = new QHBoxLayout();
+    auto* selectAdbButton = iconButton(usbBox, QStyle::SP_DialogOpenButton, "Browse");
+    autoDetectAdbPathButton_ = iconButton(usbBox, QStyle::SP_BrowserReload, "Auto Detect");
+    connect(adbModeCombo_, qOverload<int>(&QComboBox::currentIndexChanged), this, [this]() {
+        model_->setAdbMode(adbModeCombo_->currentData().toString());
+    });
+    connect(customAdbPathLineEdit_, &QLineEdit::editingFinished, this, [this]() {
+        model_->setCustomAdbPath(customAdbPathLineEdit_->text());
+    });
+    connect(selectAdbButton, &QPushButton::clicked, this, &MainWindow::chooseCustomAdbExecutable);
+    connect(autoDetectAdbPathButton_, &QPushButton::clicked,
+            model_, &HomeModel::prefillCustomAdbPathFromDetectedExecutable);
+    adbButtons->addWidget(selectAdbButton);
+    adbButtons->addWidget(autoDetectAdbPathButton_);
+    adbButtons->addStretch();
+    usbLayout->addLayout(adbButtons);
+    usbStatusLabel_ = secondaryLabel();
+    usbLayout->addWidget(usbStatusLabel_);
+    auto* usbButtons = new QHBoxLayout();
+    auto* refreshDevicesButton = iconButton(usbBox, QStyle::SP_BrowserReload, "Refresh Devices");
+    configureUsbButton_ = iconButton(usbBox, QStyle::SP_ComputerIcon, "Configure USB Reverse");
+    connect(usbDeviceCombo_, qOverload<int>(&QComboBox::currentIndexChanged), this, [this]() {
+        model_->setSelectedQuestUsbSerial(usbDeviceCombo_->currentData().toString());
+    });
+    connect(refreshDevicesButton, &QPushButton::clicked, model_, &HomeModel::refreshQuestUsbDevices);
+    connect(configureUsbButton_, &QPushButton::clicked, model_, &HomeModel::configureQuestUsbReverse);
+    usbButtons->addWidget(refreshDevicesButton);
+    usbButtons->addWidget(configureUsbButton_);
+    usbButtons->addStretch();
+    usbLayout->addLayout(usbButtons);
+    layout->addWidget(usbBox);
+
     layout->addStretch();
     scroll->setWidget(content);
     outerLayout->addWidget(scroll);
@@ -991,40 +1081,6 @@ QWidget* MainWindow::buildStreamingTab()
     layout->addWidget(configBox);
     layout->addWidget(headsetBox);
 
-    auto* usbBox = new QGroupBox("Quest USB ADB", content);
-    auto* usbLayout = new QVBoxLayout(usbBox);
-    auto* usbForm = new QFormLayout();
-    usbDeviceCombo_ = new QComboBox(usbBox);
-    usbForm->addRow("Quest device", usbDeviceCombo_);
-    usbLayout->addLayout(usbForm);
-    adbStatusLabel_ = secondaryLabel();
-    adbStatusLabel_->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    usbLayout->addWidget(adbStatusLabel_);
-    auto* adbButtons = new QHBoxLayout();
-    auto* selectAdbButton = iconButton(usbBox, QStyle::SP_DialogOpenButton, "Select ADB");
-    clearAdbPathButton_ = iconButton(usbBox, QStyle::SP_BrowserReload, "Auto Detect");
-    connect(selectAdbButton, &QPushButton::clicked, this, &MainWindow::chooseCustomAdbExecutable);
-    connect(clearAdbPathButton_, &QPushButton::clicked, model_, &HomeModel::clearCustomAdbPath);
-    adbButtons->addWidget(selectAdbButton);
-    adbButtons->addWidget(clearAdbPathButton_);
-    adbButtons->addStretch();
-    usbLayout->addLayout(adbButtons);
-    usbStatusLabel_ = secondaryLabel();
-    usbLayout->addWidget(usbStatusLabel_);
-    auto* usbButtons = new QHBoxLayout();
-    auto* refreshDevicesButton = iconButton(usbBox, QStyle::SP_BrowserReload, "Refresh Devices");
-    configureUsbButton_ = iconButton(usbBox, QStyle::SP_ComputerIcon, "Configure USB Reverse");
-    connect(usbDeviceCombo_, qOverload<int>(&QComboBox::currentIndexChanged), this, [this]() {
-        model_->setSelectedQuestUsbSerial(usbDeviceCombo_->currentData().toString());
-    });
-    connect(refreshDevicesButton, &QPushButton::clicked, model_, &HomeModel::refreshQuestUsbDevices);
-    connect(configureUsbButton_, &QPushButton::clicked, model_, &HomeModel::configureQuestUsbReverse);
-    usbButtons->addWidget(refreshDevicesButton);
-    usbButtons->addWidget(configureUsbButton_);
-    usbButtons->addStretch();
-    usbLayout->addLayout(usbButtons);
-    layout->addWidget(usbBox);
-
     layout->addStretch();
     scroll->setWidget(content);
     outerLayout->addWidget(scroll);
@@ -1063,7 +1119,7 @@ QWidget* MainWindow::buildDeveloperTab()
     auto* statsLayout = new QVBoxLayout(statsBox);
     auto* metricsGrid = new QGridLayout();
     metricsGrid->addWidget(buildMetric("Refresh", &refreshRateMetricLabel_, "Display target"), 0, 0);
-    metricsGrid->addWidget(buildMetric("Bitrate", &bitrateMetricLabel_, "Current / max"), 0, 1);
+    metricsGrid->addWidget(buildMetric("Bitrate", &bitrateMetricLabel_, "Current / effective"), 0, 1);
     metricsGrid->addWidget(buildMetric("Render", &renderMetricLabel_, "Stereo source"), 0, 2);
     metricsGrid->addWidget(buildMetric("Encoded", &encodedMetricLabel_, "Encoded stream"), 0, 3);
     metricsGrid->addWidget(buildMetric("Scale", &scaleMetricLabel_, "Current / min"), 1, 0);
@@ -1252,13 +1308,17 @@ void MainWindow::refreshLogs()
 
 void MainWindow::refreshSettings()
 {
-    developerModeCheckBox_->blockSignals(true);
-    developerModeCheckBox_->setChecked(model_->developerModeEnabled());
-    developerModeCheckBox_->blockSignals(false);
+    const QList<QWidget*> controls = {
+        developerModeCheckBox_, runtimeManifestLineEdit_, adbModeCombo_, customAdbPathLineEdit_,
+        usbDeviceCombo_,
+    };
+    for (QWidget* control : controls)
+    {
+        control->blockSignals(true);
+    }
 
-    runtimeManifestLineEdit_->blockSignals(true);
+    developerModeCheckBox_->setChecked(model_->developerModeEnabled());
     runtimeManifestLineEdit_->setText(model_->runtimeManifestPath());
-    runtimeManifestLineEdit_->blockSignals(false);
 
     setElidedText(registrationFileLabel_, model_->paths().activeRuntimePath);
     setElidedText(currentRuntimeTargetLabel_,
@@ -1274,6 +1334,32 @@ void MainWindow::refreshSettings()
     registerRuntimeButton_->setEnabled(supportsRuntimeRegistration());
     unregisterRuntimeButton_->setEnabled(supportsRuntimeRegistration() &&
                                          model_->runtimeRegistrationStatus().activeRuntimeExists);
+
+    adbModeCombo_->setCurrentIndex(std::max(adbModeCombo_->findData(model_->adbMode()), 0));
+    customAdbPathLineEdit_->setText(model_->customAdbPath());
+    const bool customAdbMode = model_->adbMode() == "custom";
+    customAdbPathLineEdit_->setEnabled(customAdbMode);
+    autoDetectAdbPathButton_->setEnabled(customAdbMode);
+
+    usbDeviceCombo_->clear();
+    usbDeviceCombo_->addItem("Select a device", QString());
+    for (const AdbDevice& device : model_->questUsbDevices())
+    {
+        usbDeviceCombo_->addItem(device.displayName(), device.serial);
+        if (device.serial == model_->selectedQuestUsbSerial())
+        {
+            usbDeviceCombo_->setCurrentIndex(usbDeviceCombo_->count() - 1);
+        }
+    }
+
+    for (QWidget* control : controls)
+    {
+        control->blockSignals(false);
+    }
+
+    adbStatusLabel_->setText(model_->adbStatus().message);
+    usbStatusLabel_->setText(model_->questUsbStatus());
+    configureUsbButton_->setEnabled(!model_->selectedQuestUsbSerial().isEmpty());
 }
 
 void MainWindow::refreshStreaming()
@@ -1286,7 +1372,7 @@ void MainWindow::refreshStreaming()
         bitrateSlider_, resolutionSlider_, dynamicResolutionSlider_, keyframeSlider_,
         refreshRateCombo_, encoderPresetCombo_, videoCodecCombo_, foveatedEncodingPresetCombo_,
         clientFoveationPresetCombo_, clientReprojectionCombo_, abrModeCombo_,
-        occlusionModeCombo_, configTransportCombo_, usbDeviceCombo_,
+        occlusionModeCombo_, configTransportCombo_,
     };
     for (QWidget* control : controls)
     {
@@ -1325,17 +1411,6 @@ void MainWindow::refreshStreaming()
         std::max(occlusionModeCombo_->findData(config.occlusionMode), 0));
     configTransportCombo_->setCurrentIndex(std::max(configTransportCombo_->findData(config.transport), 0));
 
-    usbDeviceCombo_->clear();
-    usbDeviceCombo_->addItem("Select a device", QString());
-    for (const AdbDevice& device : model_->questUsbDevices())
-    {
-        usbDeviceCombo_->addItem(device.displayName(), device.serial);
-        if (device.serial == model_->selectedQuestUsbSerial())
-        {
-            usbDeviceCombo_->setCurrentIndex(usbDeviceCombo_->count() - 1);
-        }
-    }
-
     for (QWidget* control : controls)
     {
         control->blockSignals(false);
@@ -1349,10 +1424,6 @@ void MainWindow::refreshStreaming()
     sharpeningValueLabel_->setText(config.clientSharpening <= 0.0
                                        ? QStringLiteral("Off")
                                        : QString::number(config.clientSharpening, 'f', 2));
-    adbStatusLabel_->setText(model_->adbStatus().message);
-    clearAdbPathButton_->setEnabled(!model_->customAdbPath().isEmpty());
-    usbStatusLabel_->setText(model_->questUsbStatus());
-    configureUsbButton_->setEnabled(!model_->selectedQuestUsbSerial().isEmpty());
 }
 
 void MainWindow::refreshDeveloper()
@@ -1367,11 +1438,11 @@ void MainWindow::refreshDeveloper()
     bitrateMetricLabel_->setText(QString("%1 / %2 Mbps")
                                      .arg(stats.currentBitrateMbps)
                                      .arg(stats.maxBitrateMbps));
+    bitrateMetricLabel_->setToolTip(bitrateSubtitleText(stats));
     renderMetricLabel_->setText(dimensionsText(stats.renderWidth, stats.renderHeight));
     const QString encodedDimensions = dimensionsText(stats.encodedWidth, stats.encodedHeight);
-    encodedMetricLabel_->setText(stats.videoCodec.isEmpty()
-                                     ? encodedDimensions
-                                     : QString("%1 (%2)").arg(encodedDimensions, stats.videoCodec.toUpper()));
+    encodedMetricLabel_->setText(QString("%1 (%2)")
+                                     .arg(encodedDimensions, encodedStatusText(stats)));
     scaleMetricLabel_->setText(QString("%1 / %2")
                                    .arg(stats.resolutionScale, 0, 'f', 2)
                                    .arg(stats.dynamicResolutionMinScale, 0, 'f', 2));

@@ -176,6 +176,18 @@ float luma(vec3 color) {
     return dot(color, vec3(0.299, 0.587, 0.114));
 }
 
+vec2 clampSourceUv(vec2 uv) {
+    vec2 sourceMin = min(uEyeSourceMin, uEyeSourceMax);
+    vec2 sourceMax = max(uEyeSourceMin, uEyeSourceMax);
+    vec2 inset = min(max(uLogicalTexelSize, vec2(0.00001)) * 0.5,
+                     max((sourceMax - sourceMin) * 0.5, vec2(0.0)));
+    return clamp(uv, sourceMin + inset, sourceMax - inset);
+}
+
+vec3 sampleSource(vec2 uv) {
+    return texture(uTexture, clampSourceUv(uv)).rgb;
+}
+
 void main() {
     vec2 eyeUv = clamp(vUV, vec2(0.0), vec2(1.0));
     if (uReprojectionWarpEnabled != 0) {
@@ -204,17 +216,17 @@ void main() {
     }
     corrected = clamp(corrected, vec2(0.0), vec2(1.0));
     vec2 sourceRange = uEyeSourceMax - uEyeSourceMin;
-    vec2 sourceUv = mix(uEyeSourceMin, uEyeSourceMax, corrected);
-    vec3 color = texture(uTexture, sourceUv).rgb;
+    vec2 sourceUv = clampSourceUv(mix(uEyeSourceMin, uEyeSourceMax, corrected));
+    vec3 color = sampleSource(sourceUv);
 
     if (uClientUpscalingEnabled != 0) {
         vec2 stepUv = max(uLogicalTexelSize, vec2(0.00001));
         // Linearized neighbor placement -- no extra binary searches.
         vec2 sourceStep = stepUv * invSlope * sourceRange;
-        vec3 left = texture(uTexture, sourceUv - vec2(sourceStep.x, 0.0)).rgb;
-        vec3 right = texture(uTexture, sourceUv + vec2(sourceStep.x, 0.0)).rgb;
-        vec3 up = texture(uTexture, sourceUv - vec2(0.0, sourceStep.y)).rgb;
-        vec3 down = texture(uTexture, sourceUv + vec2(0.0, sourceStep.y)).rgb;
+        vec3 left = sampleSource(sourceUv - vec2(sourceStep.x, 0.0));
+        vec3 right = sampleSource(sourceUv + vec2(sourceStep.x, 0.0));
+        vec3 up = sampleSource(sourceUv - vec2(0.0, sourceStep.y));
+        vec3 down = sampleSource(sourceUv + vec2(0.0, sourceStep.y));
         float edgeVote = abs(luma(left) - luma(right)) + abs(luma(up) - luma(down));
         if (edgeVote > uUpscaleEdgeThreshold) {
             vec3 detail = color * 4.0 - left - right - up - down;
@@ -1492,12 +1504,7 @@ bool XrApp::InitializeDisplayRefreshRate(float preferredRefreshRateHz)
              preferredRefreshRateHz);
         if (xrGetDisplayRefreshRateFB_ != nullptr)
         {
-            float currentRate = 0.0f;
-            if (XR_SUCCEEDED(xrGetDisplayRefreshRateFB_(session_, &currentRate)))
-            {
-                LOGI("Current display refresh rate: %.1fHz", currentRate);
-                clientRefreshRateHz_ = static_cast<uint32_t>(std::max(1.0f, std::round(currentRate)));
-            }
+            RefreshCurrentDisplayRate("preferred rate unavailable", true);
         }
         return true;
     }
@@ -1513,15 +1520,50 @@ bool XrApp::InitializeDisplayRefreshRate(float preferredRefreshRateHz)
 
     LOGI("Requested display refresh rate: %.1fHz", preferredRefreshRateHz);
 
-    // xrRequestDisplayRefreshRateFB is asynchronous -- the runtime hasn't
-    // necessarily applied the new rate by the time this function returns, so
-    // querying xrGetDisplayRefreshRateFB right here is racy and can read back
-    // the *old* rate, silently reporting the wrong refresh to the server for
-    // the lifetime of the connection. We already confirmed preferredRefreshRateHz
-    // is in the supported list (hasPreferredRate above) and the request itself
-    // succeeded, so just trust it instead of an immediate, unreliable read-back.
-    clientRefreshRateHz_ = static_cast<uint32_t>(std::max(1.0f, std::round(preferredRefreshRateHz)));
+    RefreshCurrentDisplayRate("after refresh request", false);
 
+    return true;
+}
+
+bool XrApp::RefreshCurrentDisplayRate(const char* context, bool logIfUnavailable)
+{
+    if (session_ == XR_NULL_HANDLE || xrGetDisplayRefreshRateFB_ == nullptr)
+    {
+        if (logIfUnavailable)
+        {
+            LOGW("Display refresh read unavailable before %s; keeping %uHz",
+                 context != nullptr ? context : "refresh update",
+                 clientRefreshRateHz_);
+        }
+        return false;
+    }
+
+    float currentRate = 0.0f;
+    const XrResult result = xrGetDisplayRefreshRateFB_(session_, &currentRate);
+    if (XR_FAILED(result) || currentRate <= 0.0f)
+    {
+        if (logIfUnavailable)
+        {
+            LOGW("Failed to read active display refresh before %s: result=%d rate=%.1f; keeping %uHz",
+                 context != nullptr ? context : "refresh update",
+                 result,
+                 currentRate,
+                 clientRefreshRateHz_);
+        }
+        return false;
+    }
+
+    const uint32_t activeRefreshRateHz =
+        static_cast<uint32_t>(std::max(1.0f, std::round(currentRate)));
+    if (activeRefreshRateHz != clientRefreshRateHz_ || logIfUnavailable)
+    {
+        LOGI("Active display refresh before %s: %.1fHz (reported %uHz, previous %uHz)",
+             context != nullptr ? context : "refresh update",
+             currentRate,
+             activeRefreshRateHz,
+             clientRefreshRateHz_);
+    }
+    clientRefreshRateHz_ = activeRefreshRateHz;
     return true;
 }
 
@@ -2714,6 +2756,8 @@ void XrApp::ConfigureServerConnection(const protocol::ServerAnnounce& server,
         OpenUsbSpatialSocket(serverSpatialPort_);
     }
 
+    RefreshCurrentDisplayRate("ClientConnect", true);
+
     // NOW send ClientConnect — server will start sending video, and we're already listening
     SendClientConnect(serverIp);
     StartControlReceiver();
@@ -2780,7 +2824,7 @@ void XrApp::SendClientConnect(const char* serverIp)
 
     LOGI("Sent ClientConnect via %s to %s:%d (device='%s' refresh=%uHz maxBitrate=%u capabilities=0x%x passthrough=%d)",
          usbAdb ? "USB ADB" : "WiFi", serverIp, protocol::CONTROL_PORT,
-         connect.deviceName, clientRefreshRateHz_, connect.maxBitrateMbps,
+         connect.deviceName, connect.refreshRateHz, connect.maxBitrateMbps,
          connect.clientCapabilities,
          (connect.clientCapabilities & protocol::CLIENT_CAPABILITY_MIXED_REALITY_PASSTHROUGH) != 0
              ? 1
@@ -3584,8 +3628,15 @@ void XrApp::RunFrame()
     if (frameState.predictedDisplayPeriod > 0)
     {
         predictedDisplayPeriodNs_ = frameState.predictedDisplayPeriod;
-        clientRefreshRateHz_ = static_cast<uint32_t>(
+        const uint32_t frameRefreshRateHz = static_cast<uint32_t>(
             std::max(1.0, std::round(1.0e9 / static_cast<double>(predictedDisplayPeriodNs_))));
+        if (frameRefreshRateHz != clientRefreshRateHz_)
+        {
+            LOGI("Frame timing display refresh changed: %uHz -> %uHz",
+                 clientRefreshRateHz_,
+                 frameRefreshRateHz);
+            clientRefreshRateHz_ = frameRefreshRateHz;
+        }
     }
 
     // xrBeginFrame
@@ -4075,7 +4126,7 @@ bool XrApp::RenderFrame(XrTime predictedDisplayTime)
             if (alphaKey.usingTransparentClearFallback &&
                 !loggedTransparentClearFallback_)
             {
-                LOGW("Passthrough stream has no alpha flags; using black-key fallback");
+                LOGW("Explicit passthrough black-key compatibility fallback is active");
                 loggedTransparentClearFallback_ = true;
             }
 
@@ -4587,6 +4638,7 @@ quest_passthrough::AlphaKeyDecision XrApp::EvaluatePassthroughAlphaKey() const
         serverMixedRealityPassthroughEnabled_ && CanUseShellPassthrough(),
         presentedVideoFrame_.alphaBlend,
         hasObservedProtocolAlphaFrame_,
+        false,
     });
 }
 
