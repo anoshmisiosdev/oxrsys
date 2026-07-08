@@ -11,6 +11,7 @@ OXRSys is independent software. It is not affiliated with, endorsed by, sponsore
 ### Android VR Client
 
 The Android VR client can be used over WiFi or USB. The USB path is the best way to experiment with the runtime because it gives the lowest latency. The macOS SwiftUI Home app can configure USB reverse directly through the headset USB ADB interface, so Android Studio and the Android SDK are not required for normal USB setup; a running local ADB server or external `adb` executable remains a fallback.
+For Quest sideload validation, `assembleRelease` is the stable debug-signed APK; `assembleOptimizedRelease` is reserved for diagnosing optimized Android regressions.
 
 ### Home Apps
 

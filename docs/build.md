@@ -329,6 +329,8 @@ selection through `XR_RUNTIME_JSON`, OXRSys Home, or `scripts/oxrsys_runtime_def
 - If a Home-launched app does not pick up the runtime, check the Apps tab logs and the Runtime
   Registration launch target. The launcher uses the selected manifest path shown by Home.
 - If Android tooling is not found, verify `clients/Android/android-vr/local.properties`, Java 17, and the installed SDK/NDK versions described in [install.md](install.md).
+- For Quest sideload validation, use `./gradlew assembleRelease`; `assembleOptimizedRelease` is only
+  for diagnosing non-debuggable optimized Android regressions.
 - If the runtime is not discovered, check that `XR_RUNTIME_JSON` or `~/.config/openxr/1/active_runtime.json` points to `build/runtime/oxrsys-runtime.json`.
 - If an exported macOS Unity Player logs `Failed to load openxr runtime loader.`, install
   `net.demonixis.oxrsys-unity` in the Unity project and rebuild the `.app`.

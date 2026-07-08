@@ -52,6 +52,9 @@ This file tracks user-facing, integration-facing, and runtime-relevant changes f
 - Fixed Quest shader upscaling sampling so edge-aware neighbor taps stay inside the visible decoded region for each eye instead of sampling the opposite eye, decoder padding, or cropped pixels.
 - Fixed Quest passthrough alpha handling so black/dark VR content is no longer treated as transparent by default; only protocol alpha frames use shader alpha unless an explicit compatibility fallback is added.
 - Fixed Quest refresh-rate reporting before `ClientConnect` by reading the active display rate after the async Meta refresh request and logging requested versus negotiated rates on both client and server.
+- Fixed Quest Android release sideload stability by making `assembleRelease` a debug-signed,
+  debuggable stable APK with conservative native flags, and by adding `assembleOptimizedRelease` for
+  diagnosing the old optimized/non-debuggable profile.
 - Fixed a Unity editor crash on session shutdown by invalidating stale VideoToolbox encode callbacks before the streaming server is destroyed and by catching callback exceptions inside the encoder.
 - Fixed the visionOS viewer black screen and doubled AR view by sharing one ARKit world-tracking session between the tracking manager and the immersive renderer, and clearing the drawable depth buffer so the visionOS compositor has a surface to reproject.
 - Fixed visionOS eye projection by sending the device's real per-eye FOV and IPD to the runtime, so it renders a matching frustum instead of the symmetric fallback that made the projection look wrong.

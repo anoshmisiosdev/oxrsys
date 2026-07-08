@@ -15,11 +15,25 @@ See [install.md](../install.md) for the recommended package list and `sdkmanager
 
 ## Build And Install
 
+For fast iteration while working on the headset client:
+
 ```bash
 cd clients/Android/android-vr
 ./gradlew assembleDebug
 adb install app/build/outputs/apk/debug/app-debug.apk
 ```
+
+For Quest sideload validation, use the stable release variant:
+
+```bash
+cd clients/Android/android-vr
+./gradlew assembleRelease
+adb install app/build/outputs/apk/release/app-release.apk
+```
+
+`assembleRelease` is debug-signed and debuggable for sideloading, but uses the release APK name and
+Quest-stable native flags. `assembleOptimizedRelease` keeps the old non-debuggable optimized native
+profile and is intended only for diagnosing optimization-sensitive headset regressions.
 
 `clients/Android/android-vr/local.properties` must point to the local Android SDK.
 
