@@ -105,9 +105,9 @@ codec negotiation or encoded bandwidth.
 
 The runtime announces the configured preferred headset refresh rate. Current Home-supported values
 are `60`, `72`, `80`, `90`, and `120` Hz. Quest clients request the announced value through
-`XR_FB_display_refresh_rate` when available and report the active rate back in
-`ClientConnect.refreshRateHz`; the runtime uses that reported value for encode cadence and pose
-prediction.
+`XR_FB_display_refresh_rate` when available, read the active headset rate again immediately before
+`ClientConnect`, and report that value in `ClientConnect.refreshRateHz`; the runtime uses the
+reported value for encode cadence and pose prediction.
 
 Foveated encoding uses an ALVR-style axis-aligned distortion transform before video encode on
 supported server paths. The announced presets currently map to:
@@ -155,10 +155,12 @@ The current stream also includes two recovery and timing helpers:
 
 - `VIDEO_FLAG_FEC` marks XOR parity packets. One parity packet is sent per `FEC_GROUP_SIZE` data packets and can recover one lost data packet in that group. FEC packets also carry the payload size of that group's last data packet in the existing 24-byte header padding. Receivers use that size only when the recovered packet is the last packet of the group; other recovered packets remain `MAX_PACKET_PAYLOAD`.
 - `VIDEO_FLAG_RENDER_POSE` marks metadata packets that carry the server render pose for a frame. These packets are not video data. Headset clients must match them to the decoded frame by presentation timestamp before submitting projection layers so compositor reprojection uses the pose that rendered that exact frame.
-- `VIDEO_FLAG_ALPHA_BLEND` marks frames submitted by the app with `XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND` or a projection layer using `XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT`. Quest clients use this with server-enabled passthrough to reveal the passthrough underlay; the current stream does not carry a full alpha plane. If passthrough is active and no alpha flags have appeared in the stream, Quest clients may temporarily use the same black-key fallback for transparent-clear AR demos.
+- `VIDEO_FLAG_ALPHA_BLEND` marks frames submitted by an explicit alpha-enabled app with `XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND` or a projection layer using `XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT`. Quest clients use this with server-enabled passthrough to reveal the passthrough underlay; the current stream does not carry a full alpha plane. Quest clients do not enable black-key alpha by default because normal VR content often contains dark reflective pixels. Any transparent-clear black-key compatibility path must be explicitly enabled outside the default stream.
 
 For passthrough, `SERVER_FEATURE_MIXED_REALITY_PASSTHROUGH` means the desktop runtime is configured
-to allow app-requested passthrough. The headset still has to advertise
+to keep a headset passthrough underlay available while streaming. Separately,
+`streaming.app_alpha_blend_passthrough` controls whether the runtime advertises OpenXR alpha-blend
+environment modes and marks source-alpha frames for explicit MR apps. The headset still has to advertise
 `CLIENT_CAPABILITY_MIXED_REALITY_PASSTHROUGH`, which the Android client sets only after its local
 OpenXR runtime exposes `XR_FB_passthrough`, reports `supportsPassthrough`, and successfully creates
 the passthrough objects. Runtime status reports `passthrough_ready` only when both sides are true.

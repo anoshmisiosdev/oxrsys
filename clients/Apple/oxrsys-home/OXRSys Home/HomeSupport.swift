@@ -267,6 +267,7 @@ struct HomeRuntimeStreamingStats: Equatable {
     var refreshRateHz: Int = 0
     var currentBitrateMbps: Int = 0
     var maxBitrateMbps: Int = 0
+    var configuredBitrateMbps: Int = 0
     var renderWidth: Int = 0
     var renderHeight: Int = 0
     var encodedWidth: Int = 0
@@ -274,6 +275,9 @@ struct HomeRuntimeStreamingStats: Equatable {
     var videoCodec: String = ""
     var encoderPreset: String = ""
     var foveatedEncodingPreset: String = ""
+    var foveatedEncodingRequestedPreset: String = ""
+    var foveatedEncodingStatus: String = ""
+    var foveatedEncodingActive = false
     var clientFoveationPreset: String = ""
     var clientUpscaling = false
     var clientReprojectionMode: String = ""
@@ -308,6 +312,7 @@ struct HomeRuntimeStreamingStats: Equatable {
             refreshRateHz: intValue(object["refresh_rate_hz"]) ?? 0,
             currentBitrateMbps: intValue(object["current_bitrate_mbps"]) ?? 0,
             maxBitrateMbps: intValue(object["max_bitrate_mbps"]) ?? 0,
+            configuredBitrateMbps: intValue(object["configured_bitrate_mbps"]) ?? 0,
             renderWidth: intValue(object["render_width"]) ?? 0,
             renderHeight: intValue(object["render_height"]) ?? 0,
             encodedWidth: intValue(object["encoded_width"]) ?? 0,
@@ -315,6 +320,9 @@ struct HomeRuntimeStreamingStats: Equatable {
             videoCodec: stringValue(object["video_codec"]) ?? "",
             encoderPreset: stringValue(object["encoder_preset"]) ?? "",
             foveatedEncodingPreset: stringValue(object["foveated_encoding_preset"]) ?? "",
+            foveatedEncodingRequestedPreset: stringValue(object["foveated_encoding_requested_preset"]) ?? "",
+            foveatedEncodingStatus: stringValue(object["foveated_encoding_status"]) ?? "",
+            foveatedEncodingActive: boolValue(object["foveated_encoding_active"]) ?? false,
             clientFoveationPreset: stringValue(object["client_foveation_preset"]) ?? "",
             clientUpscaling: boolValue(object["client_upscaling"]) ?? false,
             clientReprojectionMode: stringValue(object["client_reprojection_mode"]) ?? "",
@@ -559,6 +567,22 @@ enum HomePrimaryTransport: String, CaseIterable, Identifiable {
     }
 }
 
+enum HomeAdbMode: String, CaseIterable, Identifiable, Sendable {
+    case internalAutomatic = "internal"
+    case custom
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .internalAutomatic:
+            return "Internal"
+        case .custom:
+            return "Custom"
+        }
+    }
+}
+
 struct MacWifiStatus: Equatable {
     var interfaceName: String?
     var isPoweredOn: Bool?
@@ -670,6 +694,13 @@ struct HomeAdbStatus: Equatable, Sendable {
         HomeAdbStatus(
             executablePath: nil,
             message: "Connect a USB debugging-enabled headset, or configure an external ADB fallback."
+        )
+    }
+
+    nonisolated static var emptyCustomPath: HomeAdbStatus {
+        HomeAdbStatus(
+            executablePath: nil,
+            message: "Select or enter a custom ADB executable path, or switch ADB mode back to Internal."
         )
     }
 

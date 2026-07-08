@@ -78,6 +78,7 @@ private:
     bool InitializePassthrough();
     bool InitializeFoveation();
     bool InitializeDisplayRefreshRate(float preferredRefreshRateHz);
+    bool RefreshCurrentDisplayRate(const char* context, bool logIfUnavailable = false);
     void ApplyClientFoveationPreset(protocol::ClientFoveationPreset preset);
     void ShutdownFoveation();
     void ShutdownPassthrough();

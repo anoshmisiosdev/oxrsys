@@ -10,7 +10,10 @@
 Instance::Instance(XrVersion apiVersion, const std::vector<std::string>& enabledExtensions)
     : apiVersion_(apiVersion),
       enabledExtensions_(enabledExtensions),
-      passthroughBlendModeEnabled_(Config::Get().GetValues().passthroughEnabled)
+      passthroughBlendModeEnabled_([] {
+          const ConfigValues values = Config::Get().GetValues();
+          return values.passthroughEnabled && values.appAlphaBlendPassthrough;
+      }())
 {
     Runtime::Get().RegisterHandle(handle_, this);
     Runtime::Get().SetInstance(this);

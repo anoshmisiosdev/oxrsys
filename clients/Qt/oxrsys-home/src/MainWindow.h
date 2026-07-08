@@ -86,6 +86,8 @@ private:
     QLabel* launchTargetLabel_ = nullptr;
     QPushButton* registerRuntimeButton_ = nullptr;
     QPushButton* unregisterRuntimeButton_ = nullptr;
+    QComboBox* adbModeCombo_ = nullptr;
+    QLineEdit* customAdbPathLineEdit_ = nullptr;
 
     QCheckBox* runtimeEnabledCheckBox_ = nullptr;
     QCheckBox* fileLoggingCheckBox_ = nullptr;
@@ -121,7 +123,7 @@ private:
     QComboBox* usbDeviceCombo_ = nullptr;
     QLabel* adbStatusLabel_ = nullptr;
     QLabel* usbStatusLabel_ = nullptr;
-    QPushButton* clearAdbPathButton_ = nullptr;
+    QPushButton* autoDetectAdbPathButton_ = nullptr;
     QPushButton* configureUsbButton_ = nullptr;
 
     QLabel* refreshRateMetricLabel_ = nullptr;

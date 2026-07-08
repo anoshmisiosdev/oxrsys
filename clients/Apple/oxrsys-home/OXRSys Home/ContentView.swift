@@ -356,6 +356,7 @@ struct ContentView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 developerSettingsSection
+                adbSettingsSection
                 runtimeRegistrationSection
             }
             .padding(.top, 14)
@@ -405,6 +406,105 @@ struct ContentView: View {
         }
     }
 
+    private var adbSettingsSection: some View {
+        GroupBox("ADB") {
+            VStack(alignment: .leading, spacing: 12) {
+                Picker("ADB mode", selection: Binding(
+                    get: { model.adbMode },
+                    set: { mode in
+                        deferModelUpdate {
+                            model.setAdbMode(mode)
+                        }
+                    }
+                )) {
+                    ForEach(HomeAdbMode.allCases) { mode in
+                        Text(mode.displayName).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 220)
+
+                if model.adbMode == .custom {
+                    HStack {
+                        TextField("Path to adb", text: Binding(
+                            get: { model.customAdbPath },
+                            set: { path in
+                                deferModelUpdate {
+                                    model.setCustomAdbPathText(path)
+                                }
+                            }
+                        ))
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit {
+                            model.commitCustomAdbPath()
+                        }
+
+                        Button("Browse") {
+                            model.chooseCustomAdbExecutable()
+                        }
+                        Button("Auto Detect") {
+                            model.prefillCustomAdbPathFromDetectedExecutable()
+                        }
+                    }
+                }
+
+                if model.questUsbDevices.isEmpty {
+                    Text("No USB debugging device found.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    Picker("Quest device", selection: Binding(
+                        get: { model.selectedQuestUsbSerial ?? "" },
+                        set: { serial in
+                            deferModelUpdate {
+                                model.setSelectedQuestUsbSerial(serial.isEmpty ? nil : serial)
+                            }
+                        }
+                    )) {
+                        Text("Select a device").tag("")
+                        ForEach(model.questUsbDevices) { device in
+                            Text(device.displayName).tag(device.serial)
+                        }
+                    }
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(model.adbStatus.message)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                    if model.adbMode == .custom,
+                       !model.customAdbPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        Text("Custom ADB: \(model.customAdbPath)")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
+                }
+
+                Text(model.questUsbStatus)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                HStack {
+                    Button("Refresh Devices") {
+                        model.refreshQuestUsbDevices()
+                    }
+                    Button("Configure USB Reverse") {
+                        model.configureQuestUsbReverse()
+                    }
+                    .disabled(model.selectedQuestUsbSerial == nil ||
+                              !model.questUsbDevices.contains(where: {
+                                  $0.serial == model.selectedQuestUsbSerial && $0.isUsable
+                              }) ||
+                              model.isUsbSetupInProgress)
+                    Spacer()
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.top, 8)
+        }
+    }
+
     private var streamingTab: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
@@ -419,8 +519,10 @@ struct ContentView: View {
                             value: Binding(
                                 get: { Double(model.serverConfig.bitrateMbps) },
                                 set: { value in
-                                    model.updateStreamingConfig {
-                                        $0.bitrateMbps = Int(value.rounded())
+                                    deferModelUpdate {
+                                        model.updateStreamingConfig {
+                                            $0.bitrateMbps = Int(value.rounded())
+                                        }
                                     }
                                 }
                             ),
@@ -459,8 +561,10 @@ struct ContentView: View {
                             value: Binding(
                                 get: { Double(model.serverConfig.keyframeIntervalSec) },
                                 set: { value in
-                                    model.updateStreamingConfig {
-                                        $0.keyframeIntervalSec = Int(value.rounded())
+                                    deferModelUpdate {
+                                        model.updateStreamingConfig {
+                                            $0.keyframeIntervalSec = Int(value.rounded())
+                                        }
                                     }
                                 }
                             ),
@@ -566,68 +670,6 @@ struct ContentView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.top, 14)
 
-                GroupBox("Quest USB ADB") {
-                    VStack(alignment: .leading, spacing: 12) {
-                        if model.questUsbDevices.isEmpty {
-                            Text("No USB debugging device found.")
-                                .foregroundStyle(.secondary)
-                        } else {
-                            Picker("Quest device", selection: Binding(
-                                get: { model.selectedQuestUsbSerial ?? "" },
-                                set: { model.selectedQuestUsbSerial = $0.isEmpty ? nil : $0 }
-                            )) {
-                                Text("Select a device").tag("")
-                                ForEach(model.questUsbDevices) { device in
-                                    Text(device.displayName).tag(device.serial)
-                                }
-                            }
-                        }
-
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(model.adbStatus.message)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .textSelection(.enabled)
-                            if !model.customAdbPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                                Text("Custom ADB: \(model.customAdbPath)")
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                                    .textSelection(.enabled)
-                            }
-                        }
-
-                        Text(model.questUsbStatus)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-
-                        HStack {
-                            Button("Select ADB") {
-                                model.chooseCustomAdbExecutable()
-                            }
-                            Button("Auto Detect") {
-                                model.clearCustomAdbPath()
-                            }
-                            .disabled(model.customAdbPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                            Divider()
-                            Button("Refresh Devices") {
-                                model.refreshQuestUsbDevices()
-                            }
-                            Button("Configure USB Reverse") {
-                                model.configureQuestUsbReverse()
-                            }
-                            .disabled(model.selectedQuestUsbSerial == nil ||
-                                      !model.questUsbDevices.contains(where: {
-                                          $0.serial == model.selectedQuestUsbSerial && $0.isUsable
-                                      }) ||
-                                      model.isUsbSetupInProgress)
-                            Spacer()
-                        }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.top, 8)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.top, 14)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -683,7 +725,7 @@ struct ContentView: View {
                         RuntimeStatsMetric(
                             title: "Bitrate",
                             value: "\(latest.currentBitrateMbps) / \(latest.maxBitrateMbps) Mbps",
-                            subtitle: "Current / max",
+                            subtitle: bitrateSubtitle(latest),
                             systemImage: "gauge.with.dots.needle.67percent",
                             color: .green
                         )
@@ -697,7 +739,7 @@ struct ContentView: View {
                         RuntimeStatsMetric(
                             title: "Encoded",
                             value: dimensions(width: latest.encodedWidth, height: latest.encodedHeight),
-                            subtitle: latest.videoCodec.isEmpty ? "Encoded stream" : "\(latest.videoCodec.uppercased()) stream",
+                            subtitle: encodedSubtitle(latest),
                             systemImage: "rectangle.compress.vertical",
                             color: .purple
                         )
@@ -834,6 +876,37 @@ struct ContentView: View {
         return "\(width) x \(height)"
     }
 
+    private func bitrateSubtitle(_ stats: HomeRuntimeStreamingStats) -> String {
+        if stats.configuredBitrateMbps > 0,
+           stats.maxBitrateMbps > 0,
+           stats.configuredBitrateMbps != stats.maxBitrateMbps {
+            return "Configured \(stats.configuredBitrateMbps) Mbps"
+        }
+        return "Current / effective max"
+    }
+
+    private func encodedSubtitle(_ stats: HomeRuntimeStreamingStats) -> String {
+        let codec = stats.videoCodec.isEmpty ? "Encoded stream" : "\(stats.videoCodec.uppercased()) stream"
+        let requested = stats.foveatedEncodingRequestedPreset.isEmpty
+            ? stats.foveatedEncodingPreset
+            : stats.foveatedEncodingRequestedPreset
+        guard requested != "off", !requested.isEmpty else {
+            return codec
+        }
+        switch stats.foveatedEncodingStatus {
+        case "active":
+            return "FFE \(requested)"
+        case "inactive_resolution_scale":
+            return "FFE off: scale < 1"
+        case "client_unsupported":
+            return "FFE unsupported"
+        case "unavailable":
+            return "FFE unavailable"
+        default:
+            return stats.foveatedEncodingActive ? "FFE \(requested)" : codec
+        }
+    }
+
     private func formatMilliseconds(_ value: Double) -> String {
         if value >= 100 {
             return String(format: "%.0f ms", value)
@@ -845,11 +918,20 @@ struct ContentView: View {
         Binding(
             get: { model.serverConfig[keyPath: keyPath] },
             set: { value in
-                model.updateStreamingConfig {
-                    $0[keyPath: keyPath] = value
+                deferModelUpdate {
+                    model.updateStreamingConfig {
+                        $0[keyPath: keyPath] = value
+                    }
                 }
             }
         )
+    }
+
+    private func deferModelUpdate(_ update: @escaping @MainActor () -> Void) {
+        Task { @MainActor in
+            await Task.yield()
+            update()
+        }
     }
 }
 

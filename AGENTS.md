@@ -45,9 +45,9 @@ The Home app shows a main-window runtime activity summary from
 `~/Library/Application Support/OXRSys/runtime_status.json`, including idle/streaming state,
 transport, connected device family, active OpenXR application, WiFi/USB transport readiness,
 first-launch runtime registration guidance, one-step USB reverse setup, SDK-free native USB ADB
-setup in the SwiftUI Home app, native ADB-server protocol support with external `adb` fallback, and per-app custom ADB path selection for USB setup. Home streaming controls include the shared
-runtime 1-200 Mbps bitrate bounds, server-selected refresh rate, video codec, encoder preset, foveated encoding
-preset, ABR/dynamic-resolution mode, mixed reality, occlusion, spatial toggles, and a separate Headset Client section for client foveation override,
+setup in the SwiftUI Home app, Settings-based Internal/Custom ADB selection, native ADB-server protocol support with external `adb` fallback, and per-app custom ADB path selection for USB setup. Home streaming controls include the shared
+runtime 1-200 Mbps bitrate bounds with effective client-cap telemetry, server-selected refresh rate, video codec, encoder preset, foveated encoding
+preset with active/inactive status, ABR/dynamic-resolution mode, mixed reality, occlusion, spatial toggles, and a separate Headset Client section for client foveation override,
 Quest shader upscaling, client reprojection, and reserved headset-audio configuration;
 clients can send `ClientConnect.maxBitrateMbps = 0` to use the server-configured bitrate without
 adding a client-side cap.
@@ -104,7 +104,7 @@ Avoid duplicating the same guidance in multiple files. If commands, platform sta
 - Linux VA-API streaming supports H.264 and H.265 Main 8-bit; VA surface upload, encode submission, waits, mapping, and encoded-buffer copies must stay outside `Session::EndFrame()`.
 - Windows D3D11/D3D12 streaming must keep Direct3D and Media Foundation headers/code behind Windows-only preprocessor guards; snapshots may enqueue GPU copies during swapchain release, but fence waits, mapping, conversion, and encode must stay outside `Session::EndFrame()`.
 - Quest USB streaming uses reconnecting ADB reverse TCP on localhost ports `9944`, `9945`, `9946`, and the reserved reliable spatial port `9948`; app-level Android USB permission dialogs are only for `UsbManager`-visible devices and are not required for ADB reverse streaming.
-- Home USB setup should prefer the native ADB host-server protocol on `127.0.0.1:5037` when available, fall back to a selected or auto-detected `adb` executable only when needed, and configure missing reverse mappings automatically when the user selects USB.
+- Home USB setup should prefer the native ADB host-server protocol on `127.0.0.1:5037` when available, fall back to a selected or auto-detected `adb` executable only when needed, configure missing reverse mappings automatically when the user selects USB, and keep Settings ADB mode (`Internal`/`Custom`) from silently changing fallback behavior.
 - Quest USB TCP sockets must keep bounded send behavior; failed video sends must clear stale TCP dispatch state and must not block the encoded-frame sender, VideoToolbox callback, or `Session::EndFrame()`.
 - Encoded video dispatch is latest-frame-oriented and bounded; stale queued frames may be dropped instead of building latency when the transport cannot keep up.
 - The advertised per-eye render resolution comes from the `render_device` preset (quest2/quest3/avp). It is fixed when the app queries view configs (before any client connects), so it is a server-config choice, not per-client automatic; `resolution_scale` is a separate encode-only downscale (also driven by ABR), not a render-target change.
@@ -127,8 +127,8 @@ Avoid duplicating the same guidance in multiple files. If commands, platform sta
 - Headset speaker audio has protocol/config scaffolding only until a real capture/playback path is attached; do not advertise `SERVER_FEATURE_HEADSET_AUDIO` without that pipeline.
 - UDP FEC uses the existing 24-byte `VideoPacketHeader` padding to carry the final data packet size for each FEC group; clients must use it only when recovering the last packet in that group.
 - Quest hand tracking depends on the Android manifest permission `com.oculus.permission.HAND_TRACKING` and the optional `oculus.software.handtracking` feature.
-- Quest passthrough shell mode depends on `XR_FB_passthrough` support and the optional Android feature `com.oculus.feature.PASSTHROUGH`; streaming video remains the priority display path. The Android client must advertise `CLIENT_CAPABILITY_MIXED_REALITY_PASSTHROUGH` only after the headset runtime reports support and passthrough objects are created, and runtime status must distinguish `passthrough_enabled`, `passthrough_supported`, and `passthrough_ready`. Streaming disables the local passthrough underlay and releases local shell GL resources unless effective passthrough is active; current alpha/depth transport is approximated by the Quest shader black-key policy documented in `docs/platforms/quest.md`.
-- OpenXR environment blend mode support is snapshotted at instance creation; changing `passthrough_enabled` requires restarting the OpenXR app/runtime session to change advertised blend modes.
+- Quest passthrough shell mode depends on `XR_FB_passthrough` support and the optional Android feature `com.oculus.feature.PASSTHROUGH`; streaming video remains the priority display path. The Android client must advertise `CLIENT_CAPABILITY_MIXED_REALITY_PASSTHROUGH` only after the headset runtime reports support and passthrough objects are created, and runtime status must distinguish `passthrough_enabled`, `passthrough_supported`, and `passthrough_ready`. Streaming disables the local passthrough underlay and releases local shell GL resources unless effective passthrough is active; Quest clients must not use black-key alpha by default for ordinary dark pixels, and any transparent-clear compatibility fallback must be explicit.
+- OpenXR environment blend mode support is snapshotted at instance creation; `passthrough_enabled` only enables the headset underlay, while `app_alpha_blend_passthrough` is the explicit opt-in for advertising `XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND` to apps. Changing the alpha opt-in requires restarting the OpenXR app/runtime session to change advertised blend modes.
 - Streaming controller poses are valid only when `TRACKING_FLAG_LEFT_CONTROLLER_ACTIVE` or `TRACKING_FLAG_RIGHT_CONTROLLER_ACTIVE` is present; missing controller flags must not overwrite the last valid runtime pose.
 - The action system is profile-aware and must not regress to hard-forcing `KHR simple_controller`.
 - `xrLocateSpacesKHR` is accepted as an alias of the OpenXR 1.1 `xrLocateSpaces` entry point.
@@ -137,7 +137,7 @@ Avoid duplicating the same guidance in multiple files. If commands, platform sta
   macOS `~/Library/Application Support/OXRSys/oxrsys-runtime.toml`,
   Linux `${XDG_CONFIG_HOME:-~/.config}/oxrsys/oxrsys-runtime.toml`,
   Windows `%APPDATA%/OXRSys/oxrsys-runtime.toml`.
-- Qt Home transport readiness and USB ADB reverse configuration run asynchronously on a worker; keep slow process calls off the UI thread and ignore stale worker results after path, serial, or transport changes.
+- Qt Home transport readiness and USB ADB reverse configuration run asynchronously on a worker; keep slow process calls off the UI thread and ignore stale worker results after ADB mode, path, serial, or transport changes.
 
 ## Project Layout
 

@@ -21,6 +21,7 @@ struct HomeLauncherTests {
         try testQuestUsbAdbCustomResolution()
         try testQuestUsbAdbInvalidCustomStatus()
         try testQuestUsbAdbClearRestoresAutoDetection()
+        try testHomeAdbModeDisplay()
         try testApplicationLogFilterDropsAppleShortcutNoise()
         try testServerConfigTransportRoundTrip()
         try testServerConfigDefaultSerialization()
@@ -272,6 +273,7 @@ struct HomeLauncherTests {
         Unable to get synchronousRemoteObjectProxy, error: Error Domain=NSCocoaErrorDomain Code=4097 "connection to service named com.apple.linkd.autoShortcut"
         Error registering app with intents framework: Error Domain=NSCocoaErrorDomain Code=4097 "connection to service named com.apple.linkd.autoShortcut"
         Will NOT re-try to establish the connection
+        Unable to obtain a task name port right for pid 409: (os/kern) failure (0x5)
         real runtime error
         """)
 
@@ -280,6 +282,18 @@ struct HomeLauncherTests {
         try expect(!filtered.contains("autoShortcut"), "Expected Apple shortcut service noise to be dropped")
         try expect(!filtered.contains("intents framework"), "Expected App Intents registration noise to be dropped")
         try expect(!filtered.contains("Will NOT re-try"), "Expected retry footer noise to be dropped")
+        try expect(!filtered.contains("task name port"), "Expected task-port diagnostic noise to be dropped")
+    }
+
+    private static func testHomeAdbModeDisplay() throws {
+        try expect(HomeAdbMode.internalAutomatic.rawValue == "internal", "Expected internal ADB mode raw value")
+        try expect(HomeAdbMode.internalAutomatic.displayName == "Internal", "Expected internal ADB mode display")
+        try expect(HomeAdbMode.custom.displayName == "Custom", "Expected custom ADB mode display")
+        try expect(!HomeAdbStatus.emptyCustomPath.isAvailable, "Expected empty custom path to be unavailable")
+        try expect(
+            HomeAdbStatus.emptyCustomPath.message.contains("custom ADB executable path"),
+            "Expected empty custom path guidance"
+        )
     }
 
     private static func testServerConfigTransportRoundTrip() throws {
@@ -296,6 +310,7 @@ struct HomeLauncherTests {
         abr_mode = "full"
         dynamic_resolution_min_scale = 0.55
         passthrough_enabled = true
+        app_alpha_blend_passthrough = true
         occlusion_mode = "environment_depth"
         headset_audio = true
 
@@ -316,6 +331,7 @@ struct HomeLauncherTests {
         try expect(parsed.abrMode == .full, "Expected ABR parse")
         try expect(parsed.dynamicResolutionMinScale == 0.55, "Expected dynamic resolution parse")
         try expect(parsed.passthroughEnabled == true, "Expected passthrough parse")
+        try expect(parsed.appAlphaBlendPassthrough == true, "Expected app alpha blend parse")
         try expect(parsed.occlusionMode == .environmentDepth, "Expected occlusion parse")
         try expect(parsed.headsetAudio == true, "Expected headset audio parse")
         try expect(parsed.spatialEnabled == true, "Expected spatial enabled parse")
@@ -335,6 +351,7 @@ struct HomeLauncherTests {
         try expect(merged.contains("abr_mode = \"full\""), "Expected ABR serialization")
         try expect(merged.contains("dynamic_resolution_min_scale = 0.55"), "Expected dynamic resolution serialization")
         try expect(merged.contains("passthrough_enabled = true"), "Expected passthrough serialization")
+        try expect(merged.contains("app_alpha_blend_passthrough = true"), "Expected app alpha blend serialization")
         try expect(!merged.contains("mixed_reality_mode"), "Expected legacy MR mode to be removed")
         try expect(merged.contains("occlusion_mode = \"environment_depth\""), "Expected occlusion serialization")
         try expect(merged.contains("headset_audio = true"), "Expected audio serialization")
@@ -372,6 +389,7 @@ struct HomeLauncherTests {
         try expect(merged.contains("abr_mode = \"bitrate\""), "Expected default ABR serialization")
         try expect(merged.contains("dynamic_resolution_min_scale = 0.50"), "Expected default dynamic resolution serialization")
         try expect(merged.contains("passthrough_enabled = false"), "Expected default passthrough serialization")
+        try expect(merged.contains("app_alpha_blend_passthrough = false"), "Expected default app alpha blend serialization")
         try expect(merged.contains("occlusion_mode = \"off\""), "Expected default occlusion serialization")
         try expect(merged.contains("headset_audio = false"), "Expected default audio serialization")
         try expect(merged.contains("enabled = false"), "Expected default spatial serialization")
@@ -414,6 +432,7 @@ struct HomeLauncherTests {
             "refresh_rate_hz": 90,
             "current_bitrate_mbps": 42,
             "max_bitrate_mbps": 50,
+            "configured_bitrate_mbps": 80,
             "render_width": 3664,
             "render_height": 1920,
             "encoded_width": 2752,
@@ -421,6 +440,9 @@ struct HomeLauncherTests {
             "video_codec": "h264",
             "encoder_preset": "quality",
             "foveated_encoding_preset": "medium",
+            "foveated_encoding_requested_preset": "medium",
+            "foveated_encoding_status": "active",
+            "foveated_encoding_active": true,
             "client_foveation_preset": "high",
             "client_upscaling": true,
             "client_reprojection_mode": "pose_warp",
@@ -475,10 +497,15 @@ struct HomeLauncherTests {
         let stats = statusWithStats?.streamingStats
         try expect(stats?.refreshRateHz == 90, "Expected runtime stats refresh rate")
         try expect(stats?.currentBitrateMbps == 42, "Expected runtime stats bitrate")
+        try expect(stats?.maxBitrateMbps == 50, "Expected runtime stats effective max bitrate")
+        try expect(stats?.configuredBitrateMbps == 80, "Expected runtime stats configured bitrate")
         try expect(stats?.encodedWidth == 2752, "Expected runtime stats encoded width")
         try expect(stats?.videoCodec == "h264", "Expected runtime stats codec")
         try expect(stats?.encoderPreset == "quality", "Expected runtime stats encoder preset")
         try expect(stats?.foveatedEncodingPreset == "medium", "Expected runtime stats FFE preset")
+        try expect(stats?.foveatedEncodingRequestedPreset == "medium", "Expected runtime stats requested FFE preset")
+        try expect(stats?.foveatedEncodingStatus == "active", "Expected runtime stats FFE status")
+        try expect(stats?.foveatedEncodingActive == true, "Expected runtime stats FFE active flag")
         try expect(stats?.clientFoveationPreset == "high", "Expected runtime stats FFR preset")
         try expect(stats?.clientUpscaling == true, "Expected runtime stats upscaling")
         try expect(stats?.clientReprojectionMode == "pose_warp", "Expected runtime stats reprojection")

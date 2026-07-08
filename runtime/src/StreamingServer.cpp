@@ -1531,15 +1531,45 @@ void StreamingServer::EncodeThread()
                     stats.refreshRateHz = server->targetRefreshRateHz_.load();
                     stats.currentBitrateMbps = server->currentBitrateMbps_.load();
                     stats.maxBitrateMbps = server->configMaxBitrateMbps_.load();
+                    stats.configuredBitrateMbps = config.bitrateMbps;
                     stats.renderWidth = server->renderWidth_ * 2;
                     stats.renderHeight = server->renderHeight_;
                     stats.encodedWidth = layoutState.encodedWidth;
                     stats.encodedHeight = layoutState.encodedHeight;
                     stats.videoCodec = VideoCodecName(server->activeVideoCodec_.load());
                     stats.encoderPreset = config.encoderPreset;
-                    stats.foveatedEncodingPreset = server->clientFoveatedEncodingActive_.load()
+                    const bool foveatedEncodingActive =
+                        server->clientFoveatedEncodingActive_.load();
+                    stats.foveatedEncodingPreset = foveatedEncodingActive
                         ? config.foveatedEncodingPreset
                         : "off";
+                    stats.foveatedEncodingRequestedPreset = config.foveatedEncodingPreset;
+                    stats.foveatedEncodingActive = foveatedEncodingActive;
+                    if (config.foveatedEncodingPreset == "off")
+                    {
+                        stats.foveatedEncodingStatus = "off";
+                    }
+                    else if (foveatedEncodingActive)
+                    {
+                        stats.foveatedEncodingStatus = "active";
+                    }
+                    else if (!layoutState.foveatedEncodingActive &&
+                             layoutState.activeResolutionScale < 0.999f)
+                    {
+                        stats.foveatedEncodingStatus = "inactive_resolution_scale";
+                    }
+                    else if (!layoutState.foveatedEncodingActive)
+                    {
+                        stats.foveatedEncodingStatus = "unavailable";
+                    }
+                    else if (!server->clientSupportsFoveatedEncoding_.load())
+                    {
+                        stats.foveatedEncodingStatus = "client_unsupported";
+                    }
+                    else
+                    {
+                        stats.foveatedEncodingStatus = "inactive";
+                    }
                     stats.clientFoveationPreset = config.clientFoveationPreset;
                     stats.clientUpscaling = config.clientUpscaling;
                     stats.clientReprojectionMode =
@@ -1679,6 +1709,11 @@ void StreamingServer::HandleClientConnect(const oxr::protocol::ClientConnect& cl
     uint32_t negotiatedRefresh = clientConnect.refreshRateHz > 0
         ? clientConnect.refreshRateHz
         : refreshRateHz_;
+    spdlog::info("StreamingServer: WiFi client '{}' refresh report={}Hz server_target={}Hz negotiated={}Hz",
+                 clientName,
+                 clientConnect.refreshRateHz,
+                 refreshRateHz_,
+                 negotiatedRefresh);
     targetRefreshRateHz_.store(negotiatedRefresh);
     UpdatePredictionHorizon();
 
@@ -1847,6 +1882,11 @@ void StreamingServer::HandleUsbClientConnect(const oxr::protocol::ClientConnect&
     uint32_t negotiatedRefresh = clientConnect.refreshRateHz > 0
         ? clientConnect.refreshRateHz
         : refreshRateHz_;
+    spdlog::info("StreamingServer: USB client '{}' refresh report={}Hz server_target={}Hz negotiated={}Hz",
+                 clientName,
+                 clientConnect.refreshRateHz,
+                 refreshRateHz_,
+                 negotiatedRefresh);
     targetRefreshRateHz_.store(negotiatedRefresh);
     UpdatePredictionHorizon();
 

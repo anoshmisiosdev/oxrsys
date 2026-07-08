@@ -25,6 +25,7 @@ struct OXRSysServerConfig: Equatable {
     var clientReprojection: ClientReprojectionSetting = .pose
     var abrMode: AbrModeSetting = .bitrate
     var passthroughEnabled = false
+    var appAlphaBlendPassthrough = false
     var occlusionMode: OcclusionModeSetting = .off
     var headsetAudio = false
     var spatialEnabled = false
@@ -104,9 +105,12 @@ struct OXRSysServerConfig: Equatable {
     # "full" may select live streaming resolution profiles on reliable USB TCP.
     abr_mode = "bitrate"
 
-    # Enable headset passthrough as a runtime feature. Apps still choose opaque
-    # or alpha blend through OpenXR environment blend modes.
+    # Enable headset passthrough as a runtime feature.
     passthrough_enabled = false
+
+    # Advanced MR opt-in: expose OpenXR alpha-blend environment modes to apps.
+    # Keep false for normal VR apps so dark reflective content stays opaque.
+    app_alpha_blend_passthrough = false
 
     # Occlusion mode: "off", "scene_mesh", or "environment_depth".
     occlusion_mode = "off"
@@ -186,8 +190,14 @@ struct OXRSysServerConfig: Equatable {
         if let value = stringValue("abr_mode", in: text), let mode = AbrModeSetting(rawValue: value) {
             config.abrMode = mode
         }
+        let legacyMixedRealityMode = stringValue("mixed_reality_mode", in: text)
+        let hasValidLegacyMixedRealityMode = ["off", "passthrough", "alpha"].contains(legacyMixedRealityMode ?? "")
+        let legacyPassthroughEnabled = legacyMixedRealityMode == "passthrough" || legacyMixedRealityMode == "alpha"
+        let legacyAppAlphaBlendPassthrough = legacyMixedRealityMode == "alpha"
         config.passthroughEnabled = boolValue("passthrough_enabled", in: text) ??
-            (stringValue("mixed_reality_mode", in: text).map { $0 != "off" } ?? config.passthroughEnabled)
+            (hasValidLegacyMixedRealityMode ? legacyPassthroughEnabled : config.passthroughEnabled)
+        config.appAlphaBlendPassthrough = boolValue("app_alpha_blend_passthrough", in: text) ??
+            (hasValidLegacyMixedRealityMode ? legacyAppAlphaBlendPassthrough : config.appAlphaBlendPassthrough)
         if let value = stringValue("occlusion_mode", in: text), let mode = OcclusionModeSetting(rawValue: value) {
             config.occlusionMode = mode
         }
@@ -221,7 +231,7 @@ struct OXRSysServerConfig: Equatable {
         if text.isEmpty {
             text = Self.defaultText
         }
-        text = removingKeys(Set(["fov_degrees"]), fromSection: "streaming", in: text)
+        text = removingKeys(Set(["fov_degrees", "mixed_reality_mode"]), fromSection: "streaming", in: text)
 
         let sectionValues: [(name: String, keys: [(key: String, value: String)])] = [
             ("general", [
@@ -245,6 +255,7 @@ struct OXRSysServerConfig: Equatable {
                 ("client_reprojection", "\"\(clientReprojection.rawValue)\""),
                 ("abr_mode", "\"\(abrMode.rawValue)\""),
                 ("passthrough_enabled", boolString(passthroughEnabled)),
+                ("app_alpha_blend_passthrough", boolString(appAlphaBlendPassthrough)),
                 ("occlusion_mode", "\"\(occlusionMode.rawValue)\""),
                 ("headset_audio", boolString(headsetAudio)),
             ]),
