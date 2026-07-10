@@ -14,6 +14,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <ctime>
 #include <numeric>
 #include <thread>
 #include <utility>
@@ -22,6 +23,17 @@ namespace
 {
 
 using Clock = std::chrono::steady_clock;
+
+#if !defined(_WIN32)
+// CLOCK_MONOTONIC in nanoseconds — the clock XR_KHR_convert_timespec_time
+// converts against.
+int64_t MonotonicNowNs()
+{
+    struct timespec ts{};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<int64_t>(ts.tv_sec) * 1000000000LL + ts.tv_nsec;
+}
+#endif
 
 struct SessionMetricSummary
 {
@@ -103,6 +115,9 @@ Session::Session(Instance* instance, void* metalDevice, void* metalCommandQueue)
     inputManager_ = std::make_unique<InputManager>();
 
     startTime_ = std::chrono::steady_clock::now();
+#if !defined(_WIN32)
+    monoStartNs_ = MonotonicNowNs();
+#endif
     lastFrameTime_ = startTime_;
 
     Runtime::Get().RegisterHandle(handle_, this);
@@ -120,6 +135,9 @@ Session::Session(Instance* instance, const GraphicsContext& graphicsContext)
     inputManager_ = std::make_unique<InputManager>();
 
     startTime_ = std::chrono::steady_clock::now();
+#if !defined(_WIN32)
+    monoStartNs_ = MonotonicNowNs();
+#endif
     lastFrameTime_ = startTime_;
 
     Runtime::Get().RegisterHandle(handle_, this);
@@ -166,6 +184,23 @@ XrTime Session::GetCurrentTime() const
             std::chrono::steady_clock::now() - startTime_)
             .count());
 }
+
+#if !defined(_WIN32)
+XrTime Session::TimespecToXrTime(const struct timespec& ts) const
+{
+    const int64_t monoNs = static_cast<int64_t>(ts.tv_sec) * 1000000000LL + ts.tv_nsec;
+    // XrTime == steady_clock::now() - startTime_, and CLOCK_MONOTONIC advances in
+    // lockstep with steady_clock (both real-time ns), so XrTime == monoNs - monoStartNs_.
+    return static_cast<XrTime>(monoNs - monoStartNs_);
+}
+
+void Session::XrTimeToTimespec(XrTime time, struct timespec& ts) const
+{
+    const int64_t monoNs = static_cast<int64_t>(time) + monoStartNs_;
+    ts.tv_sec = static_cast<time_t>(monoNs / 1000000000LL);
+    ts.tv_nsec = static_cast<long>(monoNs % 1000000000LL);
+}
+#endif
 
 void Session::TransitionState(XrSessionState newState)
 {
