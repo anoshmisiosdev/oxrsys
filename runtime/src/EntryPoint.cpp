@@ -340,6 +340,9 @@ static std::vector<ExtensionInfo> GetSupportedExtensionInfos()
         {XR_KHR_METAL_ENABLE_EXTENSION_NAME, XR_KHR_metal_enable_SPEC_VERSION},
         {UNITY_METAL_ENABLE_EXTENSION_ALIAS, XR_KHR_metal_enable_SPEC_VERSION},
 #endif
+#ifdef XR_USE_TIMESPEC
+        {XR_KHR_CONVERT_TIMESPEC_TIME_EXTENSION_NAME, XR_KHR_convert_timespec_time_SPEC_VERSION},
+#endif
         {XR_EXT_HAND_TRACKING_EXTENSION_NAME, XR_EXT_hand_tracking_SPEC_VERSION},
         {XR_EXT_CONFORMANCE_AUTOMATION_EXTENSION_NAME, XR_EXT_conformance_automation_SPEC_VERSION},
         {XR_EXT_HAND_INTERACTION_EXTENSION_NAME, XR_EXT_hand_interaction_SPEC_VERSION},
@@ -421,6 +424,13 @@ static const char* ExtensionForFunctionName(const char* functionName)
     {
         return XR_EXT_DEBUG_UTILS_EXTENSION_NAME;
     }
+#ifdef XR_USE_TIMESPEC
+    if (std::strcmp(functionName, "xrConvertTimespecTimeToTimeKHR") == 0 ||
+        std::strcmp(functionName, "xrConvertTimeToTimespecTimeKHR") == 0)
+    {
+        return XR_KHR_CONVERT_TIMESPEC_TIME_EXTENSION_NAME;
+    }
+#endif
 #ifdef XR_USE_GRAPHICS_API_METAL
     if (std::strcmp(functionName, "xrGetMetalGraphicsRequirementsKHR") == 0 ||
         std::strcmp(functionName, UNITY_METAL_GRAPHICS_REQUIREMENTS_FUNCTION_ALIAS) == 0)
@@ -4008,6 +4018,78 @@ static XRAPI_ATTR XrResult XRAPI_CALL OxrGetMetalGraphicsRequirementsKHR(
 // xrGetInstanceProcAddr — the main dispatch function
 // ============================================================================
 
+#ifdef XR_USE_TIMESPEC
+// ============================================================================
+// XR_KHR_convert_timespec_time — CLOCK_MONOTONIC timespec <-> XrTime. The
+// session owns the exact time base (monoStartNs_); before a session exists we
+// fall back to a process-global monotonic epoch so conversions never hard-fail.
+// ============================================================================
+static int64_t MonotonicFallbackEpochNs()
+{
+    // Function-local static: C++11 guarantees the initializer runs exactly once
+    // even under concurrent conversion calls before any session exists.
+    static const int64_t epochNs = []() -> int64_t {
+        struct timespec ts{};
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        return static_cast<int64_t>(ts.tv_sec) * 1000000000LL + ts.tv_nsec;
+    }();
+    return epochNs;
+}
+
+static XRAPI_ATTR XrResult XRAPI_CALL OxrConvertTimespecTimeToTimeKHR(
+    XrInstance instance, const struct timespec* timespecTime, XrTime* time)
+{
+    Instance* inst = GetInstance(instance);
+    if (inst == nullptr)
+    {
+        return XR_ERROR_HANDLE_INVALID;
+    }
+    if (timespecTime == nullptr || time == nullptr ||
+        timespecTime->tv_nsec < 0 || timespecTime->tv_nsec >= 1000000000L)
+    {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+
+    if (Session* sess = inst->GetSession())
+    {
+        *time = sess->TimespecToXrTime(*timespecTime);
+    }
+    else
+    {
+        const int64_t monoNs =
+            static_cast<int64_t>(timespecTime->tv_sec) * 1000000000LL + timespecTime->tv_nsec;
+        *time = static_cast<XrTime>(monoNs - MonotonicFallbackEpochNs());
+    }
+    return XR_SUCCESS;
+}
+
+static XRAPI_ATTR XrResult XRAPI_CALL OxrConvertTimeToTimespecTimeKHR(
+    XrInstance instance, XrTime time, struct timespec* timespecTime)
+{
+    Instance* inst = GetInstance(instance);
+    if (inst == nullptr)
+    {
+        return XR_ERROR_HANDLE_INVALID;
+    }
+    if (timespecTime == nullptr)
+    {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+
+    if (Session* sess = inst->GetSession())
+    {
+        sess->XrTimeToTimespec(time, *timespecTime);
+    }
+    else
+    {
+        const int64_t monoNs = static_cast<int64_t>(time) + MonotonicFallbackEpochNs();
+        timespecTime->tv_sec = static_cast<time_t>(monoNs / 1000000000LL);
+        timespecTime->tv_nsec = static_cast<long>(monoNs % 1000000000LL);
+    }
+    return XR_SUCCESS;
+}
+#endif
+
 static XRAPI_ATTR XrResult XRAPI_CALL OxrGetInstanceProcAddr(
     XrInstance instance, const char* name, PFN_xrVoidFunction* function);
 
@@ -4135,6 +4217,12 @@ static XRAPI_ATTR XrResult XRAPI_CALL OxrGetInstanceProcAddr(
     DISPATCH(xrSessionBeginDebugUtilsLabelRegionEXT, OxrSessionBeginDebugUtilsLabelRegionEXT)
     DISPATCH(xrSessionEndDebugUtilsLabelRegionEXT, OxrSessionEndDebugUtilsLabelRegionEXT)
     DISPATCH(xrSessionInsertDebugUtilsLabelEXT, OxrSessionInsertDebugUtilsLabelEXT)
+
+    // Convert timespec time extension
+#ifdef XR_USE_TIMESPEC
+    DISPATCH(xrConvertTimespecTimeToTimeKHR, OxrConvertTimespecTimeToTimeKHR)
+    DISPATCH(xrConvertTimeToTimespecTimeKHR, OxrConvertTimeToTimespecTimeKHR)
+#endif
 
     // Metal extension
 #ifdef XR_USE_GRAPHICS_API_METAL

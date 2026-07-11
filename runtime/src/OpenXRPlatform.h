@@ -35,6 +35,15 @@
 #endif
 #endif
 
+#if !defined(_WIN32)
+// Enable the XR_KHR_convert_timespec_time declarations
+// (xrConvertTimespecTimeToTimeKHR et al.) in openxr_platform.h.
+#include <ctime>
+#ifndef XR_USE_TIMESPEC
+#define XR_USE_TIMESPEC
+#endif
+#endif
+
 #include <openxr/openxr_platform.h>
 
 #if defined(XR_USE_PLATFORM_XLIB) && defined(None)
