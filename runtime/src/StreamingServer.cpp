@@ -891,19 +891,32 @@ void StreamingServer::BroadcastThread()
 {
     oxr::protocol::ServerAnnounce announce = BuildServerAnnounce(false);
 
-    sockaddr_in broadcastAddr = {};
-    broadcastAddr.sin_family = AF_INET;
-    broadcastAddr.sin_port = htons(oxr::protocol::DISCOVERY_PORT);
-    broadcastAddr.sin_addr.s_addr = INADDR_BROADCAST;
+    // Beacon to the subnet broadcast and to loopback: macOS does not loop a
+    // 255.255.255.255 broadcast back to local listeners, so a same-machine
+    // client (e.g. the simulator) needs the explicit loopback copy.
+    auto makeTarget = [](uint32_t addr) {
+        sockaddr_in sa = {};
+        sa.sin_family = AF_INET;
+        sa.sin_port = htons(oxr::protocol::DISCOVERY_PORT);
+        sa.sin_addr.s_addr = addr;
+        return sa;
+    };
+    const sockaddr_in targets[] = {
+        makeTarget(INADDR_BROADCAST),
+        makeTarget(htonl(INADDR_LOOPBACK)),
+    };
 
     while (running_.load() && state_.load() == State::Broadcasting)
     {
-        oxrsys::runtime_socket::SendTo(broadcastSocket_,
-                                       &announce,
-                                       sizeof(announce),
-                                       0,
-                                       (sockaddr*)&broadcastAddr,
-                                       sizeof(broadcastAddr));
+        for (const sockaddr_in& target : targets)
+        {
+            oxrsys::runtime_socket::SendTo(broadcastSocket_,
+                                           &announce,
+                                           sizeof(announce),
+                                           0,
+                                           (const sockaddr*)&target,
+                                           sizeof(target));
+        }
 
         for (int i = 0; i < 10 && running_.load() && state_.load() == State::Broadcasting; i++)
         {
