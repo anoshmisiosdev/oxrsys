@@ -19,6 +19,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <limits>
+#include <bit>
 #include <numeric>
 #include <system_error>
 #include <thread>
@@ -3091,7 +3092,7 @@ void StreamingServer::HandleNackRequest(const oxr::protocol::NackRequest& reques
     std::string clientIp;
     SocketHandle videoSocket = oxrsys::runtime_socket::InvalidSocket;
     std::vector<RetransmitPacket> retransmitPackets;
-    retransmitPackets.reserve(static_cast<size_t>(__builtin_popcountll(request.missingBitmask)));
+    retransmitPackets.reserve(static_cast<size_t>(std::popcount(request.missingBitmask)));
 
     {
         std::lock_guard<std::mutex> lock(packetDispatchState_->mutex);
@@ -3171,7 +3172,7 @@ void StreamingServer::HandleNackRequest(const oxr::protocol::NackRequest& reques
     {
         videoUdpRetransmittedPackets_.fetch_add(retransmitted);
         spdlog::info("StreamingServer: NACK retransmitted {}/{} packets for frame {}",
-                      retransmitted, __builtin_popcountll(request.missingBitmask),
+                      retransmitted, std::popcount(request.missingBitmask),
                       request.frameIndex);
     }
 }
