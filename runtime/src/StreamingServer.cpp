@@ -841,6 +841,13 @@ void StreamingServer::Stop()
     running_.store(false);
     state_.store(State::Stopped);
     frameQueue_.Stop();
+    {
+        // Taking the queue lock orders the running_ store against
+        // VideoSendThread's predicate check; a notify issued between the
+        // check and the wait would otherwise be lost and the join below
+        // would block forever.
+        std::lock_guard<std::mutex> videoSendLock(videoSendMutex_);
+    }
     videoSendCv_.notify_all();
     RuntimeStatus::SetIdle();
     SendUsbDisconnectBestEffort();
