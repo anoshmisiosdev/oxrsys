@@ -3,6 +3,7 @@
 #include "StreamingServer.h"
 #include "ClientLiveness.h"
 #include "Config.h"
+#include "RuntimePlatform.h"
 #include "RuntimeSockets.h"
 #include "RuntimeStatus.h"
 #include "StreamingTransportPolicy.h"
@@ -1371,6 +1372,7 @@ void StreamingServer::TcpSpatialThread()
 
 void StreamingServer::EncodeThread()
 {
+    oxrsys::runtime_platform::SetCurrentThreadTimeSensitive();
     auto telemetry = std::make_shared<EncodeTelemetry>();
     std::shared_ptr<PacketDispatchState> packetDispatchState = packetDispatchState_;
 
@@ -2702,6 +2704,7 @@ void StreamingServer::ClearVideoSendQueue()
 
 void StreamingServer::VideoSendThread()
 {
+    oxrsys::runtime_platform::SetCurrentThreadTimeSensitive();
     while (running_.load())
     {
         TickPendingStreamConfigTimeout(SteadyClockNowNs());

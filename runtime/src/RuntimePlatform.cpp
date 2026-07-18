@@ -15,6 +15,13 @@
 #include <unistd.h>
 #endif
 
+#if defined(__APPLE__)
+#include <pthread/qos.h>
+#elif defined(__linux__)
+#include <pthread.h>
+#include <sched.h>
+#endif
+
 namespace oxrsys::runtime_platform
 {
 
@@ -151,6 +158,21 @@ uint64_t ProcessId()
     return static_cast<uint64_t>(GetCurrentProcessId());
 #else
     return static_cast<uint64_t>(getpid());
+#endif
+}
+
+void SetCurrentThreadTimeSensitive()
+{
+#if defined(__APPLE__)
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#elif defined(_WIN32)
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+#elif defined(__linux__)
+    // Realtime policies need CAP_SYS_NICE; unprivileged processes silently
+    // keep SCHED_OTHER.
+    sched_param param = {};
+    param.sched_priority = sched_get_priority_min(SCHED_FIFO);
+    pthread_setschedparam(pthread_self(), SCHED_FIFO, &param);
 #endif
 }
 
