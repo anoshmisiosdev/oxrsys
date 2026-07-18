@@ -292,9 +292,12 @@ configure_file(
     @ONLY
 )
 
-# Copy manifest JSON next to the dylib
+# Copy manifest JSON next to the dylib. TARGET_FILE_DIR rather than
+# CMAKE_CURRENT_BINARY_DIR so multi-config generators (Visual Studio) put it
+# beside the per-config binary, which is where the test environment points
+# XR_RUNTIME_JSON. Single-config generators resolve to the same directory.
 file(GENERATE
-    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/oxrsys-runtime.json
+    OUTPUT $<TARGET_FILE_DIR:oxrsys_runtime>/oxrsys-runtime.json
     INPUT ${CMAKE_CURRENT_BINARY_DIR}/oxrsys-runtime.json.in.configured
 )
 

@@ -31,6 +31,9 @@ std::filesystem::path RuntimeStatusPathForHome(const std::filesystem::path& home
 {
 #if defined(__APPLE__)
     return home / "Library/Application Support/OXRSys/runtime_status.json";
+#elif defined(_WIN32)
+    // The test points APPDATA at the temp home, so the status root is home/OXRSys.
+    return home / "OXRSys/runtime_status.json";
 #else
     if (const char* xdgStateHome = std::getenv("XDG_STATE_HOME");
         xdgStateHome != nullptr && xdgStateHome[0] != '\0')
@@ -51,7 +54,11 @@ TEST_CASE("RuntimeStatus writes streaming stats only while streaming", "[runtime
         ("openxr-runtime-status-test-" + std::to_string(suffix));
     std::filesystem::create_directories(home);
 
+#if defined(_WIN32)
+    _putenv_s("APPDATA", home.string().c_str());
+#else
     setenv("HOME", home.string().c_str(), 1);
+#endif
 
     RuntimeStatus::SetApplicationName("Status Test");
     RuntimeStatus::SetStreaming("usb_adb", "Quest 3");
