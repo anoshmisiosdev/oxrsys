@@ -2583,6 +2583,85 @@ TEST_CASE("EndFrame rejects invalid projection and quad layers", "[runtime][fram
         XR_ERROR_VALIDATION_FAILURE);
 }
 
+TEST_CASE("XR_KHR_convert_timespec_time bridges CLOCK_MONOTONIC and XrTime", "[runtime][timespec]")
+{
+    // Both conversion directions must be resolvable and must round-trip losslessly.
+    // Exercise the no-session fallback epoch (process-global) and the
+    // active-session time base.
+
+    SECTION("No-session fallback rejects bad input and round-trips losslessly")
+    {
+        const char* extensions[] = {XR_KHR_CONVERT_TIMESPEC_TIME_EXTENSION_NAME};
+        XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
+        std::strncpy(createInfo.applicationInfo.applicationName, "oxrsys_runtime_api_tests",
+                     XR_MAX_APPLICATION_NAME_SIZE);
+        createInfo.applicationInfo.apiVersion = XR_CURRENT_API_VERSION;
+        createInfo.enabledExtensionCount = 1;
+        createInfo.enabledExtensionNames = extensions;
+        XrInstance instance = XR_NULL_HANDLE;
+        XR_CHECK(xrCreateInstance(&createInfo, &instance));
+
+        auto convertTimespecToTime = reinterpret_cast<PFN_xrConvertTimespecTimeToTimeKHR>(
+            GetProc(instance, "xrConvertTimespecTimeToTimeKHR"));
+        auto convertTimeToTimespec = reinterpret_cast<PFN_xrConvertTimeToTimespecTimeKHR>(
+            GetProc(instance, "xrConvertTimeToTimespecTimeKHR"));
+
+        // Out-of-range tv_nsec is rejected in both parameter forms.
+        struct timespec badTimespec{};
+        badTimespec.tv_sec = 100;
+        badTimespec.tv_nsec = 1'000'000'000L; // == 1e9 is out of [0, 1e9)
+        XrTime scratch = 0;
+        CHECK(convertTimespecToTime(instance, &badTimespec, &scratch) ==
+              XR_ERROR_VALIDATION_FAILURE);
+        badTimespec.tv_nsec = -1;
+        CHECK(convertTimespecToTime(instance, &badTimespec, &scratch) ==
+              XR_ERROR_VALIDATION_FAILURE);
+
+        struct timespec now{};
+        REQUIRE(clock_gettime(CLOCK_MONOTONIC, &now) == 0);
+        XrTime xrTime = 0;
+        XR_CHECK(convertTimespecToTime(instance, &now, &xrTime));
+        struct timespec roundTrip{};
+        XR_CHECK(convertTimeToTimespec(instance, xrTime, &roundTrip));
+        CHECK(roundTrip.tv_sec == now.tv_sec);
+        CHECK(roundTrip.tv_nsec == now.tv_nsec);
+
+        XR_CHECK(xrDestroyInstance(instance));
+    }
+
+    SECTION("Active session shares its time base with predicted display time")
+    {
+        RuntimeSessionContext context({
+            XR_KHR_METAL_ENABLE_EXTENSION_NAME,
+            XR_KHR_CONVERT_TIMESPEC_TIME_EXTENSION_NAME,
+        });
+
+        auto convertTimespecToTime = reinterpret_cast<PFN_xrConvertTimespecTimeToTimeKHR>(
+            GetProc(context.instance, "xrConvertTimespecTimeToTimeKHR"));
+        auto convertTimeToTimespec = reinterpret_cast<PFN_xrConvertTimeToTimespecTimeKHR>(
+            GetProc(context.instance, "xrConvertTimeToTimespecTimeKHR"));
+
+        // Round-trip against the session's own time base.
+        struct timespec now{};
+        REQUIRE(clock_gettime(CLOCK_MONOTONIC, &now) == 0);
+        XrTime xrNow = 0;
+        XR_CHECK(convertTimespecToTime(context.instance, &now, &xrNow));
+        struct timespec roundTrip{};
+        XR_CHECK(convertTimeToTimespec(context.instance, xrNow, &roundTrip));
+        CHECK(roundTrip.tv_sec == now.tv_sec);
+        CHECK(roundTrip.tv_nsec == now.tv_nsec);
+
+        // Domain sanity: the XrTime for "now" must sit in the same base as the frame
+        // loop's predicted display time (within a generous few-second bound).
+        XrFrameState frameState = {XR_TYPE_FRAME_STATE};
+        XR_CHECK(xrWaitFrame(context.session, nullptr, &frameState));
+        const int64_t deltaNs =
+            std::llabs(static_cast<int64_t>(frameState.predictedDisplayTime) -
+                       static_cast<int64_t>(xrNow));
+        CHECK(deltaNs < 5'000'000'000LL);
+    }
+}
+
 TEST_CASE("EndFrame accepts a released projection image while another swapchain image is acquired", "[runtime][frame][swapchain]")
 {
     RuntimeSessionContext context({XR_KHR_METAL_ENABLE_EXTENSION_NAME});

@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MPL-2.0
 
 #include "StreamingServer.h"
+#include "ClientLiveness.h"
 #include "Config.h"
+#include "RuntimePlatform.h"
 #include "RuntimeSockets.h"
 #include "RuntimeStatus.h"
 #include "StreamingTransportPolicy.h"
@@ -20,6 +22,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <limits>
+#include <bit>
 #include <numeric>
 #include <system_error>
 #include <thread>
@@ -48,6 +51,10 @@ constexpr int64_t kStreamConfigAckTimeoutNs =
     std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::milliseconds(500)).count();
 constexpr uint32_t kStreamConfigMaxRetries = 2;
+// Treat a connected client as gone if it sends no tracking for this long (abrupt UDP kill).
+constexpr int64_t kClientLivenessTimeoutNs =
+    std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::seconds(3)).count();
 
 int64_t SteadyClockNowNs()
 {
@@ -759,6 +766,13 @@ void StreamingServer::Stop()
     running_.store(false);
     state_.store(State::Stopped);
     frameQueue_.Stop();
+    {
+        // Taking the queue lock orders the running_ store against
+        // VideoSendThread's predicate check; a notify issued between the
+        // check and the wait would otherwise be lost and the join below
+        // would block forever.
+        std::lock_guard<std::mutex> videoSendLock(videoSendMutex_);
+    }
     videoSendCv_.notify_all();
     RuntimeStatus::SetIdle();
     SendUsbDisconnectBestEffort();
@@ -815,19 +829,32 @@ void StreamingServer::BroadcastThread()
 {
     oxr::protocol::ServerAnnounce announce = BuildServerAnnounce(false);
 
-    sockaddr_in broadcastAddr = {};
-    broadcastAddr.sin_family = AF_INET;
-    broadcastAddr.sin_port = htons(oxr::protocol::DISCOVERY_PORT);
-    broadcastAddr.sin_addr.s_addr = INADDR_BROADCAST;
+    // Beacon to the subnet broadcast and to loopback: macOS does not loop a
+    // 255.255.255.255 broadcast back to local listeners, so a same-machine
+    // client (e.g. the simulator) needs the explicit loopback copy.
+    auto makeTarget = [](uint32_t addr) {
+        sockaddr_in sa = {};
+        sa.sin_family = AF_INET;
+        sa.sin_port = htons(oxr::protocol::DISCOVERY_PORT);
+        sa.sin_addr.s_addr = addr;
+        return sa;
+    };
+    const sockaddr_in targets[] = {
+        makeTarget(INADDR_BROADCAST),
+        makeTarget(htonl(INADDR_LOOPBACK)),
+    };
 
     while (running_.load() && state_.load() == State::Broadcasting)
     {
-        oxrsys::runtime_socket::SendTo(broadcastSocket_,
-                                       &announce,
-                                       sizeof(announce),
-                                       0,
-                                       (sockaddr*)&broadcastAddr,
-                                       sizeof(broadcastAddr));
+        for (const sockaddr_in& target : targets)
+        {
+            oxrsys::runtime_socket::SendTo(broadcastSocket_,
+                                           &announce,
+                                           sizeof(announce),
+                                           0,
+                                           (const sockaddr*)&target,
+                                           sizeof(target));
+        }
 
         for (int i = 0; i < 10 && running_.load() && state_.load() == State::Broadcasting; i++)
         {
@@ -1277,6 +1304,7 @@ void StreamingServer::TcpSpatialThread()
 
 void StreamingServer::EncodeThread()
 {
+    oxrsys::runtime_platform::SetCurrentThreadTimeSensitive();
     auto telemetry = std::make_shared<EncodeTelemetry>();
     std::shared_ptr<PacketDispatchState> packetDispatchState = packetDispatchState_;
 
@@ -1638,6 +1666,9 @@ void StreamingServer::HandleClientConnect(const oxr::protocol::ClientConnect& cl
     UpdatePredictionHorizon();
 
     state_.store(State::Connected);
+    lastClientActivityNs_.store(SteadyClockNowNs(), std::memory_order_relaxed);
+    lastTrackingCountSeen_.store(
+        trackingReceiver_ ? trackingReceiver_->GetPacketCount() : 0, std::memory_order_relaxed);
 
     {
         std::lock_guard<std::mutex> broadcastLock(broadcastThreadMutex_);
@@ -1829,6 +1860,9 @@ void StreamingServer::HandleUsbClientConnect(const oxr::protocol::ClientConnect&
     UpdatePredictionHorizon();
 
     state_.store(State::Connected);
+    lastClientActivityNs_.store(SteadyClockNowNs(), std::memory_order_relaxed);
+    lastTrackingCountSeen_.store(
+        trackingReceiver_ ? trackingReceiver_->GetPacketCount() : 0, std::memory_order_relaxed);
 
     {
         std::lock_guard<std::mutex> broadcastLock(broadcastThreadMutex_);
@@ -2522,10 +2556,36 @@ void StreamingServer::UpdatePredictionHorizon()
     trackingReceiver_->SetPredictionHorizonMs(horizonMs);
 }
 
+void StreamingServer::CheckClientLiveness(int64_t nowNs)
+{
+    // Only reached from SendFrame, so liveness is evaluated while the app is
+    // still submitting frames.
+    if (state_.load() != State::Connected)
+    {
+        return;
+    }
+    const uint64_t count = trackingReceiver_ ? trackingReceiver_->GetPacketCount() : 0;
+    const oxrsys::ClientLivenessState prev{
+        lastTrackingCountSeen_.load(std::memory_order_relaxed),
+        lastClientActivityNs_.load(std::memory_order_relaxed)};
+    const oxrsys::ClientLivenessDecision decision =
+        oxrsys::EvaluateClientLiveness(prev, count, nowNs, kClientLivenessTimeoutNs);
+    lastTrackingCountSeen_.store(decision.state.lastCountSeen, std::memory_order_relaxed);
+    lastClientActivityNs_.store(decision.state.lastActivityNs, std::memory_order_relaxed);
+    if (decision.disconnect)
+    {
+        spdlog::warn("StreamingServer: no client tracking for {} ms; treating client as "
+                     "disconnected and resuming broadcast",
+                     (nowNs - prev.lastActivityNs) / 1'000'000);
+        HandleClientDisconnect();
+    }
+}
+
 void StreamingServer::SendFrame(FrameSource frameSource,
                                 const float* renderHeadOrientation,
                                 const float* renderHeadPosition)
 {
+    CheckClientLiveness(SteadyClockNowNs());
     if (!frameSource.IsStereoValid() || state_.load() != State::Connected)
     {
         return;
@@ -2632,6 +2692,7 @@ void StreamingServer::ClearVideoSendQueue()
 
 void StreamingServer::VideoSendThread()
 {
+    oxrsys::runtime_platform::SetCurrentThreadTimeSensitive();
     while (running_.load())
     {
         TickPendingStreamConfigTimeout(SteadyClockNowNs());
@@ -3072,7 +3133,7 @@ void StreamingServer::HandleNackRequest(const oxr::protocol::NackRequest& reques
     std::string clientIp;
     SocketHandle videoSocket = oxrsys::runtime_socket::InvalidSocket;
     std::vector<RetransmitPacket> retransmitPackets;
-    retransmitPackets.reserve(static_cast<size_t>(__builtin_popcountll(request.missingBitmask)));
+    retransmitPackets.reserve(static_cast<size_t>(std::popcount(request.missingBitmask)));
 
     {
         std::lock_guard<std::mutex> lock(packetDispatchState_->mutex);
@@ -3152,7 +3213,7 @@ void StreamingServer::HandleNackRequest(const oxr::protocol::NackRequest& reques
     {
         videoUdpRetransmittedPackets_.fetch_add(retransmitted);
         spdlog::info("StreamingServer: NACK retransmitted {}/{} packets for frame {}",
-                      retransmitted, __builtin_popcountll(request.missingBitmask),
+                      retransmitted, std::popcount(request.missingBitmask),
                       request.frameIndex);
     }
 }

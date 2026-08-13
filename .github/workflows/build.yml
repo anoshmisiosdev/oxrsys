@@ -1,0 +1,124 @@
+# SPDX-License-Identifier: MPL-2.0
+name: Build & Test
+
+on:
+  push:
+    branches: [main, develop, 'ci/**']
+  pull_request:
+  workflow_dispatch:
+
+# Superseded pushes to the same ref don't need their runs finished.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    name: macOS (VideoToolbox)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: brew install ninja vulkan-headers vulkan-loader
+      - name: Cache third-party sources
+        uses: actions/cache@v4
+        with:
+          path: build/_deps
+          key: deps-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  linux:
+    name: Linux (FFmpeg)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build pkg-config \
+            libvulkan-dev \
+            libavcodec-dev libavutil-dev libswscale-dev \
+            libgl1-mesa-dev libx11-dev libxrandr-dev
+      - name: Cache third-party sources
+        uses: actions/cache@v4
+        with:
+          path: build/_deps
+          key: deps-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+      - name: Test time-sensitive scheduling with CAP_SYS_NICE
+        # ctest above exercises the unprivileged EPERM path; this rerun of the
+        # single scheduling test with the capability granted exercises the
+        # privileged SCHED_FIFO path. Skipped on branches that predate the
+        # scheduling helper.
+        run: |
+          if ./build/oxrsys_runtime_tests --list-tests | grep -q SetCurrentThreadTimeSensitive; then
+            sudo setcap cap_sys_nice+ep build/oxrsys_runtime_tests
+            ./build/oxrsys_runtime_tests "SetCurrentThreadTimeSensitive raises the calling thread's priority"
+          else
+            echo "scheduling test not present on this branch; skipping"
+          fi
+
+  windows:
+    name: Windows (FFmpeg)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Vulkan SDK
+        uses: humbletim/setup-vulkan-sdk@c25f41106918cde0bf347e6f201277392b3a9e9d # v1.2.1
+        with:
+          vulkan-query-version: 1.3.283.0
+          vulkan-components: Vulkan-Headers, Vulkan-Loader
+          vulkan-use-cache: true
+      - name: Cache FFmpeg dev libraries
+        id: cache-ffmpeg
+        uses: actions/cache@v4
+        with:
+          path: ffmpeg-extract
+          key: ffmpeg-win64-gpl-shared-v1
+      - name: Download FFmpeg dev libraries
+        if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          curl.exe -L -o ffmpeg.zip https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip
+          7z x ffmpeg.zip -offmpeg-extract
+      - name: Locate FFmpeg
+        shell: pwsh
+        run: |
+          $root = (Get-ChildItem ffmpeg-extract | Select-Object -First 1).FullName
+          "FFMPEG_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Cache third-party sources
+        uses: actions/cache@v4
+        with:
+          path: build/_deps
+          key: deps-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
+      - name: Configure
+        run: cmake -S . -B build -DFFMPEG_ROOT="$env:FFMPEG_ROOT"
+        shell: pwsh
+      - name: Build
+        run: cmake --build build --config Debug --parallel 4
+      - name: Register runtime for the OpenXR loader
+        # The runners execute elevated, and the loader deliberately ignores
+        # XR_RUNTIME_JSON in elevated contexts - register the runtime the way a
+        # real install does. Resolve the manifest rather than hardcoding the
+        # generator-dependent layout, and fail here if the build didn't
+        # produce one.
+        shell: pwsh
+        run: |
+          $manifest = Get-ChildItem build -Recurse -Filter oxrsys-runtime.json | Select-Object -First 1
+          if (-not $manifest) { throw 'no oxrsys-runtime.json in the build tree' }
+          reg add 'HKLM\SOFTWARE\Khronos\OpenXR\1' /v ActiveRuntime /t REG_SZ /d $manifest.FullName /f
+      - name: Test
+        shell: pwsh
+        run: |
+          Copy-Item "$env:FFMPEG_ROOT\bin\*.dll" build\Debug
+          ctest --test-dir build -C Debug --output-on-failure

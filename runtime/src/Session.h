@@ -8,6 +8,7 @@
 #include <vector>
 #include <chrono>
 #include <cstdint>
+#include <ctime>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -92,6 +93,13 @@ public:
     }
 
     XrTime GetCurrentTime() const;
+#if !defined(_WIN32)
+    // XR_KHR_convert_timespec_time helpers. CLOCK_MONOTONIC is captured at the
+    // same instant startTime_ is set (monoStartNs_), so XrTime == mono_ns -
+    // monoStartNs_ and the mapping is a pure offset consistent with GetCurrentTime().
+    XrTime TimespecToXrTime(const struct timespec& ts) const;
+    void XrTimeToTimespec(XrTime time, struct timespec& ts) const;
+#endif
     void BeginDebugUtilsLabelRegion(const XrDebugUtilsLabelEXT& labelInfo);
     void EndDebugUtilsLabelRegion();
     void InsertDebugUtilsLabel(const XrDebugUtilsLabelEXT& labelInfo);
@@ -136,6 +144,10 @@ private:
     std::vector<std::unique_ptr<Space>> spaces_;
 
     std::chrono::steady_clock::time_point startTime_;
+#if !defined(_WIN32)
+    // CLOCK_MONOTONIC nanoseconds sampled at the same instant as startTime_.
+    int64_t monoStartNs_ = 0;
+#endif
     std::chrono::steady_clock::time_point lastFrameTime_;
 
     std::vector<DebugUtilsLabelState> debugUtilsLabelRegions_;
