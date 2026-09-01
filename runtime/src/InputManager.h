@@ -60,6 +60,7 @@ public:
 
     // Controller poses (world space)
     XrPosef GetControllerPose(Hand hand) const;
+    XrPosef GetControllerAimPose(Hand hand) const;
 
     // Raw controller velocity (linear m/s, angular rad/s) in the same tracking frame as
     // GetControllerPose, for reporting XrSpaceVelocity. Undamped (finite-difference of raw
@@ -144,6 +145,9 @@ private:
     glm::quat headQuat_ = glm::quat(1.0f, 0.0f, 0.0f, 0.0f); // w,x,y,z
     glm::quat leftControllerRot_ = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
     glm::quat rightControllerRot_ = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+    // Aim (pointer) pose — distinct from grip; zero quaternion means "not supplied" (fall back).
+    glm::quat leftControllerAimRot_ = glm::quat(0.0f, 0.0f, 0.0f, 0.0f);
+    glm::quat rightControllerAimRot_ = glm::quat(0.0f, 0.0f, 0.0f, 0.0f);
     glm::vec3 headPosition_ = {0.0f, 1.6f, 0.0f};
 
     // Streaming controller state
@@ -161,6 +165,8 @@ private:
     // Controller positions (world space offsets)
     glm::vec3 leftControllerPos_ = {-0.2f, 1.3f, -0.4f};
     glm::vec3 rightControllerPos_ = {0.2f, 1.3f, -0.4f};
+    glm::vec3 leftControllerAimPos_ = {-0.2f, 1.3f, -0.4f};
+    glm::vec3 rightControllerAimPos_ = {0.2f, 1.3f, -0.4f};
 
     // Button states
     bool leftGrab_ = false;

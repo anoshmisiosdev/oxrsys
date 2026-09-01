@@ -62,6 +62,7 @@ This file tracks user-facing, integration-facing, and runtime-relevant changes f
 
 ### Fixed
 
+- Fixed controller interaction-profile reporting so standard OpenXR apps (e.g. Unity with the Oculus Touch controller profile) receive controller input from Meta Quest / PICO headsets. `xrGetCurrentInteractionProfile` now returns the most-specific profile from the runtime's compatibility list that the application actually suggested bindings for (per the OpenXR spec), instead of a device-specific profile the app never bound. Also serves `/input/aim/pose` from a streamed aim pose, thresholds analog grip/trigger for boolean actions, emits `XrEventDataInteractionProfileChanged`, and fixes a client crash on reconnect. (cherry-picked from develop)
 - Fixed Metal streaming frame snapshots so the async encoder reads a release-time staging texture instead of a swapchain slot that the app may already have reused.
 - Fixed server-side foveated encoding on Metal by running the AADT pass through a compute shader into a private GPU scratch texture before blitting into the VideoToolbox pixel buffer, avoiding render-encoder validation aborts on the first encoded frame.
 - Fixed Quest connection recovery when a server is discovered but no first video frame arrives, returning the client to discovery/retry instead of leaving the standby/loading screen stuck.
