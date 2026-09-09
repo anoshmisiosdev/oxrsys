@@ -38,6 +38,7 @@ val preferredDisplayRefreshRateHz =
 android {
     namespace = "net.demonixis.oxrsys.android"
     compileSdk = 35
+    ndkVersion = "27.2.12479018"  // pinned for reproducible CI builds
 
     lint {
         abortOnError = false

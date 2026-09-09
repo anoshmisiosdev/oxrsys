@@ -1,0 +1,67 @@
+name: Build Android client APK
+
+# Builds the OXRSys Quest client APK (with headset audio playback). The release
+# build is debug-signed for sideloading, so the artifact installs directly with
+# `adb install`. Uploaded on every push to the audio branch and attached to a
+# Release on version tags.
+
+on:
+  push:
+    branches: [feat/headset-audio, main]
+    paths: ['clients/Android/**', '.github/workflows/build-android-client.yml']
+    tags: ['client-v*']
+  pull_request:
+    paths: ['clients/Android/**']
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: clients/Android/android-vr
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK + CMake
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0" \
+                     "ndk;27.2.12479018" "cmake;3.22.1"
+
+      - name: Build release APK (debug-signed, sideloadable)
+        run: ./gradlew --no-daemon assembleRelease
+
+      - name: Locate APK
+        id: apk
+        run: |
+          apk=$(find app/build/outputs/apk -name "*.apk" | head -1)
+          echo "path=$apk" >> "$GITHUB_OUTPUT"
+          ls -la "$apk"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: oxrsys-quest-client-apk
+          path: clients/Android/android-vr/${{ steps.apk.outputs.path }}
+          if-no-files-found: error
+
+      - name: Attach to Release (tag builds only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: clients/Android/android-vr/${{ steps.apk.outputs.path }}
+          generate_release_notes: true
