@@ -2627,7 +2627,8 @@ void XrApp::SendClientConnect(const char* serverIp)
     connect.refreshRateHz = clientRefreshRateHz_;
     connect.clientCapabilities =
         protocol::CLIENT_CAPABILITY_FOVEATED_ENCODING |
-        protocol::CLIENT_CAPABILITY_CLIENT_UPSCALING;
+        protocol::CLIENT_CAPABILITY_CLIENT_UPSCALING |
+        protocol::CLIENT_CAPABILITY_AUDIO_OUTPUT;
     if (foveationAvailable_ && foveationConfigurationAvailable_ && swapchainUpdateAvailable_)
     {
         connect.clientCapabilities |= protocol::CLIENT_CAPABILITY_CLIENT_FOVEATION;

@@ -303,6 +303,25 @@ void NetworkReceiver::ReceiveTcpThread(OnNalUnitCallback callback)
             continue;
         }
 
+        if (header.type == protocol::TcpRecordType::Audio)
+        {
+            if (payload.size() >= sizeof(protocol::TcpAudioHeader))
+            {
+                const auto* audioHeader =
+                    reinterpret_cast<const protocol::TcpAudioHeader*>(payload.data());
+                const uint8_t* pcm = payload.data() + sizeof(protocol::TcpAudioHeader);
+                size_t pcmBytes = payload.size() - sizeof(protocol::TcpAudioHeader);
+                if (pcmBytes > audioHeader->payloadSize)
+                {
+                    pcmBytes = audioHeader->payloadSize;
+                }
+                audioPlayer_.Write(reinterpret_cast<const float*>(pcm),
+                                   static_cast<uint32_t>(pcmBytes / sizeof(float)),
+                                   audioHeader->sampleRateHz, audioHeader->channels);
+            }
+            continue;
+        }
+
         if (header.type != protocol::TcpRecordType::VideoNal ||
             payload.size() < sizeof(protocol::TcpVideoNalHeader))
         {
@@ -733,6 +752,7 @@ void NetworkReceiver::Stop()
 {
     discovering_.store(false);
     receiving_.store(false);
+    audioPlayer_.Stop();
 
     if (discoverySocket_ >= 0)
     {

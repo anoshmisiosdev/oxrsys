@@ -603,6 +603,7 @@ void StreamingServer::Stop()
 {
     running_.store(false);
     state_.store(State::Stopped);
+    StopAudioCapture();
     frameQueue_.Stop();
     videoSendCv_.notify_all();
     RuntimeStatus::SetIdle();
@@ -739,8 +740,13 @@ oxr::protocol::ServerAnnounce StreamingServer::BuildServerAnnounce() const
     {
         announce.serverFeatures |= oxr::protocol::SERVER_FEATURE_CLIENT_UPSCALING;
     }
-    // Headset audio is part of the wire protocol, but the stream is advertised
-    // only once an actual capture/playback path is attached.
+    // Headset audio is advertised only when enabled in config; the actual
+    // capture path is attached per-connection once the client reports the
+    // AUDIO_OUTPUT capability (USB/TCP transport only — see StartAudioCapture).
+    if (config.headsetAudio)
+    {
+        announce.serverFeatures |= oxr::protocol::SERVER_FEATURE_HEADSET_AUDIO;
+    }
 
     announce.audioPort = oxr::protocol::AUDIO_PORT;
     announce.foveatedEncodingPreset = foveationPreset;
@@ -1219,7 +1225,7 @@ void StreamingServer::EncodeThread()
                     stats.abrMode = abrModeName;
                     stats.abrState = abrStateName;
                     stats.abrProfile = abrProfileName;
-                    stats.headsetAudio = false;
+                    stats.headsetAudio = audioActive_.load();
                     stats.serverPipelineLatencyMs = serverPipelineLatencyMs_.load();
                     stats.clientPipelineLatencyMs = clientPipelineLatencyMs_.load();
                     stats.clientReceiveToSubmitMs = clientReceiveToSubmitMs_.load();
@@ -1330,6 +1336,8 @@ void StreamingServer::HandleClientConnect(const oxr::protocol::ClientConnect& cl
     UpdatePredictionHorizon();
 
     state_.store(State::Connected);
+
+    StartAudioCapture(clientConnect);
 
     if (broadcastThread_.joinable())
     {
@@ -1447,6 +1455,8 @@ void StreamingServer::HandleUsbClientConnect(const oxr::protocol::ClientConnect&
 
     state_.store(State::Connected);
 
+    StartAudioCapture(clientConnect);
+
     if (broadcastThread_.joinable())
     {
         broadcastThread_.join();
@@ -1543,6 +1553,8 @@ void StreamingServer::HandleClientDisconnect()
     {
         return;
     }
+
+    StopAudioCapture();
 
     State previousState = state_.exchange(State::Broadcasting);
     bool hadClient = false;
@@ -1984,6 +1996,162 @@ void StreamingServer::SendRenderPosePacket(const EncodedVideoFrame& frame)
                                    kBestEffortSendFlags,
                                    (sockaddr*)&destAddr,
                                    sizeof(destAddr));
+}
+
+// ─── Headset audio (USB/TCP) ────────────────────────────────────────────────
+// Tap the game's audio (Core Audio process tap, same process) and stream it as
+// TcpRecordType::Audio records multiplexed over the video TCP socket. USB only
+// for now: over Wi-Fi the video path is UDP and audio would need the separate
+// UDP AudioPacketHeader path, which is not implemented yet.
+
+namespace
+{
+constexpr size_t kMaxAudioQueuePackets = 32; // ~ a few hundred ms; drop oldest past this
+}
+
+void StreamingServer::StartAudioCapture(const oxr::protocol::ClientConnect& clientConnect)
+{
+    const ConfigValues config = Config::Get().GetValues();
+    if (!config.headsetAudio)
+    {
+        return;
+    }
+    if (!clientUsesUsbAdb_.load())
+    {
+        spdlog::info("StreamingServer: headset audio requested but only supported on "
+                     "USB transport for now; skipping");
+        return;
+    }
+    if ((clientConnect.clientCapabilities &
+         oxr::protocol::CLIENT_CAPABILITY_AUDIO_OUTPUT) == 0)
+    {
+        spdlog::info("StreamingServer: headset audio enabled but client does not "
+                     "advertise AUDIO_OUTPUT; skipping");
+        return;
+    }
+
+    StopAudioCapture(); // ensure a clean state
+
+    audioCapture_ = std::make_unique<oxrsys::AudioCapture>();
+    audioActive_.store(true);
+    audioFramesSent_.store(0);
+    audioSendThread_ = std::thread(&StreamingServer::AudioSendThread, this);
+
+    const bool started = audioCapture_->Start(
+        [this](const float* data, uint32_t frames, uint32_t sampleRateHz, uint16_t channels) {
+            EnqueueAudioSamples(data, frames, sampleRateHz, channels);
+        });
+    if (!started)
+    {
+        spdlog::warn("StreamingServer: audio capture failed to start; headset audio off");
+        StopAudioCapture();
+        return;
+    }
+    spdlog::info("StreamingServer: headset audio streaming enabled");
+}
+
+void StreamingServer::StopAudioCapture()
+{
+    if (audioCapture_)
+    {
+        audioCapture_->Stop(); // blocks until the IOProc (enqueue source) is stopped
+        audioCapture_.reset();
+    }
+    audioActive_.store(false);
+    audioQueueCv_.notify_all();
+    if (audioSendThread_.joinable())
+    {
+        audioSendThread_.join();
+    }
+    {
+        std::lock_guard<std::mutex> lock(audioQueueMutex_);
+        audioSendQueue_.clear();
+    }
+}
+
+void StreamingServer::EnqueueAudioSamples(const float* data, uint32_t frames,
+                                          uint32_t sampleRateHz, uint16_t channels)
+{
+    if (!audioActive_.load() || data == nullptr || frames == 0 || channels == 0)
+    {
+        return;
+    }
+
+    const size_t pcmBytes = static_cast<size_t>(frames) * channels * sizeof(float);
+    if (sizeof(oxr::protocol::TcpAudioHeader) + pcmBytes >
+        oxr::protocol::TCP_MAX_RECORD_PAYLOAD)
+    {
+        return; // shouldn't happen for typical IOProc buffer sizes
+    }
+
+    oxr::protocol::TcpAudioHeader header = {};
+    header.presentationTimeNs =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    header.frameCount = frames;
+    header.payloadSize = static_cast<uint32_t>(pcmBytes);
+    header.sampleRateHz = sampleRateHz;
+    header.channels = channels;
+    header.format = static_cast<uint16_t>(oxr::protocol::AudioSampleFormat::Float32);
+
+    std::vector<uint8_t> packet(sizeof(header) + pcmBytes);
+    memcpy(packet.data(), &header, sizeof(header));
+    memcpy(packet.data() + sizeof(header), data, pcmBytes);
+
+    {
+        std::lock_guard<std::mutex> lock(audioQueueMutex_);
+        if (audioSendQueue_.size() >= kMaxAudioQueuePackets)
+        {
+            audioSendQueue_.pop_front(); // drop oldest to bound latency
+            audioSendQueueDrops_.fetch_add(1);
+        }
+        audioSendQueue_.push_back(std::move(packet));
+    }
+    audioQueueCv_.notify_one();
+}
+
+void StreamingServer::AudioSendThread()
+{
+    while (audioActive_.load() && running_.load())
+    {
+        std::vector<uint8_t> packet;
+        {
+            std::unique_lock<std::mutex> lock(audioQueueMutex_);
+            audioQueueCv_.wait(lock, [this] {
+                return !audioSendQueue_.empty() || !audioActive_.load() ||
+                       !running_.load();
+            });
+            if (!audioActive_.load() || !running_.load())
+            {
+                break;
+            }
+            packet = std::move(audioSendQueue_.front());
+            audioSendQueue_.pop_front();
+        }
+
+        SocketHandle videoSocket = oxrsys::runtime_socket::InvalidSocket;
+        bool videoUsesTcp = false;
+        bool accepting = false;
+        {
+            std::lock_guard<std::mutex> lock(packetDispatchState_->mutex);
+            accepting = packetDispatchState_->acceptingPackets;
+            videoSocket = packetDispatchState_->videoSocket;
+            videoUsesTcp = packetDispatchState_->videoUsesTcp;
+        }
+        if (!accepting || !videoUsesTcp ||
+            !oxrsys::runtime_socket::IsValid(videoSocket))
+        {
+            continue; // no TCP audio path right now; drop this buffer
+        }
+
+        std::lock_guard<std::mutex> sendLock(packetDispatchState_->sendMutex);
+        if (SendTcpRecord(videoSocket, oxr::protocol::TcpRecordType::Audio,
+                          packet.data(), packet.size()))
+        {
+            audioFramesSent_.fetch_add(1);
+        }
+    }
 }
 
 void StreamingServer::SendNalUnit(const std::shared_ptr<PacketDispatchState>& dispatchState,

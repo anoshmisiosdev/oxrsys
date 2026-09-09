@@ -18,6 +18,7 @@
 #include "GraphicsTypes.h"
 #include "StreamingAbr.h"
 #include "StreamingFrameQueue.h"
+#include "AudioCapture.h"
 
 // Shared protocol definitions
 #include <oxrsys/protocol/Protocol.h>
@@ -149,6 +150,13 @@ private:
     void ClearVideoSendQueue();
     void SendEncodedVideoFrame(const EncodedVideoFrame& frame);
     void SendRenderPosePacket(const EncodedVideoFrame& frame);
+    // Headset audio (USB/TCP): tap the game's audio and stream it as
+    // TcpRecordType::Audio records multiplexed over the video TCP socket.
+    void StartAudioCapture(const oxr::protocol::ClientConnect& clientConnect);
+    void StopAudioCapture();
+    void AudioSendThread();
+    void EnqueueAudioSamples(const float* data, uint32_t frames,
+                             uint32_t sampleRateHz, uint16_t channels);
     bool StartUsbTcpListeners();
     void SendUsbDisconnectBestEffort();
     void StopUsbTcpSockets();
@@ -223,6 +231,18 @@ private:
     std::thread tcpVideoThread_;
     std::thread tcpTrackingThread_;
     std::atomic<bool> running_{false};
+
+    // Headset audio. Audio records share the video TCP socket with the video
+    // and render-pose writers, so audio sends take packetDispatchState_->sendMutex
+    // (the same lock those writers use) to avoid interleaving record framing.
+    std::unique_ptr<oxrsys::AudioCapture> audioCapture_;
+    std::thread audioSendThread_;
+    std::mutex audioQueueMutex_;
+    std::condition_variable audioQueueCv_;
+    std::deque<std::vector<uint8_t>> audioSendQueue_;
+    std::atomic<bool> audioActive_{false};
+    std::atomic<uint32_t> audioSendQueueDrops_{0};
+    std::atomic<uint64_t> audioFramesSent_{0};
     StreamingFrameQueue frameQueue_;
     std::shared_ptr<PacketDispatchState> packetDispatchState_;
     std::atomic<uint32_t> pendingFrameDepthMax_{0};

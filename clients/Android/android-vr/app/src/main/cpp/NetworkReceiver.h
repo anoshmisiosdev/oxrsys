@@ -13,6 +13,8 @@
 
 #include <oxrsys/protocol/Protocol.h>
 
+#include "AudioPlayer.h"
+
 namespace oxr
 {
 
@@ -124,6 +126,9 @@ private:
     // NACK support
     int controlSocket_ = -1;
     std::string serverIp_;
+
+    // Headset audio playback (TcpRecordType::Audio records over the video socket).
+    AudioPlayer audioPlayer_;
 
     // Stats for logging
     std::atomic<uint32_t> packetsReceived_{0};

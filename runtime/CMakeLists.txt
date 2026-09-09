@@ -24,6 +24,7 @@ if(APPLE)
         src/Swapchain.mm
         src/VideoEncoder.mm
         src/HevcEncoderHelperClient.mm
+        src/AudioCapture.mm
     )
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     list(APPEND OXRSYS_RUNTIME_SOURCES
@@ -101,6 +102,7 @@ if(APPLE)
         "-framework VideoToolbox"
         "-framework CoreMedia"
         "-framework CoreVideo"
+        "-framework CoreAudio"
         "-framework IOSurface"
     )
 endif()

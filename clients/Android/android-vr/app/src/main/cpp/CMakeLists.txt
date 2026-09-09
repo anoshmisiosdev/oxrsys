@@ -51,6 +51,7 @@ add_library(oxrsys_android SHARED
     VideoDecoder.cpp
     NetworkReceiver.cpp
     TrackingSender.cpp
+    AudioPlayer.cpp
 )
 
 target_include_directories(oxrsys_android PRIVATE
@@ -64,6 +65,7 @@ target_link_libraries(oxrsys_android PRIVATE
     android
     log
     mediandk
+    aaudio
     nativewindow
     EGL
     GLESv3
