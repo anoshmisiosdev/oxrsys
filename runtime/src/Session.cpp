@@ -358,15 +358,69 @@ XrResult Session::WaitFrame(const XrFrameWaitInfo* frameWaitInfo, XrFrameState* 
         targetRefreshHz = std::max(streamingServer_->GetTargetRefreshRateHz(), 1u);
     }
 
-    // Throttle to the negotiated headset refresh rate when available.
-    auto now = std::chrono::steady_clock::now();
-    auto elapsed = now - lastFrameTime_;
+    // Frame pacing: self-correcting absolute-deadline grid at the negotiated display
+    // period. The previous scheme slept for (period - elapsed) and then re-anchored
+    // to the wake time, so sleep overshoot was never corrected: periods were always
+    // >= the target and the phase drifted continuously against the panel (the app
+    // free-ran slightly under refresh, producing a slow beat and frame-duplication
+    // judder even at a good average framerate). Here each frame targets a fixed
+    // absolute deadline advanced by exactly one period, so overshoot on one frame is
+    // absorbed by the next and the cadence locks to the panel period with low
+    // variance. targetFrameTime comes from the client-reported (negotiated) refresh.
     auto targetFrameTime = std::chrono::nanoseconds(1000000000ll / targetRefreshHz);
+    auto now = std::chrono::steady_clock::now();
 
-    if (elapsed < targetFrameTime)
+    if (nextFrameDeadline_.time_since_epoch().count() == 0 || pacingPeriod_ != targetFrameTime)
     {
-        std::this_thread::sleep_for(targetFrameTime - elapsed);
-        now = std::chrono::steady_clock::now();
+        // First frame, or the negotiated refresh changed: (re)seed the grid.
+        pacingPeriod_ = targetFrameTime;
+        nextFrameDeadline_ = now + targetFrameTime;
+    }
+    else
+    {
+        if (now < nextFrameDeadline_)
+        {
+            std::this_thread::sleep_until(nextFrameDeadline_);
+            now = std::chrono::steady_clock::now();
+        }
+        nextFrameDeadline_ += targetFrameTime;
+
+        // If we fell far behind (a hitch, a stall, or the app pausing), snap the grid
+        // back to the present rather than firing a burst of catch-up frames.
+        if (now - nextFrameDeadline_ > 2 * targetFrameTime)
+        {
+            nextFrameDeadline_ = now + targetFrameTime;
+        }
+    }
+
+    // Frame-pacing diagnostic: actual inter-WaitFrame interval statistics prove the
+    // cadence locks to the negotiated period (e.g. ~13.9ms @72Hz, ~11.1ms @90Hz)
+    // with low variance instead of free-running / drifting.
+    {
+        static std::vector<double> intervalSamplesMs;
+        static auto lastPacingLog = Clock::now();
+        auto intervalMs = std::chrono::duration<double, std::milli>(now - lastFrameTime_).count();
+        if (lastFrameTime_ != startTime_)
+        {
+            intervalSamplesMs.push_back(intervalMs);
+        }
+        if (now - lastPacingLog >= std::chrono::seconds(1) && !intervalSamplesMs.empty())
+        {
+            double sum = std::accumulate(intervalSamplesMs.begin(), intervalSamplesMs.end(), 0.0);
+            double mean = sum / intervalSamplesMs.size();
+            double variance = 0.0;
+            for (double s : intervalSamplesMs) { variance += (s - mean) * (s - mean); }
+            variance /= intervalSamplesMs.size();
+            double stddev = std::sqrt(variance);
+            auto mm = std::minmax_element(intervalSamplesMs.begin(), intervalSamplesMs.end());
+            spdlog::info("OXRSys: Session::WaitFrame pacing target={}Hz ({:.2f}ms) "
+                         "actual mean={:.2f}ms stddev={:.2f}ms min/max={:.2f}/{:.2f}ms (n={})",
+                         targetRefreshHz,
+                         std::chrono::duration<double, std::milli>(targetFrameTime).count(),
+                         mean, stddev, *mm.first, *mm.second, intervalSamplesMs.size());
+            intervalSamplesMs.clear();
+            lastPacingLog = now;
+        }
     }
 
     auto dt = std::chrono::duration<float>(now - lastFrameTime_).count();
