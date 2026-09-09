@@ -70,8 +70,14 @@ client_reprojection = "pose"
 # "full" may select resolution/foveation/upscaling profiles after session-safe transitions.
 abr_mode = "bitrate"
 
-# Reserved for headset speaker audio. The runtime does not advertise audio until
-# a platform capture/playback path is attached.
+# Stream game audio to the headset (USB transport only for now).
+# On macOS the runtime captures a loopback INPUT device (e.g. BlackHole): install
+# one, route the game's output to it (a Multi-Output Device also including your
+# speakers lets you hear it too), and set this to true. A Core Audio system tap
+# does not work under CrossOver (silence — needs System-Audio-Recording
+# permission it can't request); a loopback input uses the Microphone permission.
+# The audio stream is advertised only when this is on and the client reports the
+# AUDIO_OUTPUT capability.
 headset_audio = false
 
 [logging]
