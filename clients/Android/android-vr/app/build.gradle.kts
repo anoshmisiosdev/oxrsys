@@ -67,14 +67,29 @@ android {
         }
     }
 
+    signingConfigs {
+        // A committed, shared debug keystore so every build (CI or local) produces
+        // an APK with the SAME signature. Without this, AGP's default debug key is
+        // generated per machine, so each CI runner signs differently and in-place
+        // updates fail with INSTALL_FAILED_UPDATE_INCOMPATIBLE. Not a secret — it's
+        // a debug key for a sideloaded client.
+        create("shared") {
+            storeFile = file("oxrsys-debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
+    }
+
     buildTypes {
         debug {
             isDebuggable = true
+            signingConfig = signingConfigs.getByName("shared")
         }
         release {
             isMinifyEnabled = false
             isDebuggable = false
-            signingConfig = signingConfigs.getByName("debug") // Use debug key for sideloading
+            signingConfig = signingConfigs.getByName("shared") // stable key for sideloading
         }
     }
 
