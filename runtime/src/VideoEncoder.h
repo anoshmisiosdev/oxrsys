@@ -150,6 +150,12 @@ private:
     std::atomic<uint32_t> inFlightFrameCount_{0};
     std::atomic<uint64_t> frameNumberCounter_{0};
     std::mutex slotMutex_;
-    static constexpr size_t SlotCount = 3;
+    // Under x86_64/Rosetta the HEVC encode runs in software (~30-40ms/frame),
+    // which is far longer than the 11-14ms frame period at 72-90Hz. With only a
+    // few slots, any callback-delivery jitter fills every slot and forces a drop
+    // cascade at AcquireSlot. More in-flight slots absorb that jitter so the
+    // software encoder can keep pace; hardware encode (native arm64) finishes in
+    // ~8ms and needs far fewer, but the extra slots are cheap headroom there too.
+    static constexpr size_t SlotCount = 6;
     std::array<BufferSlot, SlotCount> slots_{};
 };
