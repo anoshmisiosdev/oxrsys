@@ -744,6 +744,7 @@ bool VideoEncoder::TryStartHelper()
     helperCfg.helperPath = helperPath;
 
     helperClient_ = std::make_unique<HevcEncoderHelperClient>();
+    helperClient_->SetDiedCallback([this]() { OnHelperDied(); });
     bool ok = helperClient_->Start(
         helperCfg, surfaces.data(), surfaces.size(),
         [this](uint64_t cookie, const uint8_t* data, size_t size, bool key, int64_t pts) {
@@ -823,6 +824,32 @@ void VideoEncoder::OnHelperFrameDone(uint64_t cookie, bool dropped, double encod
         context->releaseSlot(context->slotIndex);
     }
     delete context;
+}
+
+void VideoEncoder::OnHelperDied()
+{
+    // The helper's completions will never arrive; finalize every outstanding
+    // frame as dropped so slots are released. useHelper_ stays true but the
+    // client now reports not-alive, so EncodeInternal takes the software path.
+    std::vector<EncodeFrameContext*> pending;
+    {
+        std::lock_guard<std::mutex> lock(helperCtxMutex_);
+        for (auto& kv : helperContexts_)
+        {
+            pending.push_back(static_cast<EncodeFrameContext*>(kv.second));
+        }
+        helperContexts_.clear();
+    }
+    if (!pending.empty())
+    {
+        spdlog::warn("VideoEncoder: helper died with {} frame(s) in flight - reclaiming slots and "
+                     "reverting to the in-process software encoder",
+                     pending.size());
+    }
+    for (EncodeFrameContext* ctx : pending)
+    {
+        FinalizeEncodeFrame(ctx, true);
+    }
 }
 
 void VideoEncoder::Shutdown()

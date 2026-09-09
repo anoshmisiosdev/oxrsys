@@ -45,9 +45,17 @@ public:
                                      bool isKeyframe, int64_t ptsNs)>;
     using OnFrameDone = std::function<void(uint64_t cookie, bool dropped, double encodeMs,
                                            bool keyframe)>;
+    // Invoked at most once, from the reader/submit thread, when the helper is
+    // first found dead after having been alive. Lets the owner reclaim any
+    // frames still in flight (whose completions will never arrive) so their
+    // slots are released and the software fallback is not starved.
+    using OnDied = std::function<void()>;
 
     HevcEncoderHelperClient() = default;
     ~HevcEncoderHelperClient();
+
+    // Set before Start(). Called once when the helper dies mid-session.
+    void SetDiedCallback(OnDied cb) { onDied_ = std::move(cb); }
 
     HevcEncoderHelperClient(const HevcEncoderHelperClient&) = delete;
     HevcEncoderHelperClient& operator=(const HevcEncoderHelperClient&) = delete;
@@ -90,6 +98,8 @@ private:
 
     OnNal onNal_;
     OnFrameDone onFrameDone_;
+    OnDied onDied_;
+    std::atomic<bool> diedNotified_{false};
 
     uint32_t slotCount_ = 0;
 };

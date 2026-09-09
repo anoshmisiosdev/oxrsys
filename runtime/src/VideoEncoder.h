@@ -127,6 +127,9 @@ private:
     void OnHelperNal(uint64_t cookie, const uint8_t* data, size_t size, bool keyframe,
                      int64_t ptsNs);
     void OnHelperFrameDone(uint64_t cookie, bool dropped, double encodeMs, bool keyframe);
+    // Reclaim every frame still in flight to a helper that just died, so their
+    // slots are released and the in-process software fallback is not starved.
+    void OnHelperDied();
 
     struct VideoToolboxState
     {

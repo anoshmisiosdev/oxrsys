@@ -389,11 +389,20 @@ void HevcEncoderHelperClient::MarkDead(const char* reason)
         spdlog::warn("EncoderHelper: marking helper dead: {}", reason);
     }
     // Closing the socket unblocks the reader thread and signals the child EOF.
-    std::lock_guard<std::mutex> lock(writeMutex_);
-    if (sockFd_ >= 0)
     {
-        ::close(sockFd_);
-        sockFd_ = -1;
+        std::lock_guard<std::mutex> lock(writeMutex_);
+        if (sockFd_ >= 0)
+        {
+            ::close(sockFd_);
+            sockFd_ = -1;
+        }
+    }
+    // Only notify a genuine mid-session death (was alive), exactly once, so the
+    // owner can reclaim in-flight frames. Init-time failures (never alive) and
+    // orderly Stop() do not fire this.
+    if (was && !diedNotified_.exchange(true) && onDied_)
+    {
+        onDied_();
     }
 }
 
