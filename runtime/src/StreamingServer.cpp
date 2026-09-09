@@ -227,7 +227,7 @@ bool SendAll(SocketHandle socket, const void* data, size_t size)
     return true;
 }
 
-bool ReadAll(SocketHandle socket, void* data, size_t size)
+bool ReadAll(SocketHandle socket, void* data, size_t size, std::string* outReason = nullptr)
 {
     auto* bytes = static_cast<uint8_t*>(data);
     size_t receivedTotal = 0;
@@ -241,10 +241,18 @@ bool ReadAll(SocketHandle socket, void* data, size_t size)
             {
                 continue;
             }
+            if (outReason)
+            {
+                *outReason = "recv error: " + oxrsys::runtime_socket::LastErrorText();
+            }
             return false;
         }
         if (received == 0)
         {
+            if (outReason)
+            {
+                *outReason = "peer closed connection (clean EOF)";
+            }
             return false;
         }
         receivedTotal += static_cast<size_t>(received);
@@ -253,9 +261,9 @@ bool ReadAll(SocketHandle socket, void* data, size_t size)
 }
 
 bool ReadTcpRecord(SocketHandle socket, oxr::protocol::TcpRecordHeader& header,
-                   std::vector<uint8_t>& payload)
+                   std::vector<uint8_t>& payload, std::string* outReason = nullptr)
 {
-    if (!ReadAll(socket, &header, sizeof(header)))
+    if (!ReadAll(socket, &header, sizeof(header), outReason))
     {
         return false;
     }
@@ -263,6 +271,10 @@ bool ReadTcpRecord(SocketHandle socket, oxr::protocol::TcpRecordHeader& header,
         header.version != oxr::protocol::TCP_RECORD_VERSION ||
         header.payloadSize > oxr::protocol::TCP_MAX_RECORD_PAYLOAD)
     {
+        if (outReason)
+        {
+            *outReason = "malformed record header (stream desync / wrong protocol)";
+        }
         return false;
     }
 
@@ -272,7 +284,7 @@ bool ReadTcpRecord(SocketHandle socket, oxr::protocol::TcpRecordHeader& header,
     {
         return true;
     }
-    return ReadAll(socket, payload.data(), payload.size());
+    return ReadAll(socket, payload.data(), payload.size(), outReason);
 }
 
 void ConfigureTcpSocket(SocketHandle socket)
@@ -881,12 +893,15 @@ void StreamingServer::TcpControlThread()
         }
 
         spdlog::info("StreamingServer: USB ADB control client connected");
+        std::string controlCloseReason = "server shutting down";
         while (running_.load())
         {
             oxr::protocol::TcpRecordHeader header = {};
             std::vector<uint8_t> payload;
-            if (!ReadTcpRecord(clientSocket, header, payload))
+            if (!ReadTcpRecord(clientSocket, header, payload, &controlCloseReason))
             {
+                spdlog::info("StreamingServer: control channel recv ended: {}",
+                             controlCloseReason);
                 break;
             }
 
@@ -904,6 +919,7 @@ void StreamingServer::TcpControlThread()
             }
             else if (header.type == oxr::protocol::TcpRecordType::Disconnect)
             {
+                spdlog::info("StreamingServer: control channel received explicit Disconnect record from client");
                 HandleClientDisconnect();
                 break;
             }
@@ -988,12 +1004,15 @@ void StreamingServer::TcpTrackingThread()
         }
 
         spdlog::info("StreamingServer: USB ADB tracking client connected");
+        std::string trackingCloseReason = "server shutting down";
         while (running_.load())
         {
             oxr::protocol::TcpRecordHeader header = {};
             std::vector<uint8_t> payload;
-            if (!ReadTcpRecord(clientSocket, header, payload))
+            if (!ReadTcpRecord(clientSocket, header, payload, &trackingCloseReason))
             {
+                spdlog::info("StreamingServer: tracking channel recv ended: {}",
+                             trackingCloseReason);
                 break;
             }
             if (header.type == oxr::protocol::TcpRecordType::Tracking &&
@@ -1054,7 +1073,18 @@ void StreamingServer::EncodeThread()
         uint32_t currentRefreshHz = std::max(targetRefreshRateHz_.load(), 1u);
         const ConfigValues config = Config::Get().GetValues();
         uint32_t keyframeFrames = std::max(config.keyframeIntervalSec * currentRefreshHz, 1u);
-        bool forceKeyframe = frame.frameIndex < 5 || (frame.frameIndex % keyframeFrames == 0);
+        // Over the reliable USB-ADB TCP video path, periodic IDR is unnecessary:
+        // TCP is lossless, and the client already asks for a keyframe (RequestKeyframe)
+        // whenever its decoder needs a refresh. Each large periodic IDR spikes client
+        // decode time and can push the displayed-frame age past the client's
+        // stream-health watchdog, which then tears down and reconnects on a hard ~5 s
+        // cycle (the reconnect loop). The startup keyframes (frameIndex < 5, reset on
+        // every connect) and client-requested keyframes still guarantee a decodable
+        // stream. Only the periodic cadence is dropped, and only for reliable TCP.
+        const bool periodicKeyframesEnabled =
+            config.usbPeriodicKeyframes || !clientUsesUsbAdb_.load();
+        bool forceKeyframe = frame.frameIndex < 5 ||
+            (periodicKeyframesEnabled && (frame.frameIndex % keyframeFrames == 0));
 
         std::shared_ptr<VideoEncoder> encoder;
         {
@@ -2003,12 +2033,21 @@ void StreamingServer::SendNalUnit(const std::shared_ptr<PacketDispatchState>& di
         nalHeader.codec = static_cast<uint8_t>(oxr::protocol::VideoCodec::H265);
 
         std::lock_guard<std::mutex> sendLock(dispatchState->sendMutex);
-        if (!SendTcpRecordParts(videoSocket,
-                                oxr::protocol::TcpRecordType::VideoNal,
-                                &nalHeader,
-                                sizeof(nalHeader),
-                                data,
-                                size))
+        const auto sendStart = std::chrono::steady_clock::now();
+        const bool sendOk = SendTcpRecordParts(videoSocket,
+                                               oxr::protocol::TcpRecordType::VideoNal,
+                                               &nalHeader,
+                                               sizeof(nalHeader),
+                                               data,
+                                               size);
+        if (isKeyframe)
+        {
+            const double sendMs = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - sendStart).count();
+            spdlog::info("StreamingServer: sent keyframe frameIndex={} size={:.1f}KB tcpSend={:.2f}ms ok={}",
+                         frameIndex, size / 1024.0, sendMs, sendOk);
+        }
+        if (!sendOk)
         {
             videoTcpSendFailures_.fetch_add(1);
             MarkTcpVideoSendFailed(dispatchState, videoSocket);

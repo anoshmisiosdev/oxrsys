@@ -21,6 +21,15 @@ struct ConfigValues
     uint32_t keyframeIntervalSec = 2; // Seconds between forced keyframes
     std::string encoderPreset = "balanced"; // "quality", "balanced", "speed"
 
+    // Force periodic IDR keyframes on the reliable USB-ADB TCP video path.
+    // Over lossless TCP, periodic IDR is not needed for error recovery (the
+    // client requests a keyframe on decode error), and each large IDR causes a
+    // client-decode spike that can push the displayed-frame age past the
+    // client's stream-health watchdog, triggering a ~5 s reconnect loop on
+    // detailed scenes. Default off: send IDR only on (re)connect and on client
+    // RequestKeyframe. Set true to restore the old always-periodic behaviour.
+    bool usbPeriodicKeyframes = false;
+
     // Out-of-process native-arm64 hardware HEVC encoder helper. The runtime
     // dylib is x86_64 (Rosetta) and cannot reach VideoToolbox's hardware HEVC
     // encoder; when enabled, the runtime spawns a native-arm64 helper that can,

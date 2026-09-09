@@ -370,6 +370,10 @@ ConfigValues ParseConfigToml(std::istream& input, const ConfigValues& defaults)
                     values.encoderPreset = value;
                 }
             }
+            else if (key == "usb_periodic_keyframes")
+            {
+                values.usbPeriodicKeyframes = ParseBool(value);
+            }
             else if (key == "encoder_helper")
             {
                 values.encoderHelperEnabled = ParseBool(value);
