@@ -370,6 +370,14 @@ ConfigValues ParseConfigToml(std::istream& input, const ConfigValues& defaults)
                     values.encoderPreset = value;
                 }
             }
+            else if (key == "encoder_helper")
+            {
+                values.encoderHelperEnabled = ParseBool(value);
+            }
+            else if (key == "encoder_helper_path")
+            {
+                values.encoderHelperPath = ParseString(value);
+            }
             else if (key == "transport")
             {
                 value = ParseString(value);

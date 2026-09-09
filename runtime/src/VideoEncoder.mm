@@ -2,9 +2,11 @@
 
 #import "VideoEncoder.h"
 #import "Config.h"
+#import "HevcEncoderHelperClient.h"
 
 #import <CoreVideo/CoreVideo.h>
 #import <Foundation/Foundation.h>
+#import <IOSurface/IOSurface.h>
 #import <Metal/Metal.h>
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 #import <VideoToolbox/VideoToolbox.h>
@@ -15,8 +17,10 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include <pthread/qos.h>
 
@@ -671,13 +675,184 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
     {
         spdlog::warn("VideoEncoder: HEVC is running on the SOFTWARE encoder - "
                      "expect high encode latency. Hardware HEVC was requested but not granted.");
+
+        // The in-process session is software-only (x86_64/Rosetta cannot reach
+        // the hardware HEVC encoder). Try to bring up the native-arm64 helper,
+        // which can. On success, per-frame encoding is delegated out-of-process
+        // and this software session becomes the fallback path only.
+        if (TryStartHelper())
+        {
+            usingHardwareEncoder_ = true;
+            spdlog::info("VideoEncoder: hardware={} (via native-arm64 out-of-process helper)", "YES");
+        }
     }
     return true;
+}
+
+bool VideoEncoder::TryStartHelper()
+{
+    const ConfigValues config = Config::Get().GetValues();
+    if (!config.encoderHelperEnabled)
+    {
+        return false;
+    }
+
+    // Resolve the helper binary path: explicit config, then env override, then
+    // a sibling of the runtime dylib.
+    std::string helperPath = config.encoderHelperPath;
+    if (const char* env = std::getenv("OXRSYS_ENCODER_HELPER_PATH"))
+    {
+        helperPath = env;
+    }
+    if (helperPath.empty())
+    {
+        const std::string& dylibDir = Config::Get().dylibDir;
+        helperPath = (dylibDir.empty() ? std::string(".") : dylibDir) + "/oxrsys-encoder-helper";
+    }
+
+    // Gather the IOSurface backing each preallocated slot; these are what the
+    // helper encodes from (zero-copy, shared via mach send rights).
+    std::vector<void*> surfaces(SlotCount, nullptr);
+    for (size_t i = 0; i < SlotCount; i++)
+    {
+        CVPixelBufferRef pb = (CVPixelBufferRef)slots_[i].pixelBuffer;
+        if (pb == nullptr)
+        {
+            spdlog::warn("VideoEncoder: helper disabled - slot {} has no pixel buffer", i);
+            return false;
+        }
+        IOSurfaceRef surf = CVPixelBufferGetIOSurface(pb);
+        if (surf == nullptr)
+        {
+            spdlog::warn("VideoEncoder: helper disabled - slot {} pixel buffer is not "
+                         "IOSurface-backed",
+                         i);
+            return false;
+        }
+        surfaces[i] = (void*)surf;
+    }
+
+    HevcEncoderHelperClient::Config helperCfg;
+    helperCfg.width = width_;
+    helperCfg.height = height_;
+    helperCfg.fps = fps_;
+    helperCfg.bitrateMbps = bitrateMbps_;
+    helperCfg.keyframeIntervalSec = config.keyframeIntervalSec;
+    helperCfg.preset = config.encoderPreset == "speed"    ? 1u
+                       : config.encoderPreset == "quality" ? 2u
+                                                           : 0u;
+    helperCfg.helperPath = helperPath;
+
+    helperClient_ = std::make_unique<HevcEncoderHelperClient>();
+    bool ok = helperClient_->Start(
+        helperCfg, surfaces.data(), surfaces.size(),
+        [this](uint64_t cookie, const uint8_t* data, size_t size, bool key, int64_t pts) {
+            OnHelperNal(cookie, data, size, key, pts);
+        },
+        [this](uint64_t cookie, bool dropped, double encodeMs, bool key) {
+            OnHelperFrameDone(cookie, dropped, encodeMs, key);
+        });
+
+    if (!ok)
+    {
+        helperClient_.reset();
+        useHelper_.store(false);
+        spdlog::warn("VideoEncoder: native-arm64 hardware helper unavailable - continuing on the "
+                     "in-process software encoder");
+        return false;
+    }
+
+    useHelper_.store(true);
+    return true;
+}
+
+void VideoEncoder::OnHelperNal(uint64_t cookie, const uint8_t* data, size_t size, bool keyframe,
+                               int64_t ptsNs)
+{
+    EncodeFrameContext* context = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(helperCtxMutex_);
+        auto it = helperContexts_.find(cookie);
+        if (it != helperContexts_.end())
+        {
+            context = static_cast<EncodeFrameContext*>(it->second);
+        }
+    }
+    if (context != nullptr && context->nalCallback)
+    {
+        context->nalCallback(data, size, keyframe, ptsNs);
+    }
+}
+
+void VideoEncoder::OnHelperFrameDone(uint64_t cookie, bool dropped, double encodeMs, bool keyframe)
+{
+    EncodeFrameContext* context = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(helperCtxMutex_);
+        auto it = helperContexts_.find(cookie);
+        if (it != helperContexts_.end())
+        {
+            context = static_cast<EncodeFrameContext*>(it->second);
+            helperContexts_.erase(it);
+        }
+    }
+    if (context == nullptr)
+    {
+        return;
+    }
+
+    auto now = Clock::now();
+    context->metrics.frameDropped = dropped;
+    context->metrics.keyframe = keyframe;
+    // encodeMs is the helper-side hardware VideoToolbox encode time (the
+    // single-digit-ms figure). Surface it both as the submit metric and as the
+    // callback latency the QoS telemetry reports.
+    context->metrics.encodeSubmitMs = encodeMs;
+    context->metrics.callbackLatencyMs = encodeMs;
+    context->metrics.totalLatencyMs = ToMilliseconds(now - context->encodeStart);
+    if (dropped)
+    {
+        droppedFrameCount_.fetch_add(1);
+    }
+    if (context->frameCallback)
+    {
+        context->frameCallback(context->metrics);
+    }
+    if (context->releaseSlot)
+    {
+        context->releaseSlot(context->slotIndex);
+    }
+    delete context;
 }
 
 void VideoEncoder::Shutdown()
 {
     shuttingDown_.store(true);
+
+    // Stop the native-arm64 helper first so no new frames are submitted to it,
+    // then reclaim any frames still in flight (the helper will send no further
+    // completions) so their slots are released and inFlightFrameCount_ drains.
+    useHelper_.store(false);
+    if (helperClient_ != nullptr)
+    {
+        helperClient_->Stop();
+        helperClient_.reset();
+    }
+    {
+        std::vector<EncodeFrameContext*> pending;
+        {
+            std::lock_guard<std::mutex> lock(helperCtxMutex_);
+            for (auto& kv : helperContexts_)
+            {
+                pending.push_back(static_cast<EncodeFrameContext*>(kv.second));
+            }
+            helperContexts_.clear();
+        }
+        for (EncodeFrameContext* ctx : pending)
+        {
+            FinalizeEncodeFrame(ctx, true);
+        }
+    }
 
     if (videoToolbox_.session != nullptr)
     {
@@ -1036,6 +1211,44 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
 
         context->metrics.gpuCopyMs = ToMilliseconds(Clock::now() - context->encodeStart);
 
+        // Preferred path: delegate the VideoToolbox encode to the native-arm64
+        // helper (hardware HEVC). The GPU composition into this slot's IOSurface
+        // has completed (we are in the command-buffer completion handler), so the
+        // helper reads finished pixels. If the helper has died since startup, fall
+        // through to the in-process software session below.
+        if (this->useHelper_.load() && this->helperClient_ != nullptr &&
+            this->helperClient_->IsAlive())
+        {
+            uint64_t cookie = (uint64_t)context;
+            context->encodeSubmitFinished = Clock::now();
+            {
+                std::lock_guard<std::mutex> lock(this->helperCtxMutex_);
+                this->helperContexts_[cookie] = context;
+            }
+            this->helperClient_->SubmitFrame(cookie, (uint32_t)context->slotIndex, timestampNs,
+                                             forceKeyframe);
+            if (!this->helperClient_->IsAlive())
+            {
+                // Helper died during this submit; reclaim and finalize as dropped
+                // so the slot is released and the frame is not lost silently.
+                EncodeFrameContext* dead = nullptr;
+                {
+                    std::lock_guard<std::mutex> lock(this->helperCtxMutex_);
+                    auto it = this->helperContexts_.find(cookie);
+                    if (it != this->helperContexts_.end())
+                    {
+                        dead = static_cast<EncodeFrameContext*>(it->second);
+                        this->helperContexts_.erase(it);
+                    }
+                }
+                if (dead != nullptr)
+                {
+                    FinalizeEncodeFrame(dead, true);
+                }
+            }
+            return;
+        }
+
         CFMutableDictionaryRef frameProps = nullptr;
         if (forceKeyframe)
         {
@@ -1157,6 +1370,13 @@ void VideoEncoder::SetBitrate(uint32_t bitrateMbps)
     if (videoToolbox_.session == nullptr || bitrateMbps == bitrateMbps_)
     {
         return;
+    }
+
+    // Keep the out-of-process hardware helper's bitrate in lockstep with the
+    // in-process fallback session.
+    if (useHelper_.load() && helperClient_ != nullptr && helperClient_->IsAlive())
+    {
+        helperClient_->SetBitrate(bitrateMbps);
     }
 
     VTCompressionSessionRef compressionSession = (VTCompressionSessionRef)videoToolbox_.session;

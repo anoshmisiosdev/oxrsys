@@ -23,6 +23,7 @@ if(APPLE)
     list(APPEND OXRSYS_RUNTIME_SOURCES
         src/Swapchain.mm
         src/VideoEncoder.mm
+        src/HevcEncoderHelperClient.mm
     )
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     list(APPEND OXRSYS_RUNTIME_SOURCES
@@ -62,6 +63,7 @@ endif()
 
 target_include_directories(oxrsys_runtime PRIVATE
     src
+    encoder_helper
     ${CMAKE_SOURCE_DIR}/common/protocol/include
     ${openxr_SOURCE_DIR}/include
     ${openxr_SOURCE_DIR}/src/common
@@ -99,6 +101,7 @@ if(APPLE)
         "-framework VideoToolbox"
         "-framework CoreMedia"
         "-framework CoreVideo"
+        "-framework IOSurface"
     )
 endif()
 

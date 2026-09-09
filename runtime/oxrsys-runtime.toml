@@ -33,6 +33,20 @@ keyframe_interval_sec = 2
 # quality  = best visual quality, slightly higher latency
 encoder_preset = "balanced"
 
+# Out-of-process native-arm64 HARDWARE HEVC encoder helper.
+# The runtime dylib is loaded in-process by the x86_64/Rosetta Wine host, and
+# VideoToolbox refuses the hardware HEVC encoder to an x86_64/Rosetta process
+# (it silently falls back to the software encoder, ~27-40ms/frame). When this is
+# enabled, the runtime spawns a small native-arm64 helper process that IS granted
+# the hardware HEVC encoder (~8ms/frame), sharing the compose IOSurfaces zero-copy
+# via mach send rights. If the helper cannot start or does not get the hardware
+# encoder, the runtime transparently falls back to the in-process software path
+# (never a black screen). Default off (opt-in).
+encoder_helper = false
+# Path to the helper binary. Empty = look for "oxrsys-encoder-helper" next to the
+# runtime dylib (also overridable at runtime via $OXRSYS_ENCODER_HELPER_PATH).
+encoder_helper_path = ""
+
 # Streaming transport: "auto" tries USB ADB reverse and WiFi, "wifi" disables USB TCP
 # listeners, and "usb_adb" disables WiFi discovery fallback.
 transport = "auto"

@@ -6,10 +6,15 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 
 #include "GraphicsTypes.h"
+
+// Native-arm64 out-of-process hardware HEVC encoder client (Apple builds only).
+class HevcEncoderHelperClient;
 
 /**
  * H.265 video encoder facade.
@@ -112,6 +117,17 @@ private:
     void ReleaseSlot(size_t slotIndex);
     void DestroySlots();
 
+    // Native-arm64 hardware-HEVC helper integration. When the helper starts and
+    // reports the hardware encoder, per-frame VideoToolbox encoding is delegated
+    // to it (out-of-process, native arm64) instead of the in-process software
+    // session; the in-process session stays as the crash/unavailable fallback.
+    bool TryStartHelper();
+    // Callbacks invoked from the helper client's reader thread. `cookie` is the
+    // EncodeFrameContext* the frame was submitted with (opaque across the IPC).
+    void OnHelperNal(uint64_t cookie, const uint8_t* data, size_t size, bool keyframe,
+                     int64_t ptsNs);
+    void OnHelperFrameDone(uint64_t cookie, bool dropped, double encodeMs, bool keyframe);
+
     struct VideoToolboxState
     {
         void* session = nullptr;          // VTCompressionSessionRef
@@ -142,6 +158,16 @@ private:
     uint32_t bitrateMbps_ = 50;
     FoveationSettings foveationSettings_ = {};
     bool usingHardwareEncoder_ = false;
+
+    // Out-of-process native-arm64 hardware HEVC helper. useHelper_ is set only
+    // once the helper is up AND reports the hardware encoder; if it ever dies
+    // mid-session the client reports not-alive and EncodeInternal transparently
+    // reverts to the in-process software path (never a black screen).
+    std::unique_ptr<HevcEncoderHelperClient> helperClient_;
+    std::atomic<bool> useHelper_{false};
+    std::mutex helperCtxMutex_;
+    std::unordered_map<uint64_t, void*> helperContexts_; // cookie -> EncodeFrameContext*
+
     uint32_t frameCount_ = 0;
     std::atomic<bool> forceKeyframe_{false};
     std::atomic<bool> shuttingDown_{false};

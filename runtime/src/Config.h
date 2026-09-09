@@ -20,6 +20,14 @@ struct ConfigValues
     float resolutionScale = 0.75f;  // Encode resolution multiplier (0.25-1.0)
     uint32_t keyframeIntervalSec = 2; // Seconds between forced keyframes
     std::string encoderPreset = "balanced"; // "quality", "balanced", "speed"
+
+    // Out-of-process native-arm64 hardware HEVC encoder helper. The runtime
+    // dylib is x86_64 (Rosetta) and cannot reach VideoToolbox's hardware HEVC
+    // encoder; when enabled, the runtime spawns a native-arm64 helper that can,
+    // sharing the compose IOSurfaces zero-copy. Falls back to the in-process
+    // software encoder if the helper is unavailable. Default off (opt-in).
+    bool encoderHelperEnabled = false;
+    std::string encoderHelperPath = ""; // empty = sibling of the runtime dylib
     std::string streamingTransport = "auto"; // "auto", "wifi", "usb_adb"
     std::string foveatedEncodingPreset = "off"; // "off", "light", "medium", "high"
     std::string clientFoveationPreset = "auto"; // "auto", "off", "light", "medium", "high"
