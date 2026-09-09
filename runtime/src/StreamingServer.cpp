@@ -27,11 +27,36 @@
 #include <net/if.h>
 #endif
 
+#if defined(__APPLE__)
+#include <pthread/qos.h>
+#endif
+
 namespace
 {
 
 using Clock = std::chrono::steady_clock;
 using SocketHandle = oxrsys::runtime_socket::SocketHandle;
+
+// Raise the calling thread to the highest user-facing scheduling class. The
+// video encode-submit and send threads sit on the critical present path: when
+// the Mac is under heavy CPU contention (concurrent builds, other media work)
+// a default-QoS thread gets starved, which shows up in the logs as multi-hundred
+// -millisecond encoder completion-callback latency and thousands of dropped
+// frames even though the hardware HEVC encode itself stays sub-millisecond.
+// Pinning these threads to USER_INTERACTIVE keeps them scheduled promptly.
+void RaiseThreadToRealtimeQoS(const char* threadName)
+{
+#if defined(__APPLE__)
+    int rc = pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    if (rc != 0)
+    {
+        spdlog::warn("StreamingServer: failed to raise QoS for {} thread (rc={})",
+                     threadName, rc);
+    }
+#else
+    (void)threadName;
+#endif
+}
 
 #if defined(MSG_DONTWAIT)
 constexpr int kBestEffortSendFlags = MSG_DONTWAIT;
@@ -911,6 +936,7 @@ void StreamingServer::TcpControlThread()
 
 void StreamingServer::TcpVideoThread()
 {
+    RaiseThreadToRealtimeQoS("tcp-video");
     while (running_.load() && usbAdbEnabled_)
     {
         SocketHandle clientSocket = AcceptWithTimeout(tcpVideoListenSocket_);
@@ -1001,6 +1027,7 @@ void StreamingServer::TcpTrackingThread()
 
 void StreamingServer::EncodeThread()
 {
+    RaiseThreadToRealtimeQoS("encode");
     auto telemetry = std::make_shared<EncodeTelemetry>();
     std::shared_ptr<PacketDispatchState> packetDispatchState = packetDispatchState_;
 
@@ -1792,6 +1819,7 @@ void StreamingServer::ClearVideoSendQueue()
 
 void StreamingServer::VideoSendThread()
 {
+    RaiseThreadToRealtimeQoS("video-send");
     while (running_.load())
     {
         EncodedVideoFrame frame = {};

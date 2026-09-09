@@ -18,10 +18,24 @@
 #include <thread>
 #include <utility>
 
+#include <pthread/qos.h>
+
 namespace
 {
 
 using Clock = std::chrono::steady_clock;
+
+// Pin the calling thread to USER_INTERACTIVE. Called at the top of the Metal
+// command-buffer completion handler (which submits the frame to VideoToolbox)
+// and the VideoToolbox compression completion callback (which drains NAL units
+// onto the send path). Both run on framework-managed threads that default to a
+// lower QoS; under CPU contention that starvation — not the sub-millisecond
+// hardware encode — is what drives the multi-hundred-ms completion-callback
+// latency and dropped-frame cascades seen in the runtime logs.
+void PinThreadToRealtimeQoS()
+{
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+}
 
 double ToMilliseconds(Clock::duration duration)
 {
@@ -354,6 +368,8 @@ static void CompressionOutputCallback(void* /*outputCallbackRefCon*/,
                                        VTEncodeInfoFlags infoFlags,
                                        CMSampleBufferRef sampleBuffer)
 {
+    PinThreadToRealtimeQoS();
+
     auto* context = static_cast<EncodeFrameContext*>(sourceFrameRefCon);
     if (context == nullptr)
     {
@@ -629,8 +645,33 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
     VTCompressionSessionPrepareToEncodeFrames(compressionSession);
     videoToolbox_.session = compressionSession;
 
-    spdlog::info("VideoEncoder: Initialized H.265 encoder {}x{} @ {}fps, {}Mbps (slots={}, keyframe={}s, preset={})",
-                  width, height, fps, bitrateMbps, SlotCount, keyframeIntervalSec, preset);
+    // Definitively report whether VideoToolbox selected the hardware encoder.
+    // The specification requests hardware (Enable=YES) but does not require it
+    // (Require=NO), so on a platform where hardware HEVC is unavailable this
+    // silently falls back to the software encoder. This query removes the
+    // guesswork: the log states plainly which path is live.
+    bool usingHardware = false;
+    CFBooleanRef hwRef = nullptr;
+    OSStatus hwStatus = VTSessionCopyProperty(
+        compressionSession,
+        kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,
+        kCFAllocatorDefault,
+        &hwRef);
+    if (hwStatus == noErr && hwRef != nullptr)
+    {
+        usingHardware = CFBooleanGetValue(hwRef);
+        CFRelease(hwRef);
+    }
+    usingHardwareEncoder_ = usingHardware;
+
+    spdlog::info("VideoEncoder: Initialized H.265 encoder {}x{} @ {}fps, {}Mbps (slots={}, keyframe={}s, preset={}) hardware={}",
+                  width, height, fps, bitrateMbps, SlotCount, keyframeIntervalSec, preset,
+                  usingHardware ? "YES" : "NO (SOFTWARE fallback)");
+    if (!usingHardware)
+    {
+        spdlog::warn("VideoEncoder: HEVC is running on the SOFTWARE encoder - "
+                     "expect high encode latency. Hardware HEVC was requested but not granted.");
+    }
     return true;
 }
 
@@ -985,6 +1026,8 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
     VTCompressionSessionRef compressionSession = (VTCompressionSessionRef)videoToolbox_.session;
     [cmdBuf addCompletedHandler:^(id<MTLCommandBuffer> commandBuffer)
     {
+        PinThreadToRealtimeQoS();
+
         if (commandBuffer.status != MTLCommandBufferStatusCompleted || this->shuttingDown_.load())
         {
             FinalizeEncodeFrame(context, true);

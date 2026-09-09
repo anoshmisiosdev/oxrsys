@@ -28,6 +28,13 @@ struct ConfigValues
     std::string abrMode = "bitrate"; // "off", "bitrate", "full"
     bool headsetAudio = false;       // Stream server audio to the headset
 
+    // Manual calibration for the STAGE (standing/roomscale) floor. Added to the
+    // head height a game sees in STAGE and LOCAL_FLOOR spaces. 0 = trust the
+    // client's floor-relative pose unchanged. Positive raises the player (taller);
+    // negative lowers them (shorter). Use this when the headset's guardian floor
+    // is miscalibrated so a standing player stands at the wrong height in-game.
+    float stageHeightOffsetM = 0.0f;
+
     bool fileLogging = true;        // Write logs to oxrsys-runtime.log
     bool questLogcat = false;       // Capture Quest logcat to oxrsys-headset.log
 };

@@ -18,6 +18,48 @@
 
 #include <openxr/openxr_platform.h>
 
+#include <glm/glm.hpp>
+#include <glm/gtc/quaternion.hpp>
+
+namespace
+{
+glm::quat ToGlmQuat(const XrQuaternionf& q) { return glm::quat(q.w, q.x, q.y, q.z); }
+glm::vec3 ToGlmVec(const XrVector3f& v) { return glm::vec3(v.x, v.y, v.z); }
+XrQuaternionf ToXrQuat(const glm::quat& q) { return {q.x, q.y, q.z, q.w}; }
+XrVector3f ToXrVec(const glm::vec3& v) { return {v.x, v.y, v.z}; }
+
+// World-space pose of a reference space's origin (mirrors Space.cpp GetWorldPose
+// for the reference-space case, including the space's own poseInSpace offset).
+XrPosef ReferenceSpaceWorldPose(Space* space, const InputManager& inputManager)
+{
+    XrPosef pose{};
+    pose.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+    pose.position = {0.0f, 0.0f, 0.0f};
+
+    if (space->GetType() == Space::Type::Reference)
+    {
+        if (space->GetReferenceSpaceType() == XR_REFERENCE_SPACE_TYPE_VIEW)
+        {
+            pose = inputManager.GetHeadPose();
+        }
+        else
+        {
+            pose = inputManager.GetReferenceSpacePose(space->GetReferenceSpaceType());
+        }
+    }
+
+    // Apply the space's own offset pose (poseInReferenceSpace).
+    const XrPosef& offset = space->GetPoseInSpace();
+    glm::quat worldRot = ToGlmQuat(pose.orientation);
+    glm::vec3 worldPos = ToGlmVec(pose.position);
+    glm::quat offsetRot = ToGlmQuat(offset.orientation);
+    glm::vec3 offsetPos = ToGlmVec(offset.position);
+    pose.orientation = ToXrQuat(worldRot * offsetRot);
+    pose.position = ToXrVec(worldPos + worldRot * offsetPos);
+    return pose;
+}
+} // namespace
+
 namespace
 {
 
@@ -745,7 +787,26 @@ XrResult Session::LocateViews(const XrViewLocateInfo* viewLocateInfo, XrViewStat
         return XR_ERROR_SIZE_INSUFFICIENT;
     }
 
+    // GetEyeViews returns the eye poses in absolute (STAGE-floor) world space.
+    // Express them relative to the requested base reference space so the game
+    // renders at the correct height for its chosen origin. Previously baseSpace
+    // was ignored here, so views were always STAGE-absolute regardless of whether
+    // the game asked for LOCAL/LOCAL_FLOOR/STAGE, and the STAGE floor-calibration
+    // offset never reached the rendered image. For a STAGE base with the default
+    // zero offset the transform is identity, so STAGE behaviour is unchanged.
     inputManager_->GetEyeViews(views, 2);
+
+    const XrPosef basePose = ReferenceSpaceWorldPose(baseSpace, *inputManager_);
+    const glm::quat baseRotInv = glm::inverse(ToGlmQuat(basePose.orientation));
+    const glm::vec3 basePos = ToGlmVec(basePose.position);
+    for (uint32_t i = 0; i < 2; ++i)
+    {
+        glm::quat viewRot = ToGlmQuat(views[i].pose.orientation);
+        glm::vec3 viewPos = ToGlmVec(views[i].pose.position);
+        views[i].pose.orientation = ToXrQuat(baseRotInv * viewRot);
+        views[i].pose.position = ToXrVec(baseRotInv * (viewPos - basePos));
+    }
+
     return XR_SUCCESS;
 }
 
@@ -853,6 +914,16 @@ XrResult Session::CreateReferenceSpace(const XrReferenceSpaceCreateInfo* createI
         default:
             return XR_ERROR_REFERENCE_SPACE_UNSUPPORTED;
     }
+
+    const char* spaceName =
+        createInfo->referenceSpaceType == XR_REFERENCE_SPACE_TYPE_VIEW ? "VIEW" :
+        createInfo->referenceSpaceType == XR_REFERENCE_SPACE_TYPE_LOCAL ? "LOCAL" :
+        createInfo->referenceSpaceType == XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR ? "LOCAL_FLOOR" :
+        createInfo->referenceSpaceType == XR_REFERENCE_SPACE_TYPE_STAGE ? "STAGE" : "UNKNOWN";
+    spdlog::info("Session: game created reference space {} (offsetInSpace y={:.3f}), "
+                 "stage_height_offset_m={:.3f}",
+                 spaceName, createInfo->poseInReferenceSpace.position.y,
+                 Config::Get().GetValues().stageHeightOffsetM);
 
     auto sp = std::make_unique<Space>(this, Space::Type::Reference,
                                        createInfo->referenceSpaceType, createInfo->poseInReferenceSpace);

@@ -91,6 +91,8 @@ public:
     uint32_t GetEncodedFrameCount() const { return frameCount_; }
     uint32_t GetDroppedFrameCount() const { return droppedFrameCount_.load(); }
     uint32_t GetInFlightFrameCount() const { return inFlightFrameCount_.load(); }
+    // True when VideoToolbox selected the hardware encoder (queried at Initialize).
+    bool IsUsingHardwareEncoder() const { return usingHardwareEncoder_; }
 
 private:
     struct BufferSlot
@@ -139,6 +141,7 @@ private:
     uint32_t fps_ = 90;
     uint32_t bitrateMbps_ = 50;
     FoveationSettings foveationSettings_ = {};
+    bool usingHardwareEncoder_ = false;
     uint32_t frameCount_ = 0;
     std::atomic<bool> forceKeyframe_{false};
     std::atomic<bool> shuttingDown_{false};
