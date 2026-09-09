@@ -2084,6 +2084,27 @@ void StreamingServer::EnqueueAudioSamples(const float* data, uint32_t frames,
         return; // shouldn't happen for typical IOProc buffer sizes
     }
 
+    // Telemetry: is the tap delivering real (non-silent) audio, and how much?
+    {
+        float peak = 0.0f;
+        const size_t sampleTotal = static_cast<size_t>(frames) * channels;
+        for (size_t i = 0; i < sampleTotal; ++i)
+        {
+            const float a = data[i] < 0.0f ? -data[i] : data[i];
+            if (a > peak) peak = a;
+        }
+        static thread_local uint32_t bufCount = 0;
+        static thread_local float windowPeak = 0.0f;
+        if (peak > windowPeak) windowPeak = peak;
+        if (++bufCount % 200 == 0)
+        {
+            spdlog::info("AudioCapture: {} buffers captured, peak amplitude={:.4f} "
+                         "(0 = silence), queued/sent so far={}",
+                         bufCount, windowPeak, audioFramesSent_.load());
+            windowPeak = 0.0f;
+        }
+    }
+
     oxr::protocol::TcpAudioHeader header = {};
     header.presentationTimeNs =
         std::chrono::duration_cast<std::chrono::nanoseconds>(

@@ -103,6 +103,7 @@ if(APPLE)
         "-framework CoreMedia"
         "-framework CoreVideo"
         "-framework CoreAudio"
+        "-framework AudioToolbox"
         "-framework IOSurface"
     )
 endif()

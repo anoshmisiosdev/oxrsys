@@ -42,8 +42,10 @@ public:
 
     bool IsRunning() const;
 
-private:
+    // Public so the Core Audio render callback (a C function) can name the type.
     struct Impl;
+
+private:
     std::unique_ptr<Impl> impl_;
 };
 
