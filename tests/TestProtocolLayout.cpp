@@ -101,3 +101,45 @@ TEST_CASE("Quest foveated layout stays aligned and rejects incoherent targets", 
         CalculateFoveationLayout(1136, 1264, FoveationPreset::Light);
     CHECK_FALSE(IsFoveatedEncodingLayoutUsable(scaledLayout, 1512, 1680));
 }
+
+// Regression guard for the FFE-at-scale fix: StreamingServer now always
+// computes the foveation layout from the FULL render eye (so it stays coherent
+// with the encoder's source-texture validation and the client's un-warp, which
+// both use renderWidth), and engages foveation whenever the optimized eye fits
+// within the pixel budget the user chose via resolution_scale. At
+// resolution_scale=0.75 (SUPERHOT: 1512x1680 render per eye -> 1136x1264
+// scaled) the Medium/High presets must be usable against the full render eye
+// AND land within that scaled budget while encoding fewer pixels than a uniform
+// 0.75 downscale — that reduction is what relieves the software-HEVC bottleneck.
+TEST_CASE("Foveation from full render coheres and fits the resolution_scale budget", "[protocol][foveation]")
+{
+    // Full render eye (SUPERHOT VR per-eye) and the 0.75 uniform-scale budget.
+    const uint32_t renderEyeW = 1512;
+    const uint32_t renderEyeH = 1680;
+    const uint32_t scaledEyeW = 1136; // round(1512*0.75) aligned up to 16
+    const uint32_t scaledEyeH = 1264; // round(1680*0.75) aligned up to 16
+
+    const uint64_t uniformEncodedPixels =
+        static_cast<uint64_t>(scaledEyeW) * 2ull * scaledEyeH;
+
+    for (FoveationPreset preset : {FoveationPreset::Medium, FoveationPreset::High})
+    {
+        const FoveationLayout layout =
+            CalculateFoveationLayout(renderEyeW, renderEyeH, preset);
+
+        // Coherent with the encoder (targetEye == source render eye) and client.
+        CHECK(IsFoveatedEncodingLayoutUsable(layout, renderEyeW, renderEyeH));
+
+        // Fits within the user's resolution_scale=0.75 pixel budget, so
+        // StreamingServer will engage it instead of the uniform downscale.
+        CHECK(layout.optimizedEyeWidth <= scaledEyeW);
+        CHECK(layout.optimizedEyeHeight <= scaledEyeH);
+
+        // Center stays at (or above) the uniform-scale sampling density while
+        // the whole frame encodes fewer pixels than uniform 0.75.
+        const uint64_t foveatedEncodedPixels =
+            static_cast<uint64_t>(layout.optimizedEyeWidth) * 2ull *
+            layout.optimizedEyeHeight;
+        CHECK(foveatedEncodedPixels < uniformEncodedPixels);
+    }
+}

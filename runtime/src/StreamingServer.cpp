@@ -445,16 +445,36 @@ bool StreamingServer::Start(uint32_t renderWidth, uint32_t renderHeight, uint32_
         IsGraphicsContextValid(graphicsContext_) &&
         VideoEncoder::SupportsFoveatedEncoding(graphicsContext_))
     {
-        const bool unscaledFoveationTarget = std::fabs(scale - 1.0f) <= 0.001f;
-        foveatedTargetEyeWidth_ = unscaledFoveationTarget ? renderWidth_ : scaledWidth_;
-        foveatedTargetEyeHeight_ = unscaledFoveationTarget ? renderHeight_ : scaledHeight_;
+        // Foveated encoding always samples the full-resolution render targets.
+        // The encoder validates that the foveation target equals the source
+        // texture size (renderWidth_/renderHeight_), and the client derives its
+        // un-warp ratio from the full render eye —
+        // FoveationActiveRatio(renderWidth/2, encodedWidth/2, ...) in the Quest
+        // client. So the foveation target must be the full render eye REGARDLESS
+        // of resolution_scale; the earlier code gated FFE to scale==1.0 and
+        // silently disabled it at every other scale. Foveation supersedes the
+        // uniform resolution_scale downscale: it keeps the center at full render
+        // resolution while compressing the periphery, which at medium/high
+        // presets is both sharper AND fewer encoded pixels than a uniform
+        // downscale — directly relieving the software-HEVC encode bottleneck.
+        foveatedTargetEyeWidth_ = renderWidth_;
+        foveatedTargetEyeHeight_ = renderHeight_;
         const oxr::protocol::FoveationLayout layout =
             oxr::protocol::CalculateFoveationLayout(foveatedTargetEyeWidth_,
                                                     foveatedTargetEyeHeight_,
                                                     foveationPreset);
-        if (unscaledFoveationTarget &&
+        const bool layoutUsable =
             oxr::protocol::IsFoveatedEncodingLayoutUsable(
-                layout, renderWidth_, renderHeight_))
+                layout, renderWidth_, renderHeight_);
+        // Only engage foveation when it does not exceed the pixel budget the
+        // user already chose via resolution_scale. If resolution_scale is more
+        // aggressive than the foveation reduction (e.g. 0.25), respect that
+        // bandwidth choice and keep the plain uniform downscale instead.
+        const bool foveationWithinScaleBudget =
+            layoutUsable &&
+            layout.optimizedEyeWidth <= scaledWidth_ &&
+            layout.optimizedEyeHeight <= scaledHeight_;
+        if (foveationWithinScaleBudget)
         {
             encodedWidth_ = layout.optimizedEyeWidth * 2;
             encodedHeight_ = layout.optimizedEyeHeight;
@@ -465,9 +485,23 @@ bool StreamingServer::Start(uint32_t renderWidth, uint32_t renderHeight, uint32_
         {
             foveatedTargetEyeWidth_ = scaledWidth_;
             foveatedTargetEyeHeight_ = scaledHeight_;
-            spdlog::warn("StreamingServer: foveated encoding preset '{}' is configured but resolution_scale={:.2f} cannot be announced coherently; advertising normal video",
-                         config.foveatedEncodingPreset,
-                         scale);
+            if (!layoutUsable)
+            {
+                spdlog::warn("StreamingServer: foveated encoding preset '{}' produced an unusable layout for render {}x{}; advertising normal video",
+                             config.foveatedEncodingPreset,
+                             renderWidth_,
+                             renderHeight_);
+            }
+            else
+            {
+                spdlog::info("StreamingServer: foveated encoding preset '{}' saves nothing over resolution_scale={:.2f} ({}x{} vs {}x{} per eye); advertising uniformly downscaled video",
+                             config.foveatedEncodingPreset,
+                             scale,
+                             layout.optimizedEyeWidth,
+                             layout.optimizedEyeHeight,
+                             scaledWidth_,
+                             scaledHeight_);
+            }
         }
     }
     else if (foveationPreset != oxr::protocol::FoveationPreset::Off)
