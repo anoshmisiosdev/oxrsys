@@ -387,10 +387,19 @@ XrPosef InputManager::GetReferenceSpacePose(XrReferenceSpaceType referenceSpaceT
     pose.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
     pose.position = {0.0f, 0.0f, 0.0f};
 
+    // Manual floor calibration. The origin's Y is shifted by -offset so that a
+    // pose located relative to it (headY - originY) becomes headY + offset:
+    // positive offset raises the player, negative lowers them. Default 0 leaves
+    // the client's floor-relative pose untouched.
+    const float stageOffset = Config::Get().GetValues().stageHeightOffsetM;
+    const float floorOriginY = -stageOffset;
+
     switch (referenceSpaceType)
     {
         case XR_REFERENCE_SPACE_TYPE_STAGE:
-            // Client head pose is already STAGE (physical-floor) relative.
+            // Client head pose is already STAGE (physical-floor) relative; only
+            // the optional manual floor calibration is applied.
+            pose.position = {0.0f, floorOriginY, 0.0f};
             break;
 
         case XR_REFERENCE_SPACE_TYPE_LOCAL:
@@ -408,7 +417,7 @@ XrPosef InputManager::GetReferenceSpacePose(XrReferenceSpaceType referenceSpaceT
             // LOCAL's horizontal position and yaw, but anchored at floor height.
             if (localReferenceCaptured_)
             {
-                pose.position = {localReferencePosition_.x, 0.0f, localReferencePosition_.z};
+                pose.position = {localReferencePosition_.x, floorOriginY, localReferencePosition_.z};
                 pose.orientation = {localReferenceYaw_.x, localReferenceYaw_.y,
                                     localReferenceYaw_.z, localReferenceYaw_.w};
             }
