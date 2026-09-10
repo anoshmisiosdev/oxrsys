@@ -249,6 +249,11 @@ private:
     std::atomic<uint32_t> replacedFrameCount_{0};
     std::atomic<uint32_t> requestKeyframeCount_{0};
     std::atomic<uint32_t> requestKeyframeTotalForAbr_{0};
+    // Cooldown to coalesce keyframe-request storms: a decode stall makes the client
+    // spam keyframe requests, but each forced IDR is large and buries an
+    // already-behind decoder further. Force at most one IDR per cooldown window.
+    std::atomic<int64_t> lastForcedKeyframeNs_{0};
+    std::atomic<uint32_t> suppressedKeyframeRequests_{0};
     std::atomic<uint32_t> encoderDroppedFramesTotalForAbr_{0};
     std::atomic<uint32_t> videoSendQueueDepthMax_{0};
     std::atomic<uint32_t> videoSendDroppedFrames_{0};

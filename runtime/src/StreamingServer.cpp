@@ -1715,14 +1715,33 @@ void StreamingServer::HandleKeyframeRequest(const oxr::protocol::RequestKeyframe
     requestKeyframeCount_.fetch_add(1);
     requestKeyframeTotalForAbr_.fetch_add(1);
 
-    std::lock_guard<std::mutex> lock(encoderMutex_);
-    if (encoder_ != nullptr)
+    // Coalesce keyframe-request storms. A stalled Quest decoder spams requests
+    // (KEYFRAME_REASON_DECODE_STALL every ~100ms), but each forced IDR is large
+    // (~0.5-1 MB) and buries an already-behind decoder further, so honoring them
+    // 1:1 turns a brief decode hiccup into a multi-second freeze on a big scene
+    // change. On the lossless USB-TCP path a stall is decoder backlog, not packet
+    // loss, so one IDR per cooldown is enough to recover; drop the rest.
+    constexpr int64_t kKeyframeCooldownNs = 250LL * 1000LL * 1000LL; // 250 ms
+    const int64_t now = SteadyClockNowNs();
+    const int64_t last = lastForcedKeyframeNs_.load();
+    if (last != 0 && (now - last) < kKeyframeCooldownNs)
     {
-        encoder_->ForceKeyframe();
+        suppressedKeyframeRequests_.fetch_add(1);
+        return;
+    }
+    lastForcedKeyframeNs_.store(now);
+
+    {
+        std::lock_guard<std::mutex> lock(encoderMutex_);
+        if (encoder_ != nullptr)
+        {
+            encoder_->ForceKeyframe();
+        }
     }
 
-    spdlog::info("StreamingServer: Keyframe requested (reasons=0x{:x}, detail={})",
-                  request.reasonFlags, request.detail);
+    spdlog::info("StreamingServer: Keyframe forced (reasons=0x{:x}, detail={}, coalesced={})",
+                  request.reasonFlags, request.detail,
+                  suppressedKeyframeRequests_.exchange(0));
 }
 
 void StreamingServer::HandleControlPayload(const uint8_t* data, size_t size)
