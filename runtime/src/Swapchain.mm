@@ -11,7 +11,14 @@
 namespace
 {
 
-constexpr uint32_t kMetalStagingImageCount = Swapchain::SwapchainImageCount + 1;
+// A staging slot is held from snapshot until the encoder finishes reading it, i.e.
+// for the whole encode latency. In-flight frames = ceil(encodeLatency / framePeriod);
+// at 120 Hz (8.33 ms) with a ~35-40 ms encode path that is ~5, so the old pool of
+// SwapchainImageCount+1 (=4) saturated every frame ("staging pool is full" →
+// stale streamed frames → jitter). Size for ~8 frames deep (~66 ms @120 Hz,
+// ~110 ms @72 Hz) so a snapshot is essentially always available. Each slot is one
+// stereo BGRA8 texture (~20 MB at full res); 8 ≈ 160 MB of unified memory.
+constexpr uint32_t kMetalStagingImageCount = Swapchain::SwapchainImageCount + 5;
 static std::atomic<uint64_t> gMetalSnapshotValue{0};
 
 void ReleaseMetalObject(void* object)
