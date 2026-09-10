@@ -314,6 +314,23 @@ bool TrackingReceiver::GetPredictedPose(oxr::protocol::TrackingPacket& outPacket
     float couplingScale = 1.0f - (1.0f - kCouplingMinHorizonScale) * couplingT;
     float headPositionHorizonSeconds = positionHorizonSeconds * couplingScale;
 
+    // Rotational over-prediction on fast flicks: a quick head turn accelerates then
+    // decelerates, so extrapolating the peak angular velocity over the full horizon
+    // overshoots, and pose_warp can't perfectly correct that for near-field geometry
+    // (rotation isn't an exact homography up close) -> jitter on quick turns. Scale
+    // the head ROTATION horizon down as angular speed rises, but gently (rotation
+    // prediction is the most latency-sensitive): full horizon for normal look-around
+    // (<2 rad/s), easing to a 0.5 floor only for hard flicks.
+    constexpr float kRotRampLoRadPerSec = 2.0f;
+    constexpr float kRotRampHiRadPerSec = 8.0f;
+    constexpr float kRotMinHorizonScale = 0.5f;
+    float rotT = std::clamp(
+        (headAngularSpeed - kRotRampLoRadPerSec) /
+            (kRotRampHiRadPerSec - kRotRampLoRadPerSec),
+        0.0f, 1.0f);
+    float rotScale = 1.0f - (1.0f - kRotMinHorizonScale) * rotT;
+    headRotationHorizonSeconds *= rotScale;
+
     float headReportedSpeed = glm::length(headLinVel);
 
     int64_t nowNs = SteadyClockNowNs();
@@ -326,9 +343,10 @@ bool TrackingReceiver::GetPredictedPose(oxr::protocol::TrackingPacket& outPacket
         // displacement (what previously overshot as "world moves when I look").
         spdlog::info("TrackingReceiver: prediction horizon={:.1f}ms head_ang_vel={} "
                      "ang_speed={:.2f}rad/s lin_speed={:.3f}m/s pos_horizon={:.2f}ms "
-                     "(scale={:.2f}) predicted_disp={:.1f}mm",
+                     "(scale={:.2f}) rot_horizon={:.2f}ms (scale={:.2f}) predicted_disp={:.1f}mm",
                      horizonMs, hasHeadAngularVelocity ? "yes" : "no", headAngularSpeed,
                      headReportedSpeed, headPositionHorizonSeconds * 1000.0f, couplingScale,
+                     headRotationHorizonSeconds * 1000.0f, rotScale,
                      std::min(headReportedSpeed, 3.0f) * headPositionHorizonSeconds * 1000.0f);
     }
 
