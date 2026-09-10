@@ -526,6 +526,17 @@ XrPosef InputManager::GetControllerPose(Hand hand) const
     return pose;
 }
 
+bool InputManager::GetControllerVelocity(Hand hand, glm::vec3& linearVelocity,
+                                         glm::vec3& angularVelocity) const
+{
+    if (trackingReceiver_ == nullptr)
+    {
+        return false;
+    }
+    return trackingReceiver_->GetRawControllerVelocity(hand == Hand::Left, linearVelocity,
+                                                        angularVelocity);
+}
+
 float InputManager::GetGrabValue(Hand hand) const
 {
     return (hand == Hand::Left) ? leftGripValue_ : rightGripValue_;

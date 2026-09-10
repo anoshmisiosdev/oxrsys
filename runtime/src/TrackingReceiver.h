@@ -9,6 +9,9 @@
 #include <mutex>
 #include <thread>
 
+#include <glm/glm.hpp>
+#include <glm/gtc/quaternion.hpp>
+
 #include "RuntimeSockets.h"
 
 #include <oxrsys/protocol/Protocol.h>
@@ -36,6 +39,14 @@ public:
     // Get the latest tracking data (thread-safe)
     bool GetLatestPose(oxr::protocol::TrackingPacket& outPacket) const;
     bool GetPredictedPose(oxr::protocol::TrackingPacket& outPacket) const;
+
+    // Raw controller velocity (linear m/s, angular rad/s) in the client tracking frame,
+    // from a finite difference of the two most recent RAW pose samples - deliberately NOT
+    // the predicted/clamped pose, so velocity-based game mechanics (e.g. punch detection)
+    // see the true, undamped controller speed. The head keeps its own prediction/jitter
+    // handling untouched. Returns false without enough recent history for that controller.
+    bool GetRawControllerVelocity(bool leftHand, glm::vec3& linearVelocity,
+                                  glm::vec3& angularVelocity) const;
 
     // Inject a tracking packet from TCP (USB mode) — same effect as receiving via UDP
     void InjectPacket(const uint8_t* data, size_t size);

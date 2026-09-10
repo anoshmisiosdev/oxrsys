@@ -174,6 +174,42 @@ static LocatedWorldPose GetWorldPose(Space* space, const InputManager& inputMana
     return result;
 }
 
+// World-frame velocity of a space (linear m/s, angular rad/s), for XrSpaceVelocity. Only
+// controller (action pose) spaces move here; reference spaces (LOCAL/STAGE/VIEW) are treated
+// as static so their velocity is zero. The controller velocity is undamped (derived from raw
+// poses), so punch-style mechanics see true speed. Returns false when no velocity is known.
+static bool GetWorldVelocity(Space* space, const InputManager& inputManager,
+                             glm::vec3& linVel, glm::vec3& angVel)
+{
+    if (space->GetType() != Space::Type::Action)
+    {
+        return false;
+    }
+
+    auto* action = Runtime::Get().FromHandle<ActionState>(
+        reinterpret_cast<uint64_t>(space->GetAction()));
+
+    std::string poseBindingPath;
+    bool poseActive = false;
+    if (action != nullptr)
+    {
+        const auto& data = action->GetSubactionData(space->GetSubactionPath());
+        poseActive = data.poseActive;
+        poseBindingPath = Runtime::Get().GetPathString(data.poseSourcePath);
+        if (poseBindingPath.empty() || !poseActive)
+        {
+            const auto& fallbackData = action->GetSubactionData(XR_NULL_PATH);
+            poseActive = fallbackData.poseActive;
+            poseBindingPath = Runtime::Get().GetPathString(fallbackData.poseSourcePath);
+        }
+    }
+
+    const InputManager::Hand hand = poseBindingPath.empty()
+        ? HandFromPath(space->GetSubactionPath())
+        : HandFromBindingPath(poseBindingPath);
+    return inputManager.GetControllerVelocity(hand, linVel, angVel);
+}
+
 XrResult Space::LocateSpace(Space* baseSpace, XrTime time, XrSpaceLocation* location)
 {
     if (location == nullptr || baseSpace == nullptr)
@@ -214,9 +250,28 @@ XrResult Space::LocateSpace(Space* baseSpace, XrTime time, XrSpaceLocation* loca
 
     if (XrSpaceVelocity* velocity = FindSpaceVelocity(location->next))
     {
-        velocity->velocityFlags = 0;
-        velocity->linearVelocity = {0.0f, 0.0f, 0.0f};
-        velocity->angularVelocity = {0.0f, 0.0f, 0.0f};
+        glm::vec3 thisLin(0.0f), thisAng(0.0f), baseLin(0.0f), baseAng(0.0f);
+        const bool haveThis = GetWorldVelocity(this, inputManager, thisLin, thisAng);
+        GetWorldVelocity(baseSpace, inputManager, baseLin, baseAng); // static base stays 0
+
+        if (haveThis && thisPose.active && basePose.active)
+        {
+            // Change the controller's world velocity into the base space's frame. For a
+            // static base (LOCAL/STAGE - the usual case for input) this is an exact change
+            // of basis, so the reported speed magnitude equals the true controller speed.
+            const glm::vec3 relLin = baseRotInv * (thisLin - baseLin);
+            const glm::vec3 relAng = baseRotInv * (thisAng - baseAng);
+            velocity->linearVelocity = ToXr(relLin);
+            velocity->angularVelocity = ToXr(relAng);
+            velocity->velocityFlags =
+                XR_SPACE_VELOCITY_LINEAR_VALID_BIT | XR_SPACE_VELOCITY_ANGULAR_VALID_BIT;
+        }
+        else
+        {
+            velocity->velocityFlags = 0;
+            velocity->linearVelocity = {0.0f, 0.0f, 0.0f};
+            velocity->angularVelocity = {0.0f, 0.0f, 0.0f};
+        }
     }
 
     return XR_SUCCESS;

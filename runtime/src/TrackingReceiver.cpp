@@ -458,3 +458,78 @@ void TrackingReceiver::StorePacket(const oxr::protocol::TrackingPacket& packet, 
     hasData_.store(true);
     packetCount_.fetch_add(1);
 }
+
+bool TrackingReceiver::GetRawControllerVelocity(bool leftHand, glm::vec3& linearVelocity,
+                                                glm::vec3& angularVelocity) const
+{
+    std::lock_guard<std::mutex> lock(poseMutex_);
+    if (history_.size() < 2)
+    {
+        return false;
+    }
+
+    const uint32_t activeFlag = leftHand
+        ? oxr::protocol::TRACKING_FLAG_LEFT_CONTROLLER_ACTIVE
+        : oxr::protocol::TRACKING_FLAG_RIGHT_CONTROLLER_ACTIVE;
+
+    // The two most recent samples that both have this controller active, so the finite
+    // difference spans real tracked motion and never straddles an inactivity gap.
+    const HistorySample* newer = nullptr;
+    const HistorySample* older = nullptr;
+    for (auto it = history_.rbegin(); it != history_.rend(); ++it)
+    {
+        const bool active = (it->packet.trackingFlags & activeFlag) != 0;
+        if (!active)
+        {
+            if (newer != nullptr)
+            {
+                return false; // active chain broken before we found a pair
+            }
+            continue; // skip trailing inactive samples
+        }
+        if (newer == nullptr)
+        {
+            newer = &(*it);
+            continue;
+        }
+        older = &(*it);
+        break;
+    }
+    if (newer == nullptr || older == nullptr)
+    {
+        return false;
+    }
+
+    const double dt = static_cast<double>(newer->receiveTimeNs - older->receiveTimeNs) / 1e9;
+    if (dt <= 1e-4 || dt > 0.1) // reject duplicate/stale (dropped-packet) pairs
+    {
+        return false;
+    }
+
+    const float* newerPos = leftHand ? newer->packet.leftControllerPos : newer->packet.rightControllerPos;
+    const float* olderPos = leftHand ? older->packet.leftControllerPos : older->packet.rightControllerPos;
+    const float* newerRot = leftHand ? newer->packet.leftControllerRot : newer->packet.rightControllerRot;
+    const float* olderRot = leftHand ? older->packet.leftControllerRot : older->packet.rightControllerRot;
+
+    linearVelocity = (LoadVec3(newerPos) - LoadVec3(olderPos)) / static_cast<float>(dt);
+
+    // Angular velocity from the delta rotation q_delta = q_new * inverse(q_old), taken as
+    // an axis-angle over dt (shortest arc).
+    glm::quat delta = LoadQuat(newerRot) * glm::inverse(LoadQuat(olderRot));
+    if (delta.w < 0.0f)
+    {
+        delta = -delta;
+    }
+    const glm::vec3 axis = glm::axis(delta);
+    const float angle = glm::angle(delta); // [0, pi]
+    if (angle > 1e-5f && glm::length(axis) > 1e-5f)
+    {
+        angularVelocity = glm::normalize(axis) * (angle / static_cast<float>(dt));
+    }
+    else
+    {
+        angularVelocity = glm::vec3(0.0f);
+    }
+
+    return true;
+}
