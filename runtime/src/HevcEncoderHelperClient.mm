@@ -127,6 +127,20 @@ bool HevcEncoderHelperClient::Start(const Config& config, void* const* iosurface
         spdlog::error("EncoderHelper: socketpair failed: {}", strerror(errno));
         return false;
     }
+    // Enlarge the socket buffers on both ends (default AF_UNIX stream buffers are
+    // ~8 KB). A single encoded frame is 80 KB-1 MB+, so with 8 KB buffers a NAL
+    // transfers as many ~8 KB ping-pongs, each a cross-process wakeup, and the
+    // helper's VideoToolbox output thread blocks in write() mid-frame — which
+    // serializes frame N's delivery ahead of frame N+1's callback. 4 MB removes
+    // the ping-ponging. The child inherits these buffers across posix_spawn.
+    {
+        const int bufSize = 4 * 1024 * 1024;
+        for (int i = 0; i < 2; ++i)
+        {
+            setsockopt(sv[i], SOL_SOCKET, SO_SNDBUF, &bufSize, sizeof(bufSize));
+            setsockopt(sv[i], SOL_SOCKET, SO_RCVBUF, &bufSize, sizeof(bufSize));
+        }
+    }
     // --- stderr capture pipe (child stderr -> parent log) ---
     int errpipe[2] = {-1, -1};
     if (pipe(errpipe) != 0)

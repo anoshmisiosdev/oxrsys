@@ -1153,7 +1153,7 @@ void StreamingServer::EncodeThread()
                 memcpy(nal.tcpPayload.data() + sizeof(nalHeader), nalData, nalSize);
                 encodedFrame->nals.push_back(std::move(nal));
             },
-            [this, telemetry, queueWaitMs, encoder, config, encodedFrame](
+            [this, telemetry, queueWaitMs, encoder, encodedFrame](
                 const VideoEncoder::FrameMetrics& metrics)
             {
                 if (!metrics.frameDropped && !encodedFrame->nals.empty())
@@ -1206,6 +1206,9 @@ void StreamingServer::EncodeThread()
                         abrProfileName = abrProfileName_;
                     }
 
+                    // Read config here (this block runs ~once/sec) rather than
+                    // capturing a full ConfigValues copy into the per-frame lambda.
+                    const ConfigValues cfg = Config::Get().GetValues();
                     RuntimeStatus::StreamingStats stats = {};
                     stats.refreshRateHz = targetRefreshRateHz_.load();
                     stats.currentBitrateMbps = currentBitrateMbps_.load();
@@ -1214,12 +1217,12 @@ void StreamingServer::EncodeThread()
                     stats.renderHeight = renderHeight_;
                     stats.encodedWidth = encodedWidth_;
                     stats.encodedHeight = encodedHeight_;
-                    stats.encoderPreset = config.encoderPreset;
+                    stats.encoderPreset = cfg.encoderPreset;
                     stats.foveatedEncodingPreset = clientFoveatedEncodingActive_.load()
-                        ? config.foveatedEncodingPreset
+                        ? cfg.foveatedEncodingPreset
                         : "off";
-                    stats.clientFoveationPreset = config.clientFoveationPreset;
-                    stats.clientUpscaling = config.clientUpscaling;
+                    stats.clientFoveationPreset = cfg.clientFoveationPreset;
+                    stats.clientUpscaling = cfg.clientUpscaling;
                     stats.clientReprojectionMode =
                         ClientReprojectionModeName(clientReprojectionMode_.load());
                     stats.abrMode = abrModeName;
@@ -2077,32 +2080,14 @@ void StreamingServer::EnqueueAudioSamples(const float* data, uint32_t frames,
         return;
     }
 
+    // Runs on the Core Audio IOProc (real-time) thread: keep it lean — no logging,
+    // no peak scan here. Telemetry is computed on AudioSendThread instead so this
+    // thread only packetizes and enqueues.
     const size_t pcmBytes = static_cast<size_t>(frames) * channels * sizeof(float);
     if (sizeof(oxr::protocol::TcpAudioHeader) + pcmBytes >
         oxr::protocol::TCP_MAX_RECORD_PAYLOAD)
     {
         return; // shouldn't happen for typical IOProc buffer sizes
-    }
-
-    // Telemetry: is the tap delivering real (non-silent) audio, and how much?
-    {
-        float peak = 0.0f;
-        const size_t sampleTotal = static_cast<size_t>(frames) * channels;
-        for (size_t i = 0; i < sampleTotal; ++i)
-        {
-            const float a = data[i] < 0.0f ? -data[i] : data[i];
-            if (a > peak) peak = a;
-        }
-        static thread_local uint32_t bufCount = 0;
-        static thread_local float windowPeak = 0.0f;
-        if (peak > windowPeak) windowPeak = peak;
-        if (++bufCount % 200 == 0)
-        {
-            spdlog::info("AudioCapture: {} buffers captured, peak amplitude={:.4f} "
-                         "(0 = silence), queued/sent so far={}",
-                         bufCount, windowPeak, audioFramesSent_.load());
-            windowPeak = 0.0f;
-        }
     }
 
     oxr::protocol::TcpAudioHeader header = {};
@@ -2134,6 +2119,13 @@ void StreamingServer::EnqueueAudioSamples(const float* data, uint32_t frames,
 
 void StreamingServer::AudioSendThread()
 {
+    // Match the video-send thread's QoS: this thread takes the shared TCP
+    // sendMutex, so at a lower QoS it would cause priority inversion, stalling
+    // the USER_INTERACTIVE video-send thread behind it.
+    RaiseThreadToRealtimeQoS("audio-send");
+
+    uint32_t sentCount = 0;
+    float windowPeak = 0.0f;
     while (audioActive_.load() && running_.load())
     {
         std::vector<uint8_t> packet;
@@ -2166,11 +2158,34 @@ void StreamingServer::AudioSendThread()
             continue; // no TCP audio path right now; drop this buffer
         }
 
-        std::lock_guard<std::mutex> sendLock(packetDispatchState_->sendMutex);
-        if (SendTcpRecord(videoSocket, oxr::protocol::TcpRecordType::Audio,
-                          packet.data(), packet.size()))
         {
-            audioFramesSent_.fetch_add(1);
+            std::lock_guard<std::mutex> sendLock(packetDispatchState_->sendMutex);
+            if (SendTcpRecord(videoSocket, oxr::protocol::TcpRecordType::Audio,
+                              packet.data(), packet.size()))
+            {
+                audioFramesSent_.fetch_add(1);
+            }
+        }
+
+        // Telemetry off the real-time capture thread: peak-scan the PCM payload
+        // and log ~once/sec worth of buffers (200 ≈ 2s at typical buffer sizes).
+        const size_t headerBytes = sizeof(oxr::protocol::TcpAudioHeader);
+        if (packet.size() > headerBytes)
+        {
+            const float* pcm =
+                reinterpret_cast<const float*>(packet.data() + headerBytes);
+            const size_t count = (packet.size() - headerBytes) / sizeof(float);
+            for (size_t i = 0; i < count; ++i)
+            {
+                const float a = pcm[i] < 0.0f ? -pcm[i] : pcm[i];
+                if (a > windowPeak) windowPeak = a;
+            }
+        }
+        if (++sentCount % 200 == 0)
+        {
+            spdlog::info("AudioCapture: {} buffers sent, peak amplitude={:.4f} "
+                         "(0 = silence)", sentCount, windowPeak);
+            windowPeak = 0.0f;
         }
     }
 }
