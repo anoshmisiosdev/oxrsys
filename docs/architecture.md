@@ -7,6 +7,7 @@ OXRSys Runtime is a cross-platform OpenXR runtime in progress. macOS is the matu
 ## Repository Layout
 
 - `runtime/`: runtime library, graphics integration, input, configuration, streaming server, tracking receiver, and video encoder.
+- `drivers/`: wired-headset device drivers compiled from a pinned Monado checkout (currently Windows Mixed Reality on macOS) plus the `oxrsys_wmr_probe` bring-up tool. See [platforms/wmr.md](platforms/wmr.md).
 - `common/protocol/include/oxrsys/protocol/`: canonical C++ protocol and FEC wire layout.
 - `clients/Android/android-vr/`: Quest/Pico-oriented Android VR client for decode, display, and tracking return.
 - `clients/Apple/`: Xcode workspace, native SwiftUI Home app, unified Apple simulator/viewer, visionOS viewer, and shared Swift packages.

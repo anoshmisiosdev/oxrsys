@@ -89,6 +89,9 @@ FetchContent_MakeAvailable(OpenXR)
 # --- Our runtime ---
 add_subdirectory(runtime)
 
+# --- Wired-headset drivers (Monado-derived) ---
+add_subdirectory(drivers)
+
 find_package(Vulkan REQUIRED)
 
 add_custom_target(oxrsys_runtime_sync_compile_commands ALL

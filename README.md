@@ -44,6 +44,7 @@ This project uses AI-generated code and documentation. We appreciate professiona
 - OpenXR SDK headers and loader
 - Metal
 - Vulkan headers for interop paths
+- hidapi and libusb (Homebrew) for the macOS Windows Mixed Reality headset driver
 - Android SDK, Android NDK, and Java 17 for the Android client
 
 ## Status
@@ -70,6 +71,7 @@ This project uses AI-generated code and documentation. We appreciate professiona
 - [Qt Home](docs/platforms/qt-home.md)
 - [iOS Viewer](docs/platforms/ios-viewer.md)
 - [Vision OS](docs/platforms/visionos.md)
+- [Windows Mixed Reality headsets](docs/platforms/wmr.md)
 - [Testing And Conformance](docs/testing-and-conformance.md)
 - [Licensing](docs/licensing.md)
 - [Scripts](scripts/README.md)

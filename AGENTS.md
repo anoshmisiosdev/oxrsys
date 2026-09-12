@@ -115,6 +115,7 @@ Avoid duplicating the same guidance in multiple files. If commands, platform sta
   Linux `${XDG_CONFIG_HOME:-~/.config}/oxrsys/oxrsys-runtime.toml`,
   Windows `%APPDATA%/OXRSys/oxrsys-runtime.toml`.
 - Qt Home transport readiness and USB ADB reverse configuration run asynchronously on a worker; keep slow process calls off the UI thread and ignore stale worker results after path, serial, or transport changes.
+- `drivers/` compiles the Windows Mixed Reality driver out of an unmodified, commit-pinned Monado checkout (BSL-1.0) fetched with FetchContent. Do not patch Monado sources in place; add macOS pieces under `drivers/monado/` and keep the source lists in `drivers/CMakeLists.txt` in step with the pinned revision. See `docs/platforms/wmr.md`.
 
 ## Project Layout
 
@@ -125,6 +126,10 @@ oxrsys_runtime/
 ├── cmake/RunOpenXRCTS.cmake
 ├── config/OXRSysVersion.xcconfig
 ├── runtime/
+├── drivers/
+│   ├── CMakeLists.txt
+│   ├── monado/
+│   └── tools/
 ├── clients/
 │   ├── Android/
 │   │   └── android-vr/

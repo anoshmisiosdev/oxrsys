@@ -21,6 +21,10 @@ This document is the entry point for build workflows. Installation steps live in
   - [Vision OS](platforms/visionos.md)
   - [macOS Home](platforms/macos-home.md)
   - [Qt Home](platforms/qt-home.md)
+  - [Windows Mixed Reality headsets](platforms/wmr.md)
+- The macOS build also compiles the Monado-derived Windows Mixed Reality driver under
+  `drivers/`, which needs `brew install hidapi libusb`. Pass `-DOXRSYS_BUILD_WMR_DRIVER=OFF`
+  to skip it.
 
 ## Build The Runtime
 
