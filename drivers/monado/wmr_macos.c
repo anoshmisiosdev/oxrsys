@@ -7,6 +7,7 @@
 #include "wmr_macos.h"
 
 #include "os_hid_hidapi.h"
+#include "psmv_macos.h"
 
 #include "util/u_misc.h"
 #include "wmr/wmr_bt_controller.h"
@@ -213,6 +214,7 @@ oxrsys_wmr_dump_hid_devices(void)
 
 		const char *note = "";
 		enum wmr_headset_type type;
+		enum oxrsys_psmv_model psmv_model;
 		if (is_holo_sensors(info)) {
 			note = info->interface_number == WMR_HOLO_INTERFACE ? "<- HoloLens Sensors (IMU interface)"
 			                                                     : "HoloLens Sensors";
@@ -227,6 +229,8 @@ oxrsys_wmr_dump_hid_devices(void)
 			}
 		} else if (info->vendor_id == MICROSOFT_VID && is_bt_controller_pid(info->product_id)) {
 			note = "WMR motion controller (not Bluetooth)";
+		} else if (oxrsys_psmv_classify(info->vendor_id, info->product_id, &psmv_model)) {
+			note = oxrsys_psmv_model_str(psmv_model);
 		}
 
 		printf("%04x:%04x %-5d 0x%04x 0x%04x %-30.30s %s\n", info->vendor_id, info->product_id,

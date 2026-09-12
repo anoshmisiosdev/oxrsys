@@ -69,7 +69,7 @@ set(XRT_HAVE_HIDAPI ON)
 if(OXRSYS_WMR_OPENCV)
     set(XRT_HAVE_OPENCV ON)
 endif()
-set(FILE_CONTENTS "#define XRT_BUILD_DRIVER_WMR\n")
+set(FILE_CONTENTS "#define XRT_BUILD_DRIVER_WMR\n#define XRT_BUILD_DRIVER_PSMV\n")
 foreach(oxrsys_monado_config IN ITEMS build have drivers vulkan android)
     configure_file(
         "${OXRSYS_MONADO_XRT}/include/xrt/xrt_config_${oxrsys_monado_config}.h.cmake_in"
@@ -115,6 +115,10 @@ set(OXRSYS_MONADO_WMR_SOURCES
     drivers/wmr/wmr_hmd_controller.c
     drivers/wmr/wmr_protocol.c
     drivers/wmr/wmr_source.c
+
+    # drivers/psmv: PlayStation Move over Bluetooth HID. Monado gates it on
+    # Linux + hidapi; drivers/monado/psmv_macos.c does the enumeration here.
+    drivers/psmv/psmv_driver.c
 
     auxiliary/os/os_time.cpp
 
@@ -185,6 +189,7 @@ list(TRANSFORM OXRSYS_MONADO_WMR_SOURCES PREPEND "${OXRSYS_MONADO_XRT}/")
 
 set(OXRSYS_MONADO_PLATFORM_SOURCES
     monado/os_hid_hidapi.c
+    monado/psmv_macos.c
     monado/t_euroc_recorder_stub.c
     monado/u_file_macos.c
     monado/wmr_macos.c
@@ -238,10 +243,11 @@ set_source_files_properties(
 )
 set_source_files_properties(
     monado/os_hid_hidapi.c
+    monado/psmv_macos.c
     monado/t_euroc_recorder_stub.c
     monado/u_file_macos.c
     monado/wmr_macos.c
-    PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra"
+    PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Wno-unused-parameter"
 )
 
 target_link_libraries(oxrsys_monado_wmr
