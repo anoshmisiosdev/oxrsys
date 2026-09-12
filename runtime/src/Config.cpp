@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 #include "Config.h"
+#include <atomic>
 #include "RuntimePlatform.h"
 
 #include <oxrsys/protocol/Protocol.h>
@@ -363,6 +364,26 @@ ConfigValues ParseConfigToml(std::istream& input, const ConfigValues& defaults)
                     values.renderDevice = value;
                 }
             }
+            else if (key == "wired_headset")
+            {
+                values.wiredHeadset = ParseBool(value);
+            }
+            else if (key == "wired_display_id")
+            {
+                long long val = std::stoll(value);
+                if (val >= 0 && val <= 0xFFFFFFFFLL)
+                {
+                    values.wiredDisplayId = static_cast<uint32_t>(val);
+                }
+            }
+            else if (key == "wired_eye_height_m")
+            {
+                float val = std::stof(value);
+                if (val >= 0.0f && val <= 3.0f)
+                {
+                    values.wiredEyeHeightM = val;
+                }
+            }
             else if (key == "keyframe_interval_sec")
             {
                 int val = std::stoi(value);
@@ -667,10 +688,30 @@ EyeResolution DeviceBaseEyeResolution(const std::string& device)
     // "quest3" and any unknown value fall back to the default base.
     return {1512, 1680};
 }
+
+// Set once, from Instance::GetSystem, when a wired headset opens. A wired panel is a fixed size,
+// so the render-device preset does not apply to it.
+std::atomic<uint32_t> g_wiredEyeWidth{0};
+std::atomic<uint32_t> g_wiredEyeHeight{0};
 } // namespace
+
+void SetWiredBaseEyeResolution(uint32_t width, uint32_t height)
+{
+    g_wiredEyeWidth.store(width, std::memory_order_release);
+    g_wiredEyeHeight.store(height, std::memory_order_release);
+}
 
 void RenderBaseEyeResolution(uint32_t& width, uint32_t& height)
 {
+    const uint32_t wiredWidth = g_wiredEyeWidth.load(std::memory_order_acquire);
+    const uint32_t wiredHeight = g_wiredEyeHeight.load(std::memory_order_acquire);
+    if (wiredWidth > 0 && wiredHeight > 0)
+    {
+        width = wiredWidth;
+        height = wiredHeight;
+        return;
+    }
+
     const EyeResolution base = DeviceBaseEyeResolution(Config::Get().GetValues().renderDevice);
     width = base.width;
     height = base.height;

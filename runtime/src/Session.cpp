@@ -10,6 +10,8 @@
 #include "Space.h"
 #include "InputManager.h"
 #include "StreamingServer.h"
+#include "RuntimeStatus.h"
+#include "WiredHeadset.h"
 #include <spdlog/spdlog.h>
 #include <algorithm>
 #include <atomic>
@@ -257,6 +259,7 @@ XrResult Session::EndSession()
 
     // Stop streaming so it can be restarted on next BeginSession
     streamingSnapshotDemand_->store(false, std::memory_order_release);
+    DetachWiredHeadset();
     if (streamingServer_)
     {
         if (!streamingServer_->Stop())
@@ -314,6 +317,7 @@ XrResult Session::Shutdown()
     }
 
     streamingSnapshotDemand_->store(false, std::memory_order_release);
+    DetachWiredHeadset();
     if (streamingServer_)
     {
         if (!streamingServer_->Stop())
@@ -324,6 +328,8 @@ XrResult Session::Shutdown()
         }
         streamingServer_.reset();
         streamingStarted_ = false;
+        inputManager_->SetTrackingReceiver(nullptr);
+        spdlog::info("OXRSys: Streaming server stopped for session end");
     }
 
     std::lock_guard<std::mutex> swapchainsLock(swapchainsMutex_);
@@ -338,6 +344,25 @@ XrResult Session::Shutdown()
     spaces_.clear();
     swapchains_.clear();
     return XR_SUCCESS;
+}
+
+// A wired headset replaces the streaming server for a session. Detaching is
+// unconditional and cannot fail, so both EndSession and Shutdown call it before
+// their own (failure-aware) streaming-server teardown.
+void Session::DetachWiredHeadset()
+{
+    if (!wiredActive_)
+    {
+        return;
+    }
+    WiredHeadset::Shared().DetachGraphics();
+    wiredActive_ = false;
+    streamingStarted_ = false;
+    if (inputManager_)
+    {
+        inputManager_->SetTrackingReceiver(nullptr);
+    }
+    spdlog::info("OXRSys: Wired headset detached for session end");
 }
 
 void Session::BeginDebugUtilsLabelRegion(const XrDebugUtilsLabelEXT& labelInfo)
@@ -429,7 +454,11 @@ XrResult Session::WaitFrame(const XrFrameWaitInfo* frameWaitInfo, XrFrameState* 
         std::memory_order_release);
 
     uint32_t targetRefreshHz = 90;
-    if (streamingServer_)
+    if (wiredActive_)
+    {
+        targetRefreshHz = std::max(WiredHeadset::Shared().GetRefreshRateHz(), 1u);
+    }
+    else if (streamingServer_)
     {
         targetRefreshHz = std::max(streamingServer_->GetTargetRefreshRateHz(), 1u);
     }
@@ -599,9 +628,13 @@ XrResult Session::EndFrame(const XrFrameEndInfo* frameEndInfo)
         }
     }
 
-    // Send to connected headset client if streaming
+    // Send to the wired headset's presenter, or the connected streaming client.
     CheckStreamingConnection();
-    if (streamingServer_ && streamingServer_->IsClientConnected())
+    if (wiredActive_)
+    {
+        WiredHeadset::Shared().SendFrame(std::move(frameSource));
+    }
+    else if (streamingServer_ && streamingServer_->IsClientConnected())
     {
         auto sendStart = Clock::now();
         if (lastRenderHasPose_)
@@ -1018,6 +1051,23 @@ void Session::StartStreamingIfNeeded()
         return;
     }
 
+    // A wired headset opened at xrGetSystem takes the place of the streaming
+    // server: tracking is already flowing, only the frame path needs attaching.
+    WiredHeadset& wired = WiredHeadset::Shared();
+    if (wired.IsOpen())
+    {
+        if (wired.AttachGraphics(graphicsContext_))
+        {
+            wiredActive_ = true;
+            streamingStarted_ = true;
+            spdlog::info("OXRSys: Presenting on wired headset '{}' at {} Hz", wired.GetName(),
+                         wired.GetRefreshRateHz());
+            return;
+        }
+        spdlog::warn("OXRSys: Wired headset is open but could not attach the session's graphics; "
+                     "falling back to streaming");
+    }
+
     streamingServer_ = std::make_unique<StreamingServer>();
     streamingServer_->SetGraphicsContext(graphicsContext_);
 
@@ -1043,6 +1093,19 @@ void Session::StartStreamingIfNeeded()
 
 void Session::CheckStreamingConnection()
 {
+    if (wiredActive_)
+    {
+        WiredHeadset& wired = WiredHeadset::Shared();
+        if (!inputManager_->IsStreaming() && wired.GetTrackingReceiver() != nullptr)
+        {
+            inputManager_->SetTrackingReceiver(wired.GetTrackingReceiver());
+            inputManager_->SetStreamingClientName(wired.GetName());
+            RuntimeStatus::SetStreaming("wired", wired.GetName());
+            spdlog::info("OXRSys: Wired headset '{}' tracking attached", wired.GetName());
+        }
+        return;
+    }
+
     if (!streamingServer_)
     {
         streamingSnapshotDemand_->store(false, std::memory_order_release);

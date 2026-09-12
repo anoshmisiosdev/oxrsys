@@ -28,6 +28,14 @@ add_library(oxrsys_runtime SHARED
     src/VideoEncoder.mm
 )
 
+# Wired Windows Mixed Reality headsets. The real backend needs the Monado
+# driver from drivers/; the stub keeps the runtime buildable without it.
+if(OXRSYS_BUILD_WMR_DRIVER)
+    target_sources(oxrsys_runtime PRIVATE src/WiredHeadset.mm)
+else()
+    target_sources(oxrsys_runtime PRIVATE src/WiredHeadsetStub.cpp)
+endif()
+
 target_include_directories(oxrsys_runtime PRIVATE
     src
     ${CMAKE_SOURCE_DIR}/common/protocol/include
@@ -61,6 +69,17 @@ target_link_libraries(oxrsys_runtime PRIVATE
     "-framework CoreMedia"
     "-framework CoreVideo"
 )
+
+if(OXRSYS_BUILD_WMR_DRIVER)
+    # Wired Windows Mixed Reality headsets through the Monado driver (drivers/).
+    target_link_libraries(oxrsys_runtime PRIVATE
+        oxrsys_monado_wmr
+        "-framework AppKit"
+        "-framework IOSurface"
+    )
+    target_compile_definitions(oxrsys_runtime PRIVATE OXRSYS_HAVE_WMR=1)
+    set_source_files_properties(src/WiredHeadset.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc;-Wno-unused-parameter")
+endif()
 
 # Only export the negotiation entry point.
 set_target_properties(oxrsys_runtime PROPERTIES

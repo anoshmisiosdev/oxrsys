@@ -3,6 +3,7 @@
 #include "Instance.h"
 #include "Config.h"
 #include "Runtime.h"
+#include "WiredHeadset.h"
 #include <algorithm>
 #include <cstring>
 #include <spdlog/spdlog.h>
@@ -37,6 +38,24 @@ XrResult Instance::GetSystem(const XrSystemGetInfo* getInfo, XrSystemId* systemI
     if (getInfo->formFactor != XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY)
     {
         return XR_ERROR_FORM_FACTOR_UNSUPPORTED;
+    }
+
+    // A wired headset must be open before the app asks for view sizes, so its
+    // panel's eye size is what xrEnumerateViewConfigurationViews recommends. The
+    // override rides on RenderBaseEyeResolution, which is where every other
+    // recommended-size consumer already reads from.
+    if (WiredHeadset::Shared().EnsureOpen(Config::Get().GetValues()))
+    {
+        WiredHeadset& wired = WiredHeadset::Shared();
+        if (wired.GetEyeWidth() > 0 && wired.GetEyeHeight() > 0)
+        {
+            SetWiredBaseEyeResolution(wired.GetEyeWidth(), wired.GetEyeHeight());
+        }
+        uint32_t eyeWidth = 0;
+        uint32_t eyeHeight = 0;
+        RenderBaseEyeResolution(eyeWidth, eyeHeight);
+        spdlog::info("OXRSys: wired headset '{}' active, recommending {}x{} per eye",
+                     wired.GetName(), eyeWidth, eyeHeight);
     }
 
     systemRequested_ = true;

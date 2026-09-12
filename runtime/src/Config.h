@@ -41,14 +41,27 @@ struct ConfigValues
     bool spatialScene = false;
     bool spatialPersistence = false;
 
+    // Wired headset (Windows Mixed Reality through the Monado driver). When
+    // enabled and a headset is connected at xrGetSystem time, it replaces the
+    // streaming client: tracking comes from the headset and frames are shown
+    // on its panel. Off by default so streaming setups are unaffected.
+    bool wiredHeadset = false;
+    uint32_t wiredDisplayId = 0;     // CGDirectDisplayID of the panel; 0 = auto-detect
+    float wiredEyeHeightM = 1.6f;    // Orientation-only tracking reports the head at this height
+
     bool fileLogging = true;        // Write logs to oxrsys-runtime.log
     bool questLogcat = false;       // Capture Quest logcat to oxrsys-headset.log
 };
 
 ConfigValues ParseConfigToml(std::istream& input, const ConfigValues& defaults = {});
 
-// Per-eye render resolution for the configured `render_device`, advertised to the app.
+// Per-eye render resolution advertised to the app: the wired headset panel's eye size when one is
+// open, otherwise the base resolution for the configured `render_device`.
 void RenderBaseEyeResolution(uint32_t& width, uint32_t& height);
+
+// Called when a wired headset opens (at xrGetSystem time) so the recommended per-eye size matches
+// the panel instead of the streaming render-device preset. Both zero clears the override.
+void SetWiredBaseEyeResolution(uint32_t width, uint32_t height);
 
 /**
  * Runtime configuration loaded from

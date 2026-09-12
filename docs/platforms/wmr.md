@@ -1,10 +1,13 @@
 # Windows Mixed Reality Headsets (macOS)
 
-Status: **display bring-up**. The Monado WMR driver builds and links on macOS,
-a probe tool opens a headset and prints IMU orientation, and a display tool
-captures the headset's panel and renders a distortion-corrected stereo test
-scene onto it from the IMU pose. Nothing is wired into the OpenXR runtime yet
-and there is no positional tracking.
+Status: **runtime integration, orientation only**. The Monado WMR driver
+builds and links on macOS, a probe tool prints IMU orientation, a display tool
+renders a test scene on the panel, and the runtime can use the headset in
+place of a streaming client: with `wired_headset = true` an OpenXR app renders
+at the panel's native eye size and refresh rate, sees the headset's FOV and
+orientation, and its frames are shown on the panel through the distortion
+warp. Verified end to end on a Dell Visor with the smoke client below. There
+is no positional tracking and no controller input yet.
 
 ## What This Is
 
@@ -156,6 +159,60 @@ display tool as usual. To undo, delete the file the tool printed under
 Verified on a Dell Visor (EDID vendor `10ac`, product `7fce`): the block sits
 at byte 146 with usage byte `0x07` (VR headset, no desktop use), and the
 patch changes two bytes.
+
+## Runtime Integration
+
+`runtime/src/WiredHeadset.mm` is the wired backend. It is a process-wide
+singleton because the panel window and the USB driver outlive sessions, and
+because the app asks for view sizes before it creates a session.
+
+- **Config.** `wired_headset = true` in `oxrsys-runtime.toml` (plus optional
+  `wired_display_id` and `wired_eye_height_m`). Off by default; streaming
+  setups are untouched.
+- **Open.** `Instance::GetSystem` calls `WiredHeadset::EnsureOpen`, which
+  opens the headset through the driver (panel on), finds its display, switches
+  it to native mode, and sets `Instance::EyeWidth/EyeHeight` to the panel's
+  per-eye size so `xrEnumerateViewConfigurationViews` recommends it.
+- **Tracking.** A thread polls the driver's head pose at 250 Hz, predicted two
+  frames ahead, and injects it into a `TrackingReceiver` as a
+  `TrackingPacket`, carrying the headset's left-eye FOV and a default IPD.
+  `InputManager`, spaces, and reference-space handling see the same data a
+  streaming client would send. Position is fixed at `wired_eye_height_m`
+  above the STAGE floor.
+- **Frames.** `Session::StartStreamingIfNeeded` attaches the session's Metal
+  device instead of starting the streaming server. `Session::EndFrame` hands
+  the projection layer's snapshot images to a latest-frame-only queue; a
+  presenter thread waits on the snapshot's shared event on the GPU and draws
+  both eyes through the distortion mesh (`drivers/monado/wmr_panel.mm`) into
+  the panel's drawable. `xrWaitFrame` paces at the panel's refresh rate.
+  `xrEndFrame` never blocks on the GPU or the display.
+- **Status.** `runtime_status.json` reports `state = "streaming"`,
+  `transport = "wired"`, `device_type = "wmr"`.
+
+### Smoke test
+
+`oxrsys_wmr_xr_smoke` is a minimal native OpenXR client (loader → runtime →
+WiredHeadset) that renders a tangent-space grid per eye tinted by the view
+orientation and submits it as a projection layer:
+
+```bash
+XR_RUNTIME_JSON=build/runtime/oxrsys-runtime.json ./build/drivers/oxrsys_wmr_xr_smoke --seconds 20
+```
+
+With `wired_headset = true` in the config, the panel shows the grid and the
+log reports the session presenting on the headset at 90 Hz with the panel's
+eye size recommended.
+
+### Known gaps in the runtime path
+
+- Orientation only; the head sits at a fixed height. Positional tracking
+  needs SLAM or an external tracker.
+- The protocol carries one FOV for both eyes; the right eye is mirrored from
+  the left. WMR eyes differ by well under a degree, so this is tolerable.
+- No timewarp: a late frame is shown as rendered. Prediction covers the
+  nominal pipeline latency only.
+- The x86_64 (Rosetta) runtime build used by the Wine bridge needs x86_64
+  hidapi and libusb; Homebrew's arm64 libraries do not link into it.
 
 ### Troubleshooting a blank panel
 

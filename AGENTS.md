@@ -123,6 +123,13 @@ As of March 17, 2026, the pinned non-interactive OpenXR-CTS baseline is green lo
   checkout (BSL-1.0) fetched with FetchContent. Do not patch Monado sources in place; add macOS
   pieces under `drivers/monado/` and keep the source lists in `drivers/CMakeLists.txt` in step with
   the pinned revision. See `docs/platforms/wmr.md`.
+- A wired headset (`WiredHeadset`, enabled by `wired_headset = true`) replaces the streaming
+  server for a session: it must be opened in `Instance::GetSystem` so the recommended eye size
+  matches the panel, its tracking is injected through the normal `TrackingReceiver`, and its
+  presenter consumes `FrameSource` snapshots through a latest-frame-only queue, waiting on the
+  snapshot's shared event on the GPU. `Session::EndFrame` must stay non-blocking on that path
+  too. Only one process can hold the headset's camera interface, so hardware tests must not
+  run concurrently.
 
 ## Runtime Files And Registration
 
