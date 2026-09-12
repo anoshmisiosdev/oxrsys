@@ -32,7 +32,8 @@ drivers/
 │   └── t_euroc_recorder_stub.c    # no-op dataset recorder (real one needs OpenCV)
 └── tools/
     ├── wmr_probe.c                # oxrsys_wmr_probe
-    └── wmr_display.mm             # oxrsys_wmr_display
+    ├── wmr_display.mm             # oxrsys_wmr_display
+    └── wmr_edid_override.py       # macOS display override generator (see below)
 ```
 
 The library target is `oxrsys_monado_wmr`. Monado sources are compiled with
@@ -126,19 +127,51 @@ into the drawable. The panel texture is CPU-shared only so `--screenshot` can
 read it; the runtime integration should render the warp straight into the
 drawable.
 
+### macOS hides the panel: the EDID override
+
+This is the expected first failure, and it is a policy, not a fault. Every
+WMR headset's EDID carries Microsoft's vendor block (OUI CA-12-5C) that
+declares the panel a non-desktop head-mounted display. macOS reads it, builds
+a display pipe for the panel (visible in `ioreg` as a `dispext` framebuffer
+with the right resolution), and then keeps the display off the desktop: it is
+never returned by `CGGetOnlineDisplayList`, so nothing can be drawn on it and
+the tool reports that no display appeared even though the HDMI link trained.
+
+Apple's display overrides can patch EDID bytes before they are interpreted
+(`edid-patches`, the same mechanism Apple ships fixes with under
+`/System/Library/Displays`). `drivers/tools/wmr_edid_override.py` reads the
+EDID from IOKit, rewrites the Microsoft block's tag to a reserved value so it
+is skipped, fixes the extension checksum, and writes the override:
+
+```bash
+python3 drivers/tools/wmr_edid_override.py                 # show the patch
+sudo python3 drivers/tools/wmr_edid_override.py --install  # write it
+```
+
+Then unplug and replug the headset's video cable (or sleep and wake). The
+panel should now be listed by `--list-displays` at its native size; run the
+display tool as usual. To undo, delete the file the tool printed under
+`/Library/Displays/Contents/Resources/Overrides/`.
+
+Verified on a Dell Visor (EDID vendor `10ac`, product `7fce`): the block sits
+at byte 146 with usage byte `0x07` (VR headset, no desktop use), and the
+patch changes two bytes.
+
 ### Troubleshooting a blank panel
 
 The tool prints a status line every two seconds (frames, fps, whether the
 display link or the fallback timer is pacing, drawable size, window
 visibility). Read it together with the display lines printed at start-up.
 
-- **Uniform light gray, and the tool said no display appeared.** The panel's
-  backlight is on but macOS never brought up a DisplayPort link, and a backlit
-  LCD with no pixel data is light gray. Check `--list-displays` while the
-  headset is on: if only the built-in display is listed, the problem is the
-  cable or adapter. 4320x2160 at 90 Hz needs DP 1.4 HBR3 end to end; many
-  USB-C to DisplayPort cables and hubs only carry HBR2. Also plug USB before
-  running the tool, since the panel only enables its DP link after the
+- **Uniform light gray, and the tool said no display appeared.** A backlit LCD
+  with no pixel data is light gray. First check for the EDID override case
+  above: if `ioreg -l | grep '"ProductName" = "MR"'` finds the panel, macOS
+  has the link and is hiding the display. If IOKit has no EDID for it, macOS
+  never brought up the video link: check the cable or adapter. Headsets
+  differ: the Dell Visor, Lenovo Explorer, Acer, and Samsung Odyssey use HDMI
+  2.0 (2880x1440 at 90 Hz needs a 400 MHz pixel clock, beyond HDMI 1.4
+  adapters), the Reverb G1/G2 use DisplayPort 1.3/1.4. Plug USB before
+  running the tool, since the panel only enables its video link after the
   activate command.
 - **A new display appeared but with a smaller mode.** The link came up at
   reduced bandwidth. The tool uses the largest mode and scales; the image will

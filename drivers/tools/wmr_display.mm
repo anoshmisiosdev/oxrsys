@@ -1267,9 +1267,11 @@ on_signal(int sig)
 		if (display == kCGNullDirectDisplay) {
 			fprintf(stderr,
 			        "No new display appeared and none has a %ux%u mode.\n"
-			        "macOS never brought up a DisplayPort link to the panel. A backlit panel with no\n"
-			        "signal looks light gray. Check the DP cable/adapter (4320x2160@90 needs DP 1.4 HBR3),\n"
-			        "then re-run; pass --display-id to force a display listed below.\n",
+			        "Either macOS has no video link to the panel (a backlit panel with no signal looks\n"
+			        "light gray; check the HDMI/DisplayPort cable and adapter bandwidth), or macOS read\n"
+			        "the panel's EDID and is hiding it because of Microsoft's head-mounted-display flag.\n"
+			        "Run drivers/tools/wmr_edid_override.py to check for the flag and install the\n"
+			        "override that hides it, then replug the video cable. --display-id forces a display.\n",
 			        src->panel_w, src->panel_h);
 			list_online_displays(stderr, true);
 			return NO;
