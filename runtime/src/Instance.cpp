@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MPL-2.0
 
 #include "Instance.h"
+#include "Config.h"
 #include "Runtime.h"
+#include "WiredHeadset.h"
 #include <algorithm>
 #include <cstring>
 #include <spdlog/spdlog.h>
@@ -31,6 +33,20 @@ XrResult Instance::GetSystem(const XrSystemGetInfo* getInfo, XrSystemId* systemI
     if (getInfo->formFactor != XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY)
     {
         return XR_ERROR_FORM_FACTOR_UNSUPPORTED;
+    }
+
+    // A wired headset must be open before the app asks for view sizes, so its
+    // panel's eye size is what xrEnumerateViewConfigurationViews recommends.
+    if (WiredHeadset::Shared().EnsureOpen(Config::Get().GetValues()))
+    {
+        WiredHeadset& wired = WiredHeadset::Shared();
+        if (wired.GetEyeWidth() > 0 && wired.GetEyeHeight() > 0)
+        {
+            EyeWidth = wired.GetEyeWidth();
+            EyeHeight = wired.GetEyeHeight();
+        }
+        spdlog::info("OXRSys: wired headset '{}' active, recommending {}x{} per eye",
+                     wired.GetName(), EyeWidth, EyeHeight);
     }
 
     systemRequested_ = true;

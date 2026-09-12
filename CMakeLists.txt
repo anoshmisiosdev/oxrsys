@@ -86,11 +86,14 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(OpenXR)
 
+# --- Wired-headset drivers (Monado-derived) ---
+# Declared before the runtime so the option and the oxrsys_monado_wmr target
+# exist when runtime/CMakeLists.txt decides whether to link them.
+option(OXRSYS_BUILD_WMR_DRIVER "Build the Monado-derived Windows Mixed Reality headset driver" ${APPLE})
+add_subdirectory(drivers)
+
 # --- Our runtime ---
 add_subdirectory(runtime)
-
-# --- Wired-headset drivers (Monado-derived) ---
-add_subdirectory(drivers)
 
 find_package(Vulkan REQUIRED)
 

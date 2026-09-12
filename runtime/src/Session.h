@@ -142,8 +142,12 @@ private:
     std::vector<DebugUtilsLabelState> debugUtilsLabelRegions_;
     std::optional<DebugUtilsLabelState> debugUtilsInsertedLabel_;
 
-    // Streaming state
+    // Streaming state. A wired headset (WiredHeadset::Shared()) takes the place
+    // of the streaming server when one is open; wiredActive_ records that this
+    // session attached to it.
     bool streamingStarted_ = false;
+    bool wiredActive_ = false;
     void StartStreamingIfNeeded();
     void CheckStreamingConnection();
+    void StopStreaming();
 };

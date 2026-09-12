@@ -25,6 +25,8 @@ This file tracks user-facing, integration-facing, and runtime-relevant changes f
 - Added a runtime ABR controller with `off`, `bitrate`, and `full` modes, sliding-window hysteresis, fast bitrate downshift, slow recovery, and profile reporting for future session-safe resolution/foveation/upscaling transitions.
 - Added `drivers/`: the Monado Windows Mixed Reality headset driver built on macOS from a commit-pinned upstream checkout, with a hidapi HID backend, hidapi-based headset enumeration, and the `oxrsys_wmr_probe` bring-up tool that prints IMU orientation. Not yet connected to the OpenXR runtime.
 - Added `oxrsys_wmr_display`, which captures a Windows Mixed Reality headset's panel as a macOS display and renders an IMU-driven, distortion-corrected stereo test scene onto it with Metal, with a `--simulate` mode for checking the render path without hardware.
+- Added `wmr_edid_override.py`, which writes the macOS display override that stops macOS hiding WMR panels as non-desktop head-mounted displays.
+- Added a wired-headset runtime backend (`WiredHeadset`, `wired_headset = true`): a Windows Mixed Reality headset replaces the streaming client, the runtime recommends the panel's eye size, paces at its refresh rate, takes orientation from its IMU, and presents projection layers on the panel through the lens distortion warp. Plus `oxrsys_wmr_xr_smoke`, a native OpenXR client for checking it end to end.
 
 ### Changed
 

@@ -74,8 +74,10 @@ public:
     void SetDebugUtilsObjectName(XrObjectType objectType, uint64_t objectHandle, const char* objectName);
     std::string GetDebugUtilsObjectName(XrObjectType objectType, uint64_t objectHandle) const;
 
-    static constexpr uint32_t EyeWidth = 1512;
-    static constexpr uint32_t EyeHeight = 1680;
+    // Recommended per-eye swapchain size. The streaming default is overridden
+    // with the panel's eye size when a wired headset opens at xrGetSystem time.
+    static inline uint32_t EyeWidth = 1512;
+    static inline uint32_t EyeHeight = 1680;
 
 private:
     struct DebugUtilsObjectKey

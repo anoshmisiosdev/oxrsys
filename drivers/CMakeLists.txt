@@ -8,8 +8,8 @@
 # add_subdirectory() on it. Everything platform specific that Monado lacks for
 # macOS (a HID backend, device enumeration) lives in drivers/monado/.
 
-option(OXRSYS_BUILD_WMR_DRIVER "Build the Monado-derived Windows Mixed Reality headset driver" ${APPLE})
-
+# The option itself is declared in the top-level CMakeLists.txt, before the
+# runtime, so the runtime can test it.
 if(NOT OXRSYS_BUILD_WMR_DRIVER)
     return()
 endif()
@@ -175,6 +175,11 @@ set(OXRSYS_MONADO_PLATFORM_SOURCES
     monado/u_file_macos.c
     monado/wmr_macos.c
 )
+if(APPLE)
+    # Objective-C++: presents warped eye images on the panel through Metal.
+    list(APPEND OXRSYS_MONADO_PLATFORM_SOURCES monado/wmr_panel.mm)
+    set_source_files_properties(monado/wmr_panel.mm PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-fobjc-arc")
+endif()
 
 add_library(oxrsys_monado_wmr STATIC
     ${OXRSYS_MONADO_WMR_SOURCES}
@@ -203,6 +208,9 @@ target_compile_definitions(oxrsys_monado_wmr
         CJSON_HIDE_SYMBOLS
         _GNU_SOURCE
 )
+# The runtime dylib is loaded into arbitrary apps; keep Monado's symbols out of
+# its export table.
+target_compile_options(oxrsys_monado_wmr PRIVATE -fvisibility=hidden)
 target_compile_features(oxrsys_monado_wmr PRIVATE c_std_11 cxx_std_20)
 
 # Third-party code is compiled warning-free rather than fixed up locally.
@@ -212,7 +220,10 @@ set_source_files_properties(
     PROPERTIES COMPILE_OPTIONS "-w"
 )
 set_source_files_properties(
-    ${OXRSYS_MONADO_PLATFORM_SOURCES}
+    monado/os_hid_hidapi.c
+    monado/t_euroc_recorder_stub.c
+    monado/u_file_macos.c
+    monado/wmr_macos.c
     PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra"
 )
 
@@ -222,6 +233,15 @@ target_link_libraries(oxrsys_monado_wmr
         PkgConfig::OXRSYS_LIBUSB
         Threads::Threads
 )
+if(APPLE)
+    target_link_libraries(oxrsys_monado_wmr
+        PUBLIC
+            "-framework AppKit"
+            "-framework CoreGraphics"
+            "-framework Metal"
+            "-framework QuartzCore"
+    )
+endif()
 
 # --- Probe tool ------------------------------------------------------------
 # Opens the first Windows Mixed Reality headset on the USB bus and prints its
@@ -230,6 +250,21 @@ add_executable(oxrsys_wmr_probe tools/wmr_probe.c)
 target_compile_features(oxrsys_wmr_probe PRIVATE c_std_11)
 target_compile_options(oxrsys_wmr_probe PRIVATE -Wall -Wextra)
 target_link_libraries(oxrsys_wmr_probe PRIVATE oxrsys_monado_wmr)
+
+# --- OpenXR smoke tool ------------------------------------------------------
+# Native OpenXR client (loader -> runtime -> WiredHeadset): the end-to-end
+# check that a wired headset works through the runtime.
+if(APPLE)
+    add_executable(oxrsys_wmr_xr_smoke tools/wmr_xr_smoke.mm)
+    target_compile_options(oxrsys_wmr_xr_smoke PRIVATE -Wall -Wextra -fobjc-arc)
+    target_compile_definitions(oxrsys_wmr_xr_smoke PRIVATE XR_USE_GRAPHICS_API_METAL)
+    target_include_directories(oxrsys_wmr_xr_smoke PRIVATE "${openxr_SOURCE_DIR}/include")
+    target_link_libraries(oxrsys_wmr_xr_smoke PRIVATE
+        OpenXR::openxr_loader
+        "-framework Foundation"
+        "-framework Metal"
+    )
+endif()
 
 # --- Display tool ----------------------------------------------------------
 # Captures the headset's panel as a macOS display and renders a

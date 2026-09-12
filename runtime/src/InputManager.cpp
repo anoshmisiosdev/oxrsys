@@ -487,8 +487,8 @@ void InputManager::GetEyeViews(XrView* views, uint32_t viewCount) const
             const ConfigValues config = Config::Get().GetValues();
             float fovDeg = static_cast<float>(config.fovDegrees);
             float halfAngleV = fovDeg * 0.5f * 3.14159265f / 180.0f;
-            constexpr float aspect = static_cast<float>(Instance::EyeWidth) /
-                                      static_cast<float>(Instance::EyeHeight);
+            const float aspect = static_cast<float>(Instance::EyeWidth) /
+                                 static_cast<float>(Instance::EyeHeight);
             float halfAngleH = std::atan(std::tan(halfAngleV) * aspect);
             views[i].fov.angleLeft = -halfAngleH;
             views[i].fov.angleRight = halfAngleH;

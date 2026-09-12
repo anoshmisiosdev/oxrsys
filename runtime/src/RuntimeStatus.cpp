@@ -121,6 +121,11 @@ std::string DeviceTypeForClientName(std::string clientName)
     {
         return "vision_pro";
     }
+    if (clientName.find("mixed reality") != std::string::npos ||
+        clientName.find("wmr") != std::string::npos)
+    {
+        return "wmr";
+    }
     if (clientName.find("simulator") != std::string::npos ||
         clientName.find("viewer") != std::string::npos)
     {

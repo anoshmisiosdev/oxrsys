@@ -80,6 +80,22 @@ abr_mode = "bitrate"
 # AUDIO_OUTPUT capability.
 headset_audio = false
 
+[wired]
+# Wired headset (Windows Mixed Reality through the Monado driver, macOS only).
+# When true and a headset is plugged in at xrGetSystem time, it replaces the
+# streaming client: tracking comes from the headset's own sensors and frames are
+# shown on its panel through the lens distortion warp. The panel must be visible
+# to macOS as a display; see docs/platforms/wmr.md for the EDID override.
+wired_headset = false
+
+# CGDirectDisplayID of the panel. 0 = auto-detect (a display with a mode of the
+# panel's size, or the display that hot-plugs after the headset switches on).
+wired_display_id = 0
+
+# Head tracking is orientation-only for now; the head is reported at this
+# height above the STAGE floor, in meters.
+wired_eye_height_m = 1.6
+
 [logging]
 # Write server logs to the platform state directory.
 #   macOS: ~/Library/Application Support/OXRSys/oxrsys-runtime.log

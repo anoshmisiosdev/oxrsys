@@ -354,6 +354,26 @@ ConfigValues ParseConfigToml(std::istream& input, const ConfigValues& defaults)
                     values.stageHeightOffsetM = val;
                 }
             }
+            else if (key == "wired_headset")
+            {
+                values.wiredHeadset = ParseBool(value);
+            }
+            else if (key == "wired_display_id")
+            {
+                long long val = std::stoll(value);
+                if (val >= 0 && val <= 0xFFFFFFFFLL)
+                {
+                    values.wiredDisplayId = static_cast<uint32_t>(val);
+                }
+            }
+            else if (key == "wired_eye_height_m")
+            {
+                float val = std::stof(value);
+                if (val >= 0.0f && val <= 3.0f)
+                {
+                    values.wiredEyeHeightM = val;
+                }
+            }
             else if (key == "keyframe_interval_sec")
             {
                 int val = std::stoi(value);

@@ -52,6 +52,14 @@ struct ConfigValues
     // is miscalibrated so a standing player stands at the wrong height in-game.
     float stageHeightOffsetM = 0.0f;
 
+    // Wired headset (Windows Mixed Reality through the Monado driver). When
+    // enabled and a headset is connected at xrGetSystem time, it replaces the
+    // streaming client: tracking comes from the headset and frames are shown
+    // on its panel. Off by default so streaming setups are unaffected.
+    bool wiredHeadset = false;
+    uint32_t wiredDisplayId = 0;     // CGDirectDisplayID of the panel; 0 = auto-detect
+    float wiredEyeHeightM = 1.6f;    // Orientation-only tracking reports the head at this height
+
     bool fileLogging = true;        // Write logs to oxrsys-runtime.log
     bool questLogcat = false;       // Capture Quest logcat to oxrsys-headset.log
 };
