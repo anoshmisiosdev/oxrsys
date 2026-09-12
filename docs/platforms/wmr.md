@@ -250,6 +250,51 @@ With `wired_headset = true` in the config, the panel shows the grid and the
 log reports the session presenting on the headset at 90 Hz with the panel's
 eye size recommended.
 
+### Camera monitor
+
+To see what the headset's tracking cameras see, and what the trackers make
+of it, start the helper with `--monitor` (or `OXRSYS_HEADSET_MONITOR=1` in
+its environment):
+
+```bash
+./build/runtime/headset_helper/oxrsys-headset-helper --monitor --vit-library /path/to/libbasalt.dylib
+```
+
+A normal window titled "OXRSys headset cameras" opens on a desktop screen
+(never on the headset's captured display) with both 640x480 camera images
+side by side at about 30 Hz, and over them:
+
+- **Squares: the features Basalt is tracking**, at the image position it
+  reports for the latest pose. The colour is the estimated depth, warm
+  (orange) for near and cool (blue) for far, gray when unknown. A filled
+  square is a feature that was already in the previous pose (tracked); a
+  hollow square is new in this one. A healthy scene has a few dozen mostly
+  filled squares per camera; all hollow means the tracker keeps losing and
+  re-detecting, none at all means it is not getting frames or has no VIT
+  library.
+- **A circle in camera 0: the PS Move sphere** when the sphere tracker is
+  active and reports a position, projected with the camera's pinhole
+  parameters from the headset's calibration (distortion ignored, so it
+  drifts a little towards the image edges).
+- **Two status lines**: the head tracking kind (`6DoF (Basalt)` or
+  `3DoF (IMU)` with `no VIT library` / `IMU only` when SLAM is off), the head
+  position, poses per second from the tracker, feature counts per camera,
+  IMU and image samples pushed, and each camera's frame rate in its label.
+
+Closing the window hides it; the helper keeps running. The frames come from
+`oxrsys_wmr_camera_tap` (`drivers/monado/wmr_camera_tap.c`), which splits
+them off next to the SLAM tracker without delaying it.
+
+The features need `liboxrsys-vit-monitor.dylib` next to the helper (the
+build puts it there, `runtime/headset_helper/`; deploy it with the helper).
+It is a VIT plugin that forwards every call to the real library named by
+`OXRSYS_VIT_REAL_LIBRARY` and records the pose features on the way
+(`drivers/monado/vit_monitor.h`). With `--monitor`, the helper sets that
+variable to the Basalt it found and loads the tracker through the shim;
+without `--monitor` the tracker is loaded directly and nothing changes. When
+the shim is missing the window still shows the camera images, only without
+the squares.
+
 ## Controllers
 
 Three kinds of controller work with the wired backend, all orientation-only

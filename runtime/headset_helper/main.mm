@@ -12,14 +12,24 @@
 // HeadsetHelperIpc.h for the protocol.
 //
 //   oxrsys-headset-helper [--socket PATH] [--display-id ID] [--no-capture]
+//                         [--vit-library PATH|none] [--monitor]
 //                         [--log-level trace|debug|info|warn|error]
+//
+// --monitor (or OXRSYS_HEADSET_MONITOR=1) opens a window on a desktop screen
+// showing the tracking cameras with Basalt's features and the tracked PS Move
+// sphere drawn over them (CameraMonitor.h). For the features the tracker is
+// loaded through the VIT monitor shim next to this executable
+// (liboxrsys-vit-monitor.dylib, drivers/monado/vit_monitor.h).
 //
 // Native arm64 only: it links the Monado driver and Metal directly.
 
 #define OXRSYS_ENC_IPC_WANT_MACH 1
+#include "CameraMonitor.h"
 #include "HeadsetHelperIpc.h"
 
 #include "psmv_macos.h"
+#include "vit_monitor.h"
+#include "wmr_camera_tap.h"
 #include "wmr_macos.h"
 #include "wmr_panel.h"
 #include "wmr_psmv_tracking.h"
@@ -363,6 +373,8 @@ struct Options
 	//! VIT plugin (Basalt) for 6DoF head tracking; empty = search the usual
 	//! places, "none" = IMU only.
 	std::string vitLibrary;
+	//! Camera monitor window (--monitor / OXRSYS_HEADSET_MONITOR=1).
+	bool monitor = false;
 };
 
 struct ClientState
@@ -399,7 +411,15 @@ struct Helper
 	struct oxrsys_wmr_slam* slam = nullptr;
 	std::string controllerKind = "none";
 	std::string trackingKind = "3DoF (IMU)";
+	//! Why there is no SLAM; empty when there is.
+	std::string slamNote;
 	float eyeHeightM = 1.6f;
+
+	// Camera monitor (--monitor): the frame tap feeding the window, and the
+	// VIT monitor shim the tracker was loaded through (empty: directly).
+	struct oxrsys_wmr_camera_tap* tap = nullptr;
+	oxrsys::CameraMonitor* monitor = nullptr;
+	std::string vitShimPath;
 
 	// Metal.
 	id<MTLDevice> device = nil;
@@ -412,6 +432,9 @@ struct Helper
 	std::mutex poseMutex;
 	oxr::protocol::TrackingPacket latestPacket = {};
 	bool haveHead = false;
+	//! A sphere-tracked controller's position in camera 0's frame, for the monitor.
+	bool controllerCamPosValid = false;
+	struct xrt_vec3 controllerCamPos = {};
 
 	// Client.
 	std::mutex clientMutex;
@@ -728,6 +751,8 @@ TrackingLoop()
 		packet.ipd = 0.063f;
 		for (int i = 0; i < 4; i++) packet.eyeFov[i] = g.geometry.views[0].fov[i];
 
+		bool camPosValid = false;
+		struct xrt_vec3 camPos = {};
 		for (int h = 0; h < 2; h++) {
 			struct xrt_device* ctrl = g.controllers[h];
 			if (ctrl == nullptr) continue;
@@ -741,6 +766,10 @@ TrackingLoop()
 			struct xrt_vec3 offset;
 			if ((cr.relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT) != 0) {
 				offset = quat_rotate(rel.pose.orientation, cr.pose.position);
+				if (!camPosValid && g.sphereTracking != nullptr) {
+					camPosValid = true;
+					camPos = cr.pose.position;
+				}
 			} else {
 				offset = YawRotate(rel.pose.orientation, left ? -0.18f : 0.18f, -0.35f, -0.40f);
 			}
@@ -760,6 +789,8 @@ TrackingLoop()
 			std::lock_guard<std::mutex> lock(g.poseMutex);
 			g.latestPacket = packet;
 			g.haveHead = valid;
+			g.controllerCamPosValid = camPosValid;
+			g.controllerCamPos = camPos;
 		}
 		if (auto c = CurrentClient()) {
 			std::vector<uint8_t> p((const uint8_t*)&packet, (const uint8_t*)&packet + sizeof(packet));
@@ -918,6 +949,18 @@ RenderLoop()
  *
  */
 
+//! Directory of this executable ("" if unknown).
+static std::string
+ExecutableDir()
+{
+	char exe[PATH_MAX];
+	uint32_t size = sizeof(exe);
+	if (_NSGetExecutablePath(exe, &size) != 0) return std::string();
+	std::string dir = exe;
+	const size_t slash = dir.find_last_of('/');
+	return slash != std::string::npos ? dir.substr(0, slash) : std::string();
+}
+
 static std::string
 FindVitLibrary()
 {
@@ -932,13 +975,8 @@ FindVitLibrary()
 	// Otherwise the usual places: next to this executable, then the user's
 	// OXRSys support directory.
 	std::vector<std::string> candidates;
-	char exe[PATH_MAX];
-	uint32_t size = sizeof(exe);
-	if (_NSGetExecutablePath(exe, &size) == 0) {
-		std::string dir = exe;
-		const size_t slash = dir.find_last_of('/');
-		if (slash != std::string::npos) candidates.push_back(dir.substr(0, slash) + "/libbasalt.dylib");
-	}
+	const std::string dir = ExecutableDir();
+	if (!dir.empty()) candidates.push_back(dir + "/libbasalt.dylib");
 	if (const char* home = getenv("HOME")) {
 		candidates.push_back(std::string(home) + "/Library/Application Support/OXRSys/libbasalt.dylib");
 	}
@@ -948,25 +986,92 @@ FindVitLibrary()
 	return std::string();
 }
 
+//! The VIT monitor shim, built next to this executable; "" when absent.
+static std::string
+FindVitMonitorShim()
+{
+	const std::string dir = ExecutableDir();
+	if (dir.empty()) return std::string();
+	const std::string path = dir + "/liboxrsys-vit-monitor.dylib";
+	return access(path.c_str(), R_OK) == 0 ? path : std::string();
+}
+
 static void
 StartHeadTracking()
 {
 	if (!oxrsys_wmr_slam_available()) {
 		LOGI("6DoF head tracking not built into this helper (OXRSYS_WMR_OPENCV); IMU orientation only");
+		g.slamNote = "IMU only";
 		return;
 	}
 	const std::string lib = FindVitLibrary();
 	if (lib.empty()) {
 		LOGI("no VIT library (libbasalt.dylib) found; IMU orientation only. See docs/platforms/wmr.md (6DoF)");
+		g.slamNote = "no VIT library";
 		return;
 	}
-	const enum oxrsys_wmr_slam_result r = oxrsys_wmr_slam_create(g.headset->hmd, lib.c_str(), g.opts.logLevel, &g.slam);
+
+	// With the monitor, load the tracker through the shim so the window can
+	// see the features; the shim forwards everything to the real library.
+	std::string load = lib;
+	if (g.opts.monitor) {
+		const std::string shim = FindVitMonitorShim();
+		if (shim.empty()) {
+			LOGW("camera monitor: liboxrsys-vit-monitor.dylib not found next to the helper; no feature overlay");
+		} else {
+			setenv(OXRSYS_VIT_MONITOR_REAL_LIBRARY_ENV, lib.c_str(), 1);
+			load = shim;
+			g.vitShimPath = shim;
+		}
+	}
+
+	const enum oxrsys_wmr_slam_result r = oxrsys_wmr_slam_create(g.headset->hmd, load.c_str(), g.opts.logLevel, &g.slam);
 	if (r != OXRSYS_WMR_SLAM_OK) {
 		LOGW("6DoF head tracking unavailable (%s); IMU orientation only", oxrsys_wmr_slam_result_str(r));
+		g.slamNote = "IMU only";
+		g.vitShimPath.clear();
 		return;
 	}
 	g.trackingKind = "6DoF (Basalt)";
-	LOGI("6DoF head tracking through %s", lib.c_str());
+	LOGI("6DoF head tracking through %s%s", lib.c_str(), g.vitShimPath.empty() ? "" : " (via the VIT monitor shim)");
+}
+
+/*
+ * Camera monitor: the tap copies every frame into the window's buffers on
+ * the camera thread; the window asks for the rest on the main thread.
+ */
+static void
+MonitorTapCallback(void* userdata, uint32_t cam, const struct xrt_frame* frame)
+{
+	auto* monitor = static_cast<oxrsys::CameraMonitor*>(userdata);
+	if (frame == nullptr || frame->format != XRT_FORMAT_L8) return;
+	monitor->PushFrame(cam, frame->data, frame->width, frame->height, frame->stride, frame->timestamp);
+}
+
+static void
+MonitorInfo(oxrsys::CameraMonitorInfo& info)
+{
+	info.trackingKind = g.trackingKind;
+	info.slamNote = g.slamNote;
+	std::lock_guard<std::mutex> lock(g.poseMutex);
+	info.haveHeadPosition = g.haveHead && g.slam != nullptr;
+	for (int i = 0; i < 3; i++) info.headPosition[i] = g.latestPacket.headPosition[i];
+	info.controllerPositionValid = g.controllerCamPosValid;
+	info.controllerPosition[0] = g.controllerCamPos.x;
+	info.controllerPosition[1] = g.controllerCamPos.y;
+	info.controllerPosition[2] = g.controllerCamPos.z;
+}
+
+static void
+StartCameraTap()
+{
+	g.monitor = new oxrsys::CameraMonitor();
+	g.monitor->SetIntrinsicsFromHeadset(g.headset->hmd);
+	g.tap = oxrsys_wmr_camera_tap_create(g.headset->hmd, oxrsys_wmr_slam_sinks(g.slam), MonitorTapCallback, g.monitor,
+	                                     g.opts.logLevel);
+	if (g.tap == nullptr) {
+		LOGW("camera monitor: could not tap the headset cameras; the window will stay empty");
+	}
 }
 
 static bool
@@ -999,6 +1104,12 @@ OpenHeadset()
 	// Head: 6DoF through Basalt when available, else the IMU.
 	StartHeadTracking();
 
+	// Camera monitor: tap the frames next to the tracker. Consumers attached
+	// later must share with the tap's sinks, not the tracker's.
+	if (g.opts.monitor) StartCameraTap();
+	const struct xrt_slam_sinks* cameraSinks =
+	    g.tap != nullptr ? oxrsys_wmr_camera_tap_sinks(g.tap) : oxrsys_wmr_slam_sinks(g.slam);
+
 	// Controllers: the headset's own, else PS Moves (sphere-tracked with OpenCV).
 	if (g.headset->left != nullptr || g.headset->right != nullptr) {
 		g.controllers[0] = g.headset->left;
@@ -1008,7 +1119,7 @@ OpenHeadset()
 		LOGI("no PS Move controller connected over Bluetooth; controllers none");
 	} else {
 		struct xrt_tracking_factory* factory = oxrsys_wmr_psmv_tracking_create(
-		    g.headset->hmd, oxrsys_wmr_slam_sinks(g.slam), g.opts.logLevel, &g.sphereTracking);
+		    g.headset->hmd, cameraSinks, g.opts.logLevel, &g.sphereTracking);
 		oxrsys_psmv_set_tracking_factory(factory);
 		if (oxrsys_psmv_open_all(g.opts.logLevel, g.psmv, 4, &g.psmvCount) == OXRSYS_PSMV_OPEN_OK) {
 			g.controllers[1] = g.psmv[0]->xdev;
@@ -1103,7 +1214,14 @@ Shutdown()
 	for (size_t i = 0; i < g.psmvCount; i++) oxrsys_psmv_close(&g.psmv[i]);
 	oxrsys_psmv_set_tracking_factory(nullptr);
 	oxrsys_wmr_psmv_tracking_destroy(&g.sphereTracking);
+	// Attached after the SLAM tracker, so detached before it.
+	oxrsys_wmr_camera_tap_destroy(&g.tap);
 	oxrsys_wmr_slam_destroy(&g.slam);
+	if (g.monitor) {
+		g.monitor->Close();
+		delete g.monitor;
+		g.monitor = nullptr;
+	}
 	if (g.panel) {
 		g.panel->Close();
 		delete g.panel;
@@ -1145,6 +1263,8 @@ main(int argc, char** argv)
 			g.opts.capture = false;
 		} else if (strcmp(argv[i], "--vit-library") == 0 && hasValue) {
 			g.opts.vitLibrary = argv[++i];
+		} else if (strcmp(argv[i], "--monitor") == 0) {
+			g.opts.monitor = true;
 		} else if (strcmp(argv[i], "--log-level") == 0 && hasValue) {
 			const char* l = argv[++i];
 			g.opts.logLevel = strcmp(l, "trace") == 0 ? U_LOGGING_TRACE
@@ -1155,10 +1275,13 @@ main(int argc, char** argv)
 		} else {
 			fprintf(stderr,
 			        "usage: %s [--socket PATH] [--display-id ID] [--no-capture] [--vit-library PATH|none] "
-			        "[--log-level LEVEL]\n",
+			        "[--monitor] [--log-level LEVEL]\n",
 			        argv[0]);
 			return 2;
 		}
+	}
+	if (const char* env = getenv("OXRSYS_HEADSET_MONITOR")) {
+		if (strcmp(env, "1") == 0 || strcmp(env, "true") == 0) g.opts.monitor = true;
 	}
 	static const char* levelNames[] = {"trace", "debug", "info", "warn", "error"};
 	if (g.opts.logLevel <= U_LOGGING_ERROR) {
@@ -1180,6 +1303,11 @@ main(int argc, char** argv)
 		if (!OpenHeadset() || !SetupMetal() || !SetupSocket()) {
 			Shutdown();
 			return 1;
+		}
+		if (g.monitor != nullptr) {
+			// On a desktop screen, never on the (captured) panel.
+			g.monitor->Open(g.panel->DisplayId(), g.vitShimPath, MonitorInfo);
+			LOGI("camera monitor window open%s", g.vitShimPath.empty() ? " (no feature overlay)" : "");
 		}
 		g.trackingThread = std::thread(TrackingLoop);
 		g.renderThread = std::thread(RenderLoop);

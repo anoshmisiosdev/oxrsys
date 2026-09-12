@@ -359,6 +359,28 @@ if(APPLE)
     )
 endif()
 
+# --- VIT monitor shim ------------------------------------------------------
+# liboxrsys-vit-monitor.dylib: a VIT plugin that forwards to the real one
+# (Basalt) and records the features it tracks, for the headset helper's
+# camera monitor window. Plain C on libSystem, no Monado code; it only needs
+# the VIT interface header from the Monado checkout. The helper's
+# CMakeLists.txt puts it next to the helper executable, where the helper
+# looks for it.
+if(APPLE AND NOT OXRSYS_WMR_CROSS_ARCH)
+    add_library(oxrsys_vit_monitor SHARED monado/vit_monitor.c)
+    set_target_properties(oxrsys_vit_monitor PROPERTIES
+        OUTPUT_NAME "oxrsys-vit-monitor"
+        C_VISIBILITY_PRESET default
+    )
+    target_compile_features(oxrsys_vit_monitor PRIVATE c_std_11)
+    target_compile_options(oxrsys_vit_monitor PRIVATE -Wall -Wextra)
+    target_include_directories(oxrsys_vit_monitor PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/monado"
+        "${OXRSYS_MONADO_EXTERNAL}/vit_includes"
+    )
+    target_link_libraries(oxrsys_vit_monitor PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+endif()
+
 # --- Probe tool ------------------------------------------------------------
 # Opens the first Windows Mixed Reality headset on the USB bus and prints its
 # IMU-driven orientation. This is the hardware bring-up check for the driver.
