@@ -123,6 +123,14 @@ wired_eye_height_m = 1.6
 # dylib (also $OXRSYS_HEADSET_HELPER_PATH).
 wired_helper_path = ""
 
+# Positional (6DoF) head tracking through Basalt. The helper looks for
+# libbasalt.dylib next to itself and in ~/Library/Application Support/OXRSys/
+# (build it with drivers/tools/build_basalt.sh); without one, or with this set
+# to false, the head is tracked in orientation only at wired_eye_height_m.
+wired_position_tracking = true
+# Explicit path of the Basalt library instead of the search above.
+wired_vit_library = ""
+
 [logging]
 # Write server logs to the platform state directory.
 #   macOS: ~/Library/Application Support/OXRSys/oxrsys-runtime.log

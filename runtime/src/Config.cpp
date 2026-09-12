@@ -393,6 +393,19 @@ ConfigValues ParseConfigToml(std::istream& input, const ConfigValues& defaults)
                 }
                 values.wiredHelperPath = path;
             }
+            else if (key == "wired_position_tracking")
+            {
+                values.wiredPositionTracking = ParseBool(value);
+            }
+            else if (key == "wired_vit_library")
+            {
+                std::string path = value;
+                if (path.size() >= 2 && path.front() == '"' && path.back() == '"')
+                {
+                    path = path.substr(1, path.size() - 2);
+                }
+                values.wiredVitLibrary = path;
+            }
             else if (key == "keyframe_interval_sec")
             {
                 int val = std::stoi(value);
