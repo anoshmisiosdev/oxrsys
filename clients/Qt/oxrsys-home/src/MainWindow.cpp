@@ -785,10 +785,13 @@ QWidget* MainWindow::buildStreamingTab()
     wiredDisplayIdSpin_->setSpecialValueText("Auto-detect");
     wiredForm->addRow("Panel display ID", wiredDisplayIdSpin_);
     wiredLayout->addLayout(wiredForm);
+    wiredPositionTrackingCheckBox_ = new QCheckBox("Positional head tracking (6DoF, Basalt)", wiredHeadsetOptions_);
+    wiredLayout->addWidget(wiredPositionTrackingCheckBox_);
     auto* wiredHelp = secondaryLabel(
         "macOS only. The headset replaces the streaming client while it is plugged in over USB and "
-        "HDMI/DisplayPort. Head tracking is orientation-only; the eye height sets where the head sits "
-        "above the floor. macOS hides Windows Mixed Reality panels until the one-time EDID display "
+        "HDMI/DisplayPort. Positional tracking needs libbasalt.dylib next to the headset helper "
+        "(drivers/tools/build_basalt.sh); without it, or with the box unchecked, the head is tracked in "
+        "orientation only at the eye height. macOS hides Windows Mixed Reality panels until the one-time EDID display "
         "override is installed (drivers/tools/wmr_edid_override.py --install, then replug the video "
         "cable); without it the panel stays black. See docs/platforms/wmr.md. Controllers: Windows "
         "Mixed Reality motion controllers over Bluetooth, or PlayStation Move.");
@@ -904,6 +907,7 @@ QWidget* MainWindow::buildStreamingTab()
     connect(configTransportCombo_, qOverload<int>(&QComboBox::currentIndexChanged), this, connectConfigChanged);
     connect(headsetModeCombo_, qOverload<int>(&QComboBox::currentIndexChanged), this, connectConfigChanged);
     connect(wiredEyeHeightSpin_, qOverload<double>(&QDoubleSpinBox::valueChanged), this, connectConfigChanged);
+    connect(wiredPositionTrackingCheckBox_, &QCheckBox::toggled, this, connectConfigChanged);
     connect(wiredDisplayIdSpin_, qOverload<int>(&QSpinBox::valueChanged), this, connectConfigChanged);
 
     auto* configButtons = new QHBoxLayout();
@@ -1227,7 +1231,7 @@ void MainWindow::refreshStreaming()
         refreshRateCombo_, encoderPresetCombo_, foveatedEncodingPresetCombo_,
         clientFoveationPresetCombo_, clientReprojectionCombo_, abrModeCombo_,
         configTransportCombo_, headsetModeCombo_, wiredEyeHeightSpin_, wiredDisplayIdSpin_,
-        usbDeviceCombo_,
+        wiredPositionTrackingCheckBox_, usbDeviceCombo_,
     };
     for (QWidget* control : controls)
     {
@@ -1255,6 +1259,7 @@ void MainWindow::refreshStreaming()
     headsetModeCombo_->setCurrentIndex(std::max(headsetModeCombo_->findData(config.wiredHeadset), 0));
     wiredEyeHeightSpin_->setValue(config.wiredEyeHeightM);
     wiredDisplayIdSpin_->setValue(config.wiredDisplayId);
+    wiredPositionTrackingCheckBox_->setChecked(config.wiredPositionTracking);
     wiredHeadsetOptions_->setVisible(config.wiredHeadset);
 
     usbDeviceCombo_->clear();
@@ -1451,6 +1456,7 @@ void MainWindow::updateConfigFromControls()
     config.wiredHeadset = headsetModeCombo_->currentData().toBool();
     config.wiredEyeHeightM = wiredEyeHeightSpin_->value();
     config.wiredDisplayId = wiredDisplayIdSpin_->value();
+    config.wiredPositionTracking = wiredPositionTrackingCheckBox_->isChecked();
     wiredHeadsetOptions_->setVisible(config.wiredHeadset);
 
     bitrateValueLabel_->setText(QString("%1 Mbps").arg(config.bitrateMbps));

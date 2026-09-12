@@ -256,6 +256,8 @@ QString ServerConfig::defaultText()
         "wired_headset = false\n"
         "wired_display_id = 0\n"
         "wired_eye_height_m = 1.6\n"
+        "# 6DoF head tracking through Basalt when libbasalt.dylib sits next to the headset helper.\n"
+        "wired_position_tracking = true\n"
         "\n"
         "[logging]\n"
         "file_logging = true\n"
@@ -365,6 +367,12 @@ ServerConfig ServerConfig::parse(const QString& text)
         config.wiredEyeHeightM = wiredEyeHeightM;
     }
 
+    const bool wiredPositionTracking = boolValue("wired_position_tracking", text, &ok);
+    if (ok)
+    {
+        config.wiredPositionTracking = wiredPositionTracking;
+    }
+
     const bool fileLogging = boolValue("file_logging", text, &ok);
     if (ok)
     {
@@ -410,6 +418,7 @@ QString ServerConfig::mergedInto(const QString& currentText) const
         {"wired_headset", boolString(wiredHeadset)},
         {"wired_display_id", QString::number(wiredDisplayId)},
         {"wired_eye_height_m", decimalString(wiredEyeHeightM)},
+        {"wired_position_tracking", boolString(wiredPositionTracking)},
     });
     text = upsertSection(text, "logging", {
         {"file_logging", boolString(fileLogging)},

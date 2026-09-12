@@ -109,6 +109,7 @@ private:
     QComboBox* headsetModeCombo_ = nullptr;
     QWidget* wiredHeadsetOptions_ = nullptr;
     QDoubleSpinBox* wiredEyeHeightSpin_ = nullptr;
+    QCheckBox* wiredPositionTrackingCheckBox_ = nullptr;
     QSpinBox* wiredDisplayIdSpin_ = nullptr;
     QComboBox* usbDeviceCombo_ = nullptr;
     QLabel* adbStatusLabel_ = nullptr;

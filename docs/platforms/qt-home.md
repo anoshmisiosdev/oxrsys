@@ -63,8 +63,8 @@ real capture/playback stream is implemented.
 
 The Headset section at the top of the Streaming tab mirrors the SwiftUI Home headset mode: the
 streaming default writes `wired.wired_headset = false`, and `Wired Windows Mixed Reality headset
-(USB)` writes `wired_headset = true` together with `wired_eye_height_m` and `wired_display_id`
-(`0` = auto-detect). The wired backend itself is macOS only (see
+(USB)` writes `wired_headset = true` together with `wired_eye_height_m`, `wired_display_id`
+(`0` = auto-detect) and `wired_position_tracking` (the 6DoF/Basalt checkbox). The wired backend itself is macOS only (see
 [wmr.md](wmr.md)); on other platforms the keys are written but ignored by the runtime. Runtime
 activity shows `Wired headset` / `Windows Mixed Reality (wired)` when the status file reports
 transport `wired` and device type `wmr`.

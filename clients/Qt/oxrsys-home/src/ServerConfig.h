@@ -29,6 +29,7 @@ struct ServerConfig
     bool wiredHeadset = false;
     int wiredDisplayId = 0;
     double wiredEyeHeightM = 1.6;
+    bool wiredPositionTracking = true;
     bool fileLogging = true;
     bool questLogcat = false;
 

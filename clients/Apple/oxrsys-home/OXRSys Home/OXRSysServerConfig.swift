@@ -25,6 +25,7 @@ struct OXRSysServerConfig: Equatable {
     var wiredHeadset = false
     var wiredDisplayId = 0
     var wiredEyeHeightM = 1.6
+    var wiredPositionTracking = true
     var fileLogging = true
     var questLogcat = false
 
@@ -98,9 +99,13 @@ struct OXRSysServerConfig: Equatable {
     # CGDirectDisplayID of the headset panel. 0 = auto-detect.
     wired_display_id = 0
 
-    # Head tracking is orientation-only; the head is reported at this height
-    # above the floor, in meters.
+    # Height of the eyes above the floor, in meters: where the head sits
+    # without positional tracking, and the starting height with it.
     wired_eye_height_m = 1.6
+
+    # Positional (6DoF) head tracking through Basalt when libbasalt.dylib is
+    # installed next to the headset helper; false = orientation only.
+    wired_position_tracking = true
 
     [logging]
     # Write server logs to ~/Library/Application Support/OXRSys/oxrsys-runtime.log.
@@ -164,6 +169,9 @@ struct OXRSysServerConfig: Equatable {
            (Self.minWiredEyeHeightM...Self.maxWiredEyeHeightM).contains(value) {
             config.wiredEyeHeightM = value
         }
+        if let value = boolValue("wired_position_tracking", in: text) {
+            config.wiredPositionTracking = value
+        }
         if let value = boolValue("file_logging", in: text) {
             config.fileLogging = value
         }
@@ -203,6 +211,7 @@ struct OXRSysServerConfig: Equatable {
                 ("wired_headset", boolString(wiredHeadset)),
                 ("wired_display_id", "\(wiredDisplayId)"),
                 ("wired_eye_height_m", decimalString(wiredEyeHeightM)),
+                ("wired_position_tracking", boolString(wiredPositionTracking)),
             ]),
             ("logging", [
                 ("file_logging", boolString(fileLogging)),

@@ -81,6 +81,7 @@ void testServerConfigRoundTrip()
         wired_headset = true
         wired_display_id = 69734400
         wired_eye_height_m = 1.75
+        wired_position_tracking = false
 
         [logging]
         quest_logcat = yes
@@ -100,6 +101,7 @@ void testServerConfigRoundTrip()
     expect(parsed.wiredHeadset, "Expected wired headset parse");
     expect(parsed.wiredDisplayId == 69734400, "Expected wired display id parse");
     expect(parsed.wiredEyeHeightM == 1.75, "Expected wired eye height parse");
+    expect(!parsed.wiredPositionTracking, "Expected wired position tracking parse");
     expect(parsed.questLogcat, "Expected quest_logcat parse");
 
     const QString merged = parsed.mergedInto(ServerConfig::defaultText());
@@ -116,6 +118,7 @@ void testServerConfigRoundTrip()
     expect(merged.contains("wired_headset = true"), "Expected wired headset serialization");
     expect(merged.contains("wired_display_id = 69734400"), "Expected wired display id serialization");
     expect(merged.contains("wired_eye_height_m = 1.75"), "Expected wired eye height serialization");
+    expect(merged.contains("wired_position_tracking = false"), "Expected wired position tracking serialization");
 }
 
 void testHomeModelResetsStreamingConfigToDefaults()

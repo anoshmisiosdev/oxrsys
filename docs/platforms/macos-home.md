@@ -183,6 +183,7 @@ The structured editor covers the current runtime keys:
 - `wired.wired_headset`
 - `wired.wired_display_id`
 - `wired.wired_eye_height_m`
+- `wired.wired_position_tracking`
 - `logging.file_logging`
 - `logging.quest_logcat`
 
@@ -215,8 +216,10 @@ PICO / visionOS / simulator)` is the default and writes `wired.wired_headset = f
 Mixed Reality headset (USB)` writes `wired_headset = true`: a Windows Mixed Reality headset plugged
 into the Mac over USB and HDMI/DisplayPort then replaces the streaming client (see
 [wmr.md](wmr.md)). With wired selected, the section also exposes `wired_eye_height_m` (`1.0` to
-`2.2` m, the head height above the floor while tracking is orientation-only) and
-`wired_display_id` (the panel's `CGDirectDisplayID`; `0` auto-detects), and reminds the user that
+`2.2` m, the head height above the floor without positional tracking, and the starting height
+with it), `wired_display_id` (the panel's `CGDirectDisplayID`; `0` auto-detects) and a
+`Positional head tracking (6DoF, Basalt)` toggle (`wired_position_tracking`, on by default; it
+only takes effect when `libbasalt.dylib` is installed next to the headset helper), and reminds the user that
 the one-time EDID display override from `drivers/tools/wmr_edid_override.py` is required before
 macOS shows the panel. Home does not edit `wired_helper_path`; the runtime looks for
 `oxrsys-headset-helper` next to the runtime dylib unless the key is set by hand.
@@ -247,8 +250,10 @@ The runtime reloads config file changes opportunistically:
   `foveated_encoding_preset`, `client_foveation_preset`, `client_upscaling`,
   `client_reprojection`, `abr_mode`, and `headset_audio` apply when streaming or the
   encoder/client connection is recreated
-- `wired_headset`, `wired_display_id`, and `wired_eye_height_m` are read when an app calls
-  `xrGetSystem`, so switching headset mode takes effect for the next OpenXR app launch
+- `wired_headset`, `wired_display_id`, `wired_eye_height_m` and `wired_position_tracking` are
+  read when an app calls `xrGetSystem` and passed to the headset helper when the runtime starts
+  it, so switching headset mode takes effect for the next OpenXR app launch (stop a running
+  helper first for the other keys)
 - file logger sink setup still requires a restart
 
 The Quest USB ADB section detects authorized `adb` devices, applies reverse mappings for ports `9944`, `9945`, and `9946`, then verifies them with `adb reverse --list`. This prepares the USB TCP transport; it is separate from Android `UsbManager` app permission prompts.
