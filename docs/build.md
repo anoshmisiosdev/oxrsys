@@ -41,6 +41,10 @@ runtime/oxrsys-runtime.toml
 The runtime needs Vulkan headers at compile time but does not link a Vulkan loader. Metal and
 VideoToolbox are macOS frameworks.
 
+The macOS build also compiles the Monado-derived Windows Mixed Reality driver under `drivers/`,
+which needs `brew install hidapi libusb`. Pass `-DOXRSYS_BUILD_WMR_DRIVER=OFF` to skip it. See
+[Windows Mixed Reality headsets](platforms/wmr.md).
+
 ## Versioning
 
 `config/OXRSysVersion.xcconfig` is the only product-version source. CMake, Xcode, and Gradle consume

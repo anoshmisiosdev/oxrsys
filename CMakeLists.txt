@@ -126,6 +126,9 @@ add_library(OXRSYS::VulkanHeaders ALIAS oxrsys_vulkan_headers)
 # --- Our runtime ---
 add_subdirectory(runtime)
 
+# --- Wired-headset drivers (Monado-derived) ---
+add_subdirectory(drivers)
+
 add_custom_target(oxrsys_runtime_sync_compile_commands ALL
     COMMAND ${CMAKE_COMMAND}
         -DINPUT_FILE=${CMAKE_BINARY_DIR}/compile_commands.json

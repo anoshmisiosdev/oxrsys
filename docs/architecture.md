@@ -14,6 +14,8 @@ targets, not additional runtime hosts.
 
 - `runtime/`: OpenXR entry points, instance/session/action state, graphics integration, streaming,
   VideoToolbox encoding, configuration, and status.
+- `drivers/`: wired-headset device drivers compiled from a pinned Monado checkout (Windows Mixed
+  Reality on macOS) plus the `oxrsys_wmr_probe` bring-up tool. See [platforms/wmr.md](platforms/wmr.md).
 - `common/protocol/`: wire-layout definitions shared with native clients.
 - `clients/home/`: SwiftUI macOS launcher, runtime selector, configuration, ADB, and diagnostics.
 - `clients/simulator/`: standalone macOS/iOS simulator and Cardboard viewer.

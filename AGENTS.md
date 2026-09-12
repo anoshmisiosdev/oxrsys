@@ -119,6 +119,10 @@ As of March 17, 2026, the pinned non-interactive OpenXR-CTS baseline is green lo
   until capture and playback are implemented.
 - `xrLocateSpacesKHR` remains accepted as the alias of OpenXR 1.1 `xrLocateSpaces`.
 - Reference spaces currently enumerate `VIEW`, `LOCAL`, `LOCAL_FLOOR`, and `STAGE`.
+- `drivers/` compiles the Windows Mixed Reality driver out of an unmodified, commit-pinned Monado
+  checkout (BSL-1.0) fetched with FetchContent. Do not patch Monado sources in place; add macOS
+  pieces under `drivers/monado/` and keep the source lists in `drivers/CMakeLists.txt` in step with
+  the pinned revision. See `docs/platforms/wmr.md`.
 
 ## Runtime Files And Registration
 
@@ -139,6 +143,10 @@ oxrsys_runtime/
 ├── CHANGES.md
 ├── config/OXRSysVersion.xcconfig
 ├── runtime/
+├── drivers/
+│   ├── CMakeLists.txt
+│   ├── monado/
+│   └── tools/
 ├── clients/
 │   ├── OXRSys Clients.xcworkspace/
 │   ├── home/

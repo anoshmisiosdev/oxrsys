@@ -36,6 +36,7 @@ streaming, and physical-device qualification are reported as separate gates.
 
 ```text
 runtime/                 macOS OpenXR runtime
+drivers/                 Monado-derived wired-headset drivers (Windows Mixed Reality)
 clients/
   home/                  SwiftUI macOS Home app
   simulator/             macOS/iOS simulator and Cardboard viewer
