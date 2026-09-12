@@ -230,7 +230,7 @@ int ConnectSocket(const std::string& path)
     return fd;
 }
 
-bool SpawnHelper(const std::string& path, const std::string& socketPath)
+bool SpawnHelper(const std::string& path, const std::string& socketPath, const ConfigValues& config)
 {
     if (access(path.c_str(), X_OK) != 0)
     {
@@ -243,11 +243,32 @@ bool SpawnHelper(const std::string& path, const std::string& socketPath)
     posix_spawnattr_init(&attr);
     // Its own session: it outlives the game and keeps the lobby up.
     posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID);
-    std::string pathCopy = path;
-    std::string sockCopy = socketPath;
-    char* argv[] = {pathCopy.data(), (char*)"--socket", sockCopy.data(), nullptr};
+
+    // The helper's settings come from the runtime config.
+    std::vector<std::string> args = {path, "--socket", socketPath};
+    if (config.wiredDisplayId != 0)
+    {
+        args.push_back("--display-id");
+        args.push_back(std::to_string(config.wiredDisplayId));
+    }
+    args.push_back("--eye-height");
+    args.push_back(std::to_string(config.wiredEyeHeightM));
+    if (!config.wiredPositionTracking)
+    {
+        args.push_back("--vit-library");
+        args.push_back("none");
+    }
+    else if (!config.wiredVitLibrary.empty())
+    {
+        args.push_back("--vit-library");
+        args.push_back(config.wiredVitLibrary);
+    }
+    std::vector<char*> argv;
+    for (std::string& a : args) argv.push_back(a.data());
+    argv.push_back(nullptr);
+
     pid_t pid = -1;
-    const int rc = posix_spawn(&pid, path.c_str(), nullptr, &attr, argv, environ);
+    const int rc = posix_spawn(&pid, path.c_str(), nullptr, &attr, argv.data(), environ);
     posix_spawnattr_destroy(&attr);
     if (rc != 0)
     {
@@ -270,7 +291,7 @@ bool WiredHeadset::EnsureOpen(const ConfigValues& config)
     int fd = ConnectSocket(socketPath);
     if (fd < 0)
     {
-        if (!SpawnHelper(HelperPath(config), socketPath)) return false;
+        if (!SpawnHelper(HelperPath(config), socketPath, config)) return false;
         // Opening the headset and finding its display takes a few seconds.
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
         while (fd < 0 && std::chrono::steady_clock::now() < deadline)

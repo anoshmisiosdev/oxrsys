@@ -188,8 +188,9 @@ where an in-process window did not.
 sizes before it creates a session.
 
 - **Config.** `wired_headset = true` in `oxrsys-runtime.toml` (plus optional
-  `wired_display_id` and `wired_eye_height_m`). Off by default; streaming
-  setups are untouched. The Home app's Streaming tab has a Headset section
+  `wired_display_id`, `wired_eye_height_m`, `wired_position_tracking` and
+  `wired_vit_library`; the runtime passes them to the helper when it starts
+  it). Off by default; streaming setups are untouched. The Home app's Streaming tab has a Headset section
   that writes these keys: pick `Wired Windows Mixed Reality headset (USB)` as
   the headset mode, then adjust the eye height and, if auto-detection picks
   the wrong display, the panel display ID (see
@@ -377,8 +378,10 @@ Linux-only one), and the helper uses it when it finds a Basalt library:
    `libbasalt.dylib` (no Pangolin, no ROS).
 2. Put the library where the helper looks: next to `oxrsys-headset-helper`,
    or `~/Library/Application Support/OXRSys/libbasalt.dylib`. Or point at it
-   explicitly with `--vit-library PATH` / `OXRSYS_VIT_LIBRARY`;
-   `--vit-library none` forces IMU-only tracking.
+   explicitly: `wired_vit_library` in the runtime config, `--vit-library PATH`
+   or `OXRSYS_VIT_LIBRARY` on the helper. `wired_position_tracking = false`
+   (or `--vit-library none`) keeps IMU-only tracking even with a library
+   installed.
 3. Restart the helper. Its log says `6DoF head tracking through ...` and the
    open line reports `head 6DoF (Basalt)`; the status line every ten seconds
    prints the head position. `HeadsetInfo` carries a tracking description
@@ -391,11 +394,32 @@ makes headset creation fail, so the helper opens the headset with
 computed (`wh->tracking.slam_calib`), routes both cameras and the IMU into
 it, and flips the driver to `slam_over_3dof`. The driver then applies
 Basalt's pose (with its IMU-to-eye offset) in `xrt_device_get_tracked_pose`,
-predicted with the IMU. The SLAM origin is wherever tracking started; the
-helper adds the eye height so the floor stays where it was. `SLAM_LOG=trace`
-prints every frame and IMU sample handed to Basalt; `SLAM_*` variables from
-Monado (`SLAM_PREDICTION_TYPE`, `SLAM_CONFIG` for a Basalt config file
-instead of the driver calibration) work unchanged.
+predicted with the IMU.
+
+Pipeline settings: Basalt's generic defaults let the estimate run away
+within seconds on a Visor (tens of metres in half a minute while the headset
+sat still). Basalt ships a profile for WMR headsets (`msdmo`, tuned on the
+Monado SLAM Datasets recorded with an Odyssey+; the differences that matter
+are an image safe radius that keeps features out of the vignetted corners
+and marginalising lost landmarks). The helper writes that profile, plus a
+calibration file converted from the driver's calibration, to
+`~/Library/Caches/OXRSys/basalt/` (`wmr.toml`, `wmr_vio_config.json`,
+`wmr_calib.json`) at every start and hands the TOML to Monado as
+`SLAM_CONFIG`. With a config file Monado does not send the calibration over
+the plugin interface, which is why the file carries it. Edit
+`wmr_vio_config.json` to experiment (it is regenerated at the next start, so
+copy it and set `SLAM_CONFIG` to your own TOML to keep changes). Basalt
+splits the config path as a command line, so it must not contain spaces.
+
+Start-up: the estimate wanders during the first seconds (camera restart,
+exposure settling, few landmarks), so the helper keeps the head at the fixed
+eye height until the SLAM position has stayed within 5 cm for 2.5 s, then
+takes that point as the origin and logs `6DoF position settled`. From then
+on the reported position is the SLAM position relative to that origin, plus
+the eye height. With the headset still on a desk the head then stayed within
+6 cm over 50 s on a Dell Visor. `SLAM_LOG=trace` prints every frame and IMU
+sample handed to Basalt; Monado's other `SLAM_*` variables
+(`SLAM_PREDICTION_TYPE`, `SLAM_CONFIG`) work unchanged.
 
 Camera restarts: the WMR source only takes new sinks by stopping and
 restarting the cameras, and its stop merely requests cancellation of the USB

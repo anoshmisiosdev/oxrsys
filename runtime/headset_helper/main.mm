@@ -12,8 +12,11 @@
 // HeadsetHelperIpc.h for the protocol.
 //
 //   oxrsys-headset-helper [--socket PATH] [--display-id ID] [--no-capture]
-//                         [--vit-library PATH|none] [--monitor]
+//                         [--eye-height M] [--vit-library PATH|none] [--monitor]
 //                         [--log-level trace|debug|info|warn|error]
+//
+// The runtime passes --display-id, --eye-height and --vit-library from its
+// wired_* config keys when it starts the helper.
 //
 // --monitor (or OXRSYS_HEADSET_MONITOR=1) opens a window on a desktop screen
 // showing the tracking cameras with Basalt's features and the tracked PS Move
@@ -1290,6 +1293,9 @@ main(int argc, char** argv)
 			g.opts.displayId = (CGDirectDisplayID)strtoul(argv[++i], nullptr, 0);
 		} else if (strcmp(argv[i], "--no-capture") == 0) {
 			g.opts.capture = false;
+		} else if (strcmp(argv[i], "--eye-height") == 0 && hasValue) {
+			const float h = strtof(argv[++i], nullptr);
+			if (h > 0.5f && h < 3.0f) g.eyeHeightM = h;
 		} else if (strcmp(argv[i], "--vit-library") == 0 && hasValue) {
 			g.opts.vitLibrary = argv[++i];
 		} else if (strcmp(argv[i], "--monitor") == 0) {
@@ -1303,8 +1309,8 @@ main(int argc, char** argv)
 			                                            : U_LOGGING_INFO;
 		} else {
 			fprintf(stderr,
-			        "usage: %s [--socket PATH] [--display-id ID] [--no-capture] [--vit-library PATH|none] "
-			        "[--monitor] [--log-level LEVEL]\n",
+			        "usage: %s [--socket PATH] [--display-id ID] [--no-capture] [--eye-height M] "
+			        "[--vit-library PATH|none] [--monitor] [--log-level LEVEL]\n",
 			        argv[0]);
 			return 2;
 		}
