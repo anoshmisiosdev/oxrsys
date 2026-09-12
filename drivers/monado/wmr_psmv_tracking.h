@@ -33,11 +33,17 @@ struct oxrsys_wmr_psmv_tracking;
  * Create the tracker on @p hmd (an xrt_device created by the WMR driver) and
  * start feeding it camera frames.
  *
+ * @param share_with Sinks that already receive the headset's camera frames
+ * (the SLAM tracker's, see oxrsys_wmr_slam_sinks) and must keep receiving
+ * them: the frames are split between them and the sphere tracker. NULL when
+ * nothing else consumes the cameras.
+ *
  * @return The tracking factory to hand to the PS Move driver, or NULL when
  * OpenCV is not built in or the headset has no usable tracking cameras.
  */
 struct xrt_tracking_factory *
 oxrsys_wmr_psmv_tracking_create(struct xrt_device *hmd,
+                                const struct xrt_slam_sinks *share_with,
                                 enum u_logging_level log_level,
                                 struct oxrsys_wmr_psmv_tracking **out_tracking);
 

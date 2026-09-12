@@ -341,10 +341,11 @@ bool WiredHeadset::EnsureOpen(const ConfigValues& config)
         }
     }
 
-    spdlog::info("WiredHeadset: helper serves {}: panel {}x{} @ {} Hz, eye {}x{}, controllers {}, display {}",
+    spdlog::info("WiredHeadset: helper serves {}: panel {}x{} @ {} Hz, eye {}x{}, tracking {}, controllers {}, display {}",
                  impl_->info.name, impl_->info.panelW, impl_->info.panelH, impl_->info.refreshHz,
-                 impl_->info.eyeW, impl_->info.eyeH, impl_->info.controllers,
-                 impl_->info.displayReady ? "ready" : "missing");
+                 impl_->info.eyeW, impl_->info.eyeH,
+                 impl_->info.tracking.empty() ? std::string("unknown") : impl_->info.tracking,
+                 impl_->info.controllers, impl_->info.displayReady ? "ready" : "missing");
 
     impl_->tracking = std::make_unique<TrackingReceiver>();
     impl_->readerRunning.store(true);

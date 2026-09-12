@@ -20,6 +20,7 @@
 #include "util/u_sink.h"
 #include "wmr/wmr_config.h"
 #include "wmr/wmr_hmd.h"
+#include "wmr_slam.h"
 #include "xrt/xrt_frame.h"
 #include "xrt/xrt_frameserver.h"
 
@@ -36,6 +37,9 @@ struct oxrsys_wmr_psmv_tracking
 	enum u_logging_level log_level;
 	//! The headset's camera source our sinks are attached to.
 	struct xrt_fs *source;
+	//! What the source fed before we attached (the SLAM tracker's sinks, or
+	//! nothing); restored on destroy.
+	struct xrt_slam_sinks shared;
 };
 
 static struct oxrsys_wmr_psmv_tracking *
@@ -129,6 +133,7 @@ create_tracked_slam(struct xrt_tracking_factory *xtf, struct xrt_tracked_slam **
 
 struct xrt_tracking_factory *
 oxrsys_wmr_psmv_tracking_create(struct xrt_device *hmd,
+                                const struct xrt_slam_sinks *share_with,
                                 enum u_logging_level log_level,
                                 struct oxrsys_wmr_psmv_tracking **out_tracking)
 {
@@ -180,17 +185,26 @@ oxrsys_wmr_psmv_tracking_create(struct xrt_device *hmd,
 	struct xrt_frame_sink *right = NULL;
 	u_sink_combiner_create(&t->xfctx, sink, &left, &right);
 
-	// Point the headset's camera source at us. The WMR source only forwards
-	// frames to these sinks; its own IMU/SLAM plumbing is unaffected. The
-	// driver already started the cameras, and starting them twice fails, so
-	// stop first.
+	// Point the headset's camera source at us. When something else (the SLAM
+	// tracker) already consumes the cameras, every frame is split between it
+	// and us and its IMU sink keeps flowing. The driver already started the
+	// cameras, and starting them twice fails, so stop first.
 	struct xrt_slam_sinks sinks;
 	memset(&sinks, 0, sizeof(sinks));
+	if (share_with != NULL) {
+		t->shared = *share_with;
+		sinks = *share_with;
+		if (sinks.cams[0] != NULL) {
+			u_sink_split_create(&t->xfctx, sinks.cams[0], left, &left);
+		}
+		if (sinks.cams[1] != NULL) {
+			u_sink_split_create(&t->xfctx, sinks.cams[1], right, &right);
+		}
+	}
 	sinks.cam_count = 2;
 	sinks.cams[0] = left;
 	sinks.cams[1] = right;
-	xrt_fs_stream_stop(wh->tracking.source);
-	if (!xrt_fs_slam_stream_start(wh->tracking.source, &sinks)) {
+	if (!oxrsys_wmr_camera_route(wh->tracking.source, &sinks)) {
 		U_LOG_IFL_E(log_level, "Could not attach the sphere tracker to the headset cameras.");
 		oxrsys_wmr_psmv_tracking_destroy(&t);
 		return NULL;
@@ -211,12 +225,10 @@ oxrsys_wmr_psmv_tracking_destroy(struct oxrsys_wmr_psmv_tracking **tracking_ptr)
 		return;
 	}
 	// The headset's camera source keeps raw pointers to our sinks; point it
-	// at nothing before they go away.
+	// back at whatever it fed before (the SLAM tracker, or nothing) before
+	// they go away.
 	if (t->source != NULL) {
-		struct xrt_slam_sinks none;
-		memset(&none, 0, sizeof(none));
-		xrt_fs_stream_stop(t->source);
-		xrt_fs_slam_stream_start(t->source, &none); // back to the driver's own (empty) sinks
+		oxrsys_wmr_camera_route(t->source, &t->shared);
 		t->source = NULL;
 	}
 	// Tears down every sink and tracker created in the context.
@@ -238,10 +250,12 @@ oxrsys_wmr_psmv_tracking_available(void)
 
 struct xrt_tracking_factory *
 oxrsys_wmr_psmv_tracking_create(struct xrt_device *hmd,
+                                const struct xrt_slam_sinks *share_with,
                                 enum u_logging_level log_level,
                                 struct oxrsys_wmr_psmv_tracking **out_tracking)
 {
 	(void)hmd;
+	(void)share_with;
 	U_LOG_IFL_I(log_level, "Sphere tracking not built (configure with -DOXRSYS_WMR_OPENCV=ON).");
 	*out_tracking = NULL;
 	return NULL;

@@ -231,6 +231,25 @@ oxrsys_psmv_dump_hid_devices(void)
 	return count;
 }
 
+size_t
+oxrsys_psmv_count_usable(void)
+{
+	if (hid_init() != 0) {
+		return 0;
+	}
+	struct hid_device_info *list = hid_enumerate(PSMV_VID, 0);
+	size_t count = 0;
+	for (const struct hid_device_info *info = list; info != NULL; info = info->next) {
+		enum oxrsys_psmv_model model;
+		if (oxrsys_psmv_classify(info->vendor_id, info->product_id, &model) &&
+		    bus_of(info) == OXRSYS_PSMV_BUS_BLUETOOTH) {
+			count++;
+		}
+	}
+	hid_free_enumeration(list);
+	return count;
+}
+
 enum oxrsys_psmv_open_result
 oxrsys_psmv_open_all(enum u_logging_level log_level,
                      struct oxrsys_psmv_controller **out_controllers,
