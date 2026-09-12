@@ -17,6 +17,7 @@
 #include "StreamingFrameQueue.h"
 #include "TrackingReceiver.h"
 
+#include "psmv_macos.h"
 #include "wmr_macos.h"
 #include "wmr_panel.h"
 
@@ -48,6 +49,116 @@ int64_t SteadyNowNs()
 
 constexpr float kDefaultIpdM = 0.063f;
 constexpr int kTrackingRateHz = 250;
+constexpr size_t kMaxPsMove = 4;
+
+// Orientation-only controllers get a fixed "arm model" position relative to
+// the head: hands slightly in front, below, and to either side, following
+// the head's yaw so they stay in view when the user turns.
+constexpr float kArmOffsetX = 0.18f;
+constexpr float kArmOffsetY = -0.35f;
+constexpr float kArmOffsetZ = -0.40f;
+
+enum class Hand
+{
+    Left = 0,
+    Right = 1,
+};
+
+// The first pose-typed input is the grip pose on every driver we use.
+enum xrt_input_name GripPoseInput(const struct xrt_device* xdev)
+{
+    for (size_t i = 0; i < xdev->input_count; i++)
+    {
+        if (XRT_GET_INPUT_TYPE(xdev->inputs[i].name) == XRT_INPUT_TYPE_POSE)
+        {
+            return xdev->inputs[i].name;
+        }
+    }
+    return XRT_INPUT_GENERIC_HEAD_POSE;
+}
+
+// Map one controller's inputs onto the packet's Touch-style fields. WMR
+// controllers have a thumbstick, trackpad, menu, squeeze and trigger; PS
+// Moves have face buttons, Move (used as grip), Start (menu) and a trigger.
+void MapControllerInputs(const struct xrt_device* xdev, Hand hand, oxr::protocol::TrackingPacket& packet)
+{
+    using namespace oxr::protocol;
+    const bool left = hand == Hand::Left;
+    float& trigger = left ? packet.leftTrigger : packet.rightTrigger;
+    float& grip = left ? packet.leftGrip : packet.rightGrip;
+    float* stick = left ? packet.leftThumbstick : packet.rightThumbstick;
+    const uint32_t primaryClick = left ? BUTTON_X : BUTTON_A;    // lower face button
+    const uint32_t secondaryClick = left ? BUTTON_Y : BUTTON_B;  // upper face button
+    const uint32_t stickClick = left ? BUTTON_LEFT_THUMBSTICK : BUTTON_RIGHT_THUMBSTICK;
+    const uint32_t triggerClick = left ? BUTTON_LEFT_TRIGGER : BUTTON_RIGHT_TRIGGER;
+    const uint32_t gripClick = left ? BUTTON_LEFT_GRIP : BUTTON_RIGHT_GRIP;
+
+    for (size_t i = 0; i < xdev->input_count; i++)
+    {
+        const struct xrt_input& in = xdev->inputs[i];
+        const bool b = in.value.boolean;
+        switch (in.name)
+        {
+            // Windows Mixed Reality (original, Odyssey, Reverb G2).
+            case XRT_INPUT_WMR_TRIGGER_VALUE:
+            case XRT_INPUT_ODYSSEY_CONTROLLER_TRIGGER_VALUE:
+            case XRT_INPUT_G2_CONTROLLER_TRIGGER_VALUE:
+            case XRT_INPUT_PSMV_TRIGGER_VALUE:
+                trigger = in.value.vec1.x;
+                if (trigger > 0.5f) packet.buttonState |= triggerClick;
+                break;
+            case XRT_INPUT_WMR_SQUEEZE_CLICK:
+            case XRT_INPUT_ODYSSEY_CONTROLLER_SQUEEZE_CLICK:
+            case XRT_INPUT_PSMV_MOVE_CLICK:
+                if (b) { grip = 1.0f; packet.buttonState |= gripClick; }
+                break;
+            case XRT_INPUT_G2_CONTROLLER_SQUEEZE_VALUE:
+                grip = in.value.vec1.x;
+                if (grip > 0.5f) packet.buttonState |= gripClick;
+                break;
+            case XRT_INPUT_WMR_MENU_CLICK:
+            case XRT_INPUT_ODYSSEY_CONTROLLER_MENU_CLICK:
+            case XRT_INPUT_G2_CONTROLLER_MENU_CLICK:
+            case XRT_INPUT_PSMV_START_CLICK:
+                if (b) packet.buttonState |= BUTTON_MENU;
+                break;
+            case XRT_INPUT_WMR_THUMBSTICK:
+            case XRT_INPUT_ODYSSEY_CONTROLLER_THUMBSTICK:
+            case XRT_INPUT_G2_CONTROLLER_THUMBSTICK:
+                stick[0] = in.value.vec2.x;
+                stick[1] = in.value.vec2.y;
+                break;
+            case XRT_INPUT_WMR_THUMBSTICK_CLICK:
+            case XRT_INPUT_ODYSSEY_CONTROLLER_THUMBSTICK_CLICK:
+            case XRT_INPUT_G2_CONTROLLER_THUMBSTICK_CLICK:
+                if (b) packet.buttonState |= stickClick;
+                break;
+            // The WMR trackpad click stands in for the lower face button.
+            case XRT_INPUT_WMR_TRACKPAD_CLICK:
+            case XRT_INPUT_ODYSSEY_CONTROLLER_TRACKPAD_CLICK:
+            case XRT_INPUT_G2_CONTROLLER_A_CLICK:
+            case XRT_INPUT_G2_CONTROLLER_X_CLICK:
+            case XRT_INPUT_PSMV_CROSS_CLICK:
+                if (b) packet.buttonState |= primaryClick;
+                break;
+            case XRT_INPUT_G2_CONTROLLER_B_CLICK:
+            case XRT_INPUT_G2_CONTROLLER_Y_CLICK:
+            case XRT_INPUT_PSMV_CIRCLE_CLICK:
+                if (b) packet.buttonState |= secondaryClick;
+                break;
+            default:
+                break;
+        }
+    }
+}
+
+// Rotate a vector by the yaw component of a quaternion only.
+struct xrt_vec3 YawRotate(const struct xrt_quat& q, float x, float y, float z)
+{
+    const float yaw = atan2f(2.0f * (q.w * q.y + q.x * q.z), 1.0f - 2.0f * (q.x * q.x + q.y * q.y));
+    const float c = cosf(yaw), s = sinf(yaw);
+    return {c * x + s * z, y, -s * x + c * z};
+}
 
 } // namespace
 
@@ -61,6 +172,14 @@ struct WiredHeadset::Impl
     std::string name;
     uint32_t refreshHz = 90;
     float eyeHeightM = 1.6f;
+
+    // Controllers: the headset's own (WMR over its radio or Bluetooth), or
+    // PlayStation Moves paired to the Mac. Indexed by Hand. Not owned here:
+    // WMR devices belong to the headset struct, PS Moves to psmv[].
+    struct xrt_device* controllers[2] = {nullptr, nullptr};
+    struct oxrsys_psmv_controller* psmv[kMaxPsMove] = {};
+    size_t psmvCount = 0;
+    std::string controllerKind;
 
     // Tracking.
     std::unique_ptr<TrackingReceiver> tracking;
@@ -136,6 +255,37 @@ bool WiredHeadset::EnsureOpen(const ConfigValues& config)
     impl_->name = std::string("Windows Mixed Reality ") + oxrsys_wmr_headset_type_str(headset->type);
     impl_->eyeHeightM = config.wiredEyeHeightM;
 
+    // Controllers: prefer the headset's (radio or Bluetooth WMR controllers),
+    // otherwise PlayStation Moves paired to this Mac. With no left/right
+    // identity, the first Move is the right hand, the second the left.
+    if (headset->left != nullptr || headset->right != nullptr)
+    {
+        impl_->controllers[static_cast<int>(Hand::Left)] = headset->left;
+        impl_->controllers[static_cast<int>(Hand::Right)] = headset->right;
+        impl_->controllerKind = headset->controllers_bluetooth ? "WMR controllers (Bluetooth)"
+                                                               : "WMR controllers (headset radio)";
+    }
+    else
+    {
+        const enum oxrsys_psmv_open_result psmvResult =
+            oxrsys_psmv_open_all(U_LOGGING_INFO, impl_->psmv, kMaxPsMove, &impl_->psmvCount);
+        if (psmvResult == OXRSYS_PSMV_OPEN_OK)
+        {
+            impl_->controllers[static_cast<int>(Hand::Right)] = impl_->psmv[0]->xdev;
+            if (impl_->psmvCount > 1)
+            {
+                impl_->controllers[static_cast<int>(Hand::Left)] = impl_->psmv[1]->xdev;
+            }
+            impl_->controllerKind = "PlayStation Move";
+        }
+        else
+        {
+            impl_->controllerKind = "none";
+        }
+    }
+    spdlog::info("WiredHeadset: controllers: {} (left {}, right {})", impl_->controllerKind,
+                 impl_->controllers[0] != nullptr ? "yes" : "no", impl_->controllers[1] != nullptr ? "yes" : "no");
+
     impl_->panel = std::make_unique<oxrsys::WmrPanel>(headset->hmd->hmd);
     oxrsys::WmrPanelOptions options;
     options.display_id = config.wiredDisplayId;
@@ -195,6 +345,13 @@ void WiredHeadset::Close()
         impl_->panel->Close();
         impl_->panel.reset();
     }
+    impl_->controllers[0] = nullptr;
+    impl_->controllers[1] = nullptr;
+    for (size_t i = 0; i < impl_->psmvCount; i++)
+    {
+        oxrsys_psmv_close(&impl_->psmv[i]);
+    }
+    impl_->psmvCount = 0;
     if (impl_->headset != nullptr)
     {
         oxrsys_wmr_headset_close(&impl_->headset);
@@ -367,6 +524,45 @@ void WiredHeadset::Impl::TrackingLoop()
         packet.eyeFov[1] = geometry.views[0].fov[1];
         packet.eyeFov[2] = geometry.views[0].fov[2];
         packet.eyeFov[3] = geometry.views[0].fov[3];
+
+        // Controllers: orientation from their IMU, position from the arm
+        // model around the head, inputs mapped onto the Touch-style fields.
+        for (int h = 0; h < 2; h++)
+        {
+            struct xrt_device* ctrl = controllers[h];
+            if (ctrl == nullptr)
+            {
+                continue;
+            }
+            const Hand hand = static_cast<Hand>(h);
+            xrt_device_update_inputs(ctrl);
+
+            struct xrt_space_relation ctrlRelation = {};
+            const xrt_result_t cret =
+                xrt_device_get_tracked_pose(ctrl, GripPoseInput(ctrl), monadoNowNs + horizonNs, &ctrlRelation);
+            const bool ctrlValid = cret == XRT_SUCCESS &&
+                                   (ctrlRelation.relation_flags & XRT_SPACE_RELATION_ORIENTATION_VALID_BIT) != 0;
+            if (!ctrlValid)
+            {
+                continue;
+            }
+
+            float* pos = hand == Hand::Left ? packet.leftControllerPos : packet.rightControllerPos;
+            float* rot = hand == Hand::Left ? packet.leftControllerRot : packet.rightControllerRot;
+            const struct xrt_vec3 offset = YawRotate(relation.pose.orientation,
+                                                     hand == Hand::Left ? -kArmOffsetX : kArmOffsetX,
+                                                     kArmOffsetY, kArmOffsetZ);
+            pos[0] = packet.headPosition[0] + offset.x;
+            pos[1] = packet.headPosition[1] + offset.y;
+            pos[2] = packet.headPosition[2] + offset.z;
+            rot[0] = ctrlRelation.pose.orientation.x;
+            rot[1] = ctrlRelation.pose.orientation.y;
+            rot[2] = ctrlRelation.pose.orientation.z;
+            rot[3] = ctrlRelation.pose.orientation.w;
+            packet.trackingFlags |= hand == Hand::Left ? oxr::protocol::TRACKING_FLAG_LEFT_CONTROLLER_ACTIVE
+                                                       : oxr::protocol::TRACKING_FLAG_RIGHT_CONTROLLER_ACTIVE;
+            MapControllerInputs(ctrl, hand, packet);
+        }
 
         tracking->InjectPacket(reinterpret_cast<const uint8_t*>(&packet), sizeof(packet));
         samples++;
