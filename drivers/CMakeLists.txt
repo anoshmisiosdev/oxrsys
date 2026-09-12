@@ -20,6 +20,17 @@ pkg_check_modules(OXRSYS_LIBUSB REQUIRED IMPORTED_TARGET libusb-1.0)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 find_package(Threads REQUIRED)
 
+# Optional OpenCV, needed by Monado's camera-based (controller/SLAM) tracking
+# code. Off by default so the plain headset build stays dependency-light.
+# macOS: `brew install opencv`. Note that the x86_64 (Rosetta) runtime build
+# used by the Wine bridge needs an x86_64 OpenCV, for example from an x86_64
+# Homebrew under /usr/local, since Apple Silicon Homebrew libraries under
+# /opt/homebrew are arm64 only.
+option(OXRSYS_WMR_OPENCV "Link the Monado WMR driver against OpenCV" OFF)
+if(OXRSYS_WMR_OPENCV)
+    find_package(OpenCV REQUIRED)
+endif()
+
 include(FetchContent)
 
 # Pinned Monado main (BSL-1.0). Bump deliberately: the file lists below track
@@ -55,6 +66,9 @@ file(MAKE_DIRECTORY "${OXRSYS_MONADO_GENERATED}/xrt")
 # it expects. Only the features we build are switched on.
 set(XRT_HAVE_LIBUSB ON)
 set(XRT_HAVE_HIDAPI ON)
+if(OXRSYS_WMR_OPENCV)
+    set(XRT_HAVE_OPENCV ON)
+endif()
 set(FILE_CONTENTS "#define XRT_BUILD_DRIVER_WMR\n")
 foreach(oxrsys_monado_config IN ITEMS build have drivers vulkan android)
     configure_file(
@@ -202,6 +216,9 @@ target_include_directories(oxrsys_monado_wmr
         "${OXRSYS_MONADO_EXTERNAL}/bcdec"
 )
 target_include_directories(oxrsys_monado_wmr SYSTEM PRIVATE "${eigen_SOURCE_DIR}")
+if(OXRSYS_WMR_OPENCV)
+    target_include_directories(oxrsys_monado_wmr SYSTEM PUBLIC ${OpenCV_INCLUDE_DIRS})
+endif()
 
 target_compile_definitions(oxrsys_monado_wmr
     PRIVATE
@@ -233,6 +250,9 @@ target_link_libraries(oxrsys_monado_wmr
         PkgConfig::OXRSYS_LIBUSB
         Threads::Threads
 )
+if(OXRSYS_WMR_OPENCV)
+    target_link_libraries(oxrsys_monado_wmr PUBLIC ${OpenCV_LIBS})
+endif()
 if(APPLE)
     target_link_libraries(oxrsys_monado_wmr
         PUBLIC
@@ -248,7 +268,8 @@ endif()
 # IMU-driven orientation. This is the hardware bring-up check for the driver.
 add_executable(oxrsys_wmr_probe tools/wmr_probe.c)
 target_compile_features(oxrsys_wmr_probe PRIVATE c_std_11)
-target_compile_options(oxrsys_wmr_probe PRIVATE -Wall -Wextra)
+# -Wno-unused-parameter: Monado's inline os_time.h / os_threading.h helpers trip it.
+target_compile_options(oxrsys_wmr_probe PRIVATE -Wall -Wextra -Wno-unused-parameter)
 target_link_libraries(oxrsys_wmr_probe PRIVATE oxrsys_monado_wmr)
 
 # --- OpenXR smoke tool ------------------------------------------------------
