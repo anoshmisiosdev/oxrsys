@@ -49,6 +49,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -691,6 +692,11 @@ TrackingLoop()
 	const int64_t horizonNs = 2 * (1000000000LL / std::max<uint32_t>(g.refreshHz, 1));
 	struct xrt_device* hmd = g.headset->hmd;
 
+	// 6DoF settling state (this thread only).
+	bool slamSettled = false;
+	struct xrt_vec3 slamOrigin = {0.0f, 0.0f, 0.0f};
+	std::deque<std::pair<int64_t, struct xrt_vec3>> settle;
+
 	while (g.running.load()) {
 		const int64_t loopStart = SteadyNowNs();
 		const int64_t monadoNow = os_monotonic_get_ns();
@@ -709,11 +715,34 @@ TrackingLoop()
 			packet.headOrientation[2] = rel.pose.orientation.z;
 			packet.headOrientation[3] = rel.pose.orientation.w;
 		}
-		// 6DoF: the SLAM origin is where tracking started, at eye height.
+		// 6DoF. The SLAM estimate wanders during its first seconds (camera
+		// restart, exposure settling, few features yet), so the position is
+		// only used once it has held still for a while, and that point
+		// becomes the origin: the user starts where they are, at eye height.
 		if (valid && (rel.relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT) != 0) {
-			packet.headPosition[0] = rel.pose.position.x;
-			packet.headPosition[1] = g.eyeHeightM + rel.pose.position.y;
-			packet.headPosition[2] = rel.pose.position.z;
+			const struct xrt_vec3 p = rel.pose.position;
+			if (!slamSettled) {
+				settle.push_back({loopStart, p});
+				while (!settle.empty() && loopStart - settle.front().first > 3000000000LL) settle.pop_front();
+				if (loopStart - settle.front().first >= 2500000000LL) {
+					float spread = 0.0f;
+					for (const auto& e : settle) {
+						const float dx = e.second.x - p.x, dy = e.second.y - p.y, dz = e.second.z - p.z;
+						spread = std::max(spread, sqrtf(dx * dx + dy * dy + dz * dz));
+					}
+					if (spread < 0.05f) {
+						slamOrigin = p;
+						slamSettled = true;
+						settle.clear();
+						LOGI("6DoF position settled; origin set at (%.2f, %.2f, %.2f)", p.x, p.y, p.z);
+					}
+				}
+			}
+			if (slamSettled) {
+				packet.headPosition[0] = p.x - slamOrigin.x;
+				packet.headPosition[1] = g.eyeHeightM + (p.y - slamOrigin.y);
+				packet.headPosition[2] = p.z - slamOrigin.z;
+			}
 		}
 		if ((rel.relation_flags & XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT) != 0) {
 			packet.headLinearVelocity[0] = rel.linear_velocity.x;
