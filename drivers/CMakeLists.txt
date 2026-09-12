@@ -187,6 +187,25 @@ set(OXRSYS_MONADO_WMR_SOURCES
 )
 list(TRANSFORM OXRSYS_MONADO_WMR_SOURCES PREPEND "${OXRSYS_MONADO_XRT}/")
 
+# Camera-based tracking (Monado's aux_tracking OpenCV half plus the PS Move
+# sphere tracker), only with OpenCV.
+if(OXRSYS_WMR_OPENCV)
+    set(OXRSYS_MONADO_OPENCV_SOURCES
+        auxiliary/tracking/t_calibration.cpp
+        auxiliary/tracking/t_convert.cpp
+        auxiliary/tracking/t_debug_hsv_filter.cpp
+        auxiliary/tracking/t_debug_hsv_picker.cpp
+        auxiliary/tracking/t_debug_hsv_viewer.cpp
+        auxiliary/tracking/t_file.cpp
+        auxiliary/tracking/t_frame_cv_mat_wrapper.cpp
+        auxiliary/tracking/t_hsv_filter.c
+        auxiliary/tracking/t_kalman.cpp
+        auxiliary/tracking/t_tracker_psmv.cpp
+    )
+    list(TRANSFORM OXRSYS_MONADO_OPENCV_SOURCES PREPEND "${OXRSYS_MONADO_XRT}/")
+    list(APPEND OXRSYS_MONADO_WMR_SOURCES ${OXRSYS_MONADO_OPENCV_SOURCES})
+endif()
+
 set(OXRSYS_MONADO_PLATFORM_SOURCES
     monado/os_hid_hidapi.c
     monado/psmv_macos.c
