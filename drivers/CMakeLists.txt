@@ -230,3 +230,20 @@ add_executable(oxrsys_wmr_probe tools/wmr_probe.c)
 target_compile_features(oxrsys_wmr_probe PRIVATE c_std_11)
 target_compile_options(oxrsys_wmr_probe PRIVATE -Wall -Wextra)
 target_link_libraries(oxrsys_wmr_probe PRIVATE oxrsys_monado_wmr)
+
+# --- Display tool ----------------------------------------------------------
+# Captures the headset's panel as a macOS display and renders a
+# distortion-corrected stereo test scene onto it with Metal.
+if(APPLE)
+    add_executable(oxrsys_wmr_display tools/wmr_display.mm)
+    # -Wno-unused-parameter: Monado's inline os_time.h helpers trip it.
+    target_compile_options(oxrsys_wmr_display PRIVATE -Wall -Wextra -Wno-unused-parameter -fobjc-arc)
+    target_link_libraries(oxrsys_wmr_display PRIVATE
+        oxrsys_monado_wmr
+        "-framework AppKit"
+        "-framework CoreGraphics"
+        "-framework ImageIO"
+        "-framework Metal"
+        "-framework QuartzCore"
+    )
+endif()

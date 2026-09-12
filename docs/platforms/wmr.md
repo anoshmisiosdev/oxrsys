@@ -1,9 +1,10 @@
 # Windows Mixed Reality Headsets (macOS)
 
-Status: **driver bring-up**. The Monado WMR driver builds and links on macOS
-and a probe tool can open a headset and print IMU orientation. Nothing is wired
-into the OpenXR runtime yet; there is no display output and no positional
-tracking.
+Status: **display bring-up**. The Monado WMR driver builds and links on macOS,
+a probe tool opens a headset and prints IMU orientation, and a display tool
+captures the headset's panel and renders a distortion-corrected stereo test
+scene onto it from the IMU pose. Nothing is wired into the OpenXR runtime yet
+and there is no positional tracking.
 
 ## What This Is
 
@@ -30,7 +31,8 @@ drivers/
 │   ├── u_file_macos.c             # config-dir helpers Monado only ships for Linux
 │   └── t_euroc_recorder_stub.c    # no-op dataset recorder (real one needs OpenCV)
 └── tools/
-    └── wmr_probe.c                # oxrsys_wmr_probe
+    ├── wmr_probe.c                # oxrsys_wmr_probe
+    └── wmr_display.mm             # oxrsys_wmr_display
 ```
 
 The library target is `oxrsys_monado_wmr`. Monado sources are compiled with
@@ -79,6 +81,45 @@ yaw/pitch/roll. `flags` shows `valid,tracked` once the IMU fusion has settled.
 Exit codes: `0` ran, `1` no usable headset (reason on stderr), `2` bad
 arguments.
 
+## Display
+
+```bash
+./build/drivers/oxrsys_wmr_display                     # room scene on the headset, Ctrl-C to stop
+./build/drivers/oxrsys_wmr_display --pattern           # lens-calibration rings and crosshair
+./build/drivers/oxrsys_wmr_display --no-distortion     # raw eye images, for comparison
+./build/drivers/oxrsys_wmr_display --simulate --screenshot out.png   # no hardware: synthetic headset
+```
+
+What it does, in order:
+
+1. Opens the headset through the driver. `wmr_hmd_create()` sends the
+   panel-on command, so the display hot-plugs a moment later.
+2. Waits up to `--display-timeout` seconds (default 20) for a non-built-in
+   display that has a mode matching the panel's pixel size, or uses
+   `--display-id`. If nothing appears it lists the online displays and exits 1.
+3. Takes the display out of any mirror set, switches it to the panel's native
+   mode at the highest refresh rate, and captures it (`CGDisplayCapture`), so
+   the desktop never shows on the panel.
+4. Covers it with a borderless window at the shielding level holding a
+   `CAMetalLayer` whose drawable is exactly the panel size.
+5. Each refresh: predicts the eye poses ~16 ms ahead with the driver's
+   `get_view_poses`, renders a procedural room per eye (coloured walls, 0.5 m
+   grid, bright marker straight ahead) into eye-sized textures, then draws the
+   driver's distortion mesh per view, sampling red, green and blue at their own
+   UVs. Mesh coordinates follow Monado's Vulkan orientation, so only the clip y
+   axis is flipped for Metal.
+
+`--simulate` swaps in a synthetic 2880x1600 headset with a mild radial
+distortion and a slowly turning head, shown in a desktop window. Together with
+`--screenshot` it is the way to check the render path without hardware; the
+tool always exits, falling back to a timer when the display link delivers no
+callbacks (as happens without an interactive window-server session).
+
+A frame is: two eye passes, one warp pass into a panel-sized texture, one blit
+into the drawable. The panel texture is CPU-shared only so `--screenshot` can
+read it; the runtime integration should render the warp straight into the
+drawable.
+
 ## How A Headset Is Opened
 
 1. hidapi enumerates all HID interfaces.
@@ -101,9 +142,16 @@ read the USB interface number; report that with the full `--list` output.
   interface, the fix is a small Monado patch to make the source optional.
 - **Orientation only.** Positional (6DoF) tracking in Monado comes from its
   Basalt SLAM integration, which is not built here.
-- **No runtime integration yet.** The next step is a local wired backend in the
-  runtime that feeds `xrt_device` poses into the tracking path and presents
-  distortion-corrected frames on the headset's display.
+- **No runtime integration yet.** The display tool proves the presentation
+  path; the next step is a local wired backend in the runtime that feeds
+  `xrt_device` poses into the tracking path and presents submitted OpenXR
+  layers through the same warp instead of a test scene.
+- **Display detection is by pixel size.** The panel is matched by a display
+  mode equal to `screens[0]`; a monitor with the same native resolution would
+  also match, so use `--display-id` in that case.
+- **Refresh rate.** The driver does not report a nominal frame interval; the
+  tool picks the highest-rate mode at the native size and lets the display link
+  pace frames.
 - **Controller calibration cache path.** Monado writes cached controller
   calibration to `$XDG_CONFIG_HOME/monado/wmr/` or, failing that,
   `~/monado/wmr/`. That is Monado's choice on non-Linux platforms and may be
