@@ -112,6 +112,10 @@ set(XRT_HAVE_LIBUSB ON)
 set(XRT_HAVE_HIDAPI ON)
 if(OXRSYS_WMR_OPENCV)
     set(XRT_HAVE_OPENCV ON)
+    # Monado's SLAM tracker (t_tracker_slam.cpp) needs OpenCV's cv::Mat. The
+    # actual visual-inertial system (Basalt) is a separate shared library
+    # loaded at run time through the VIT plugin interface.
+    set(XRT_FEATURE_SLAM ON)
 endif()
 set(FILE_CONTENTS "#define XRT_BUILD_DRIVER_WMR\n#define XRT_BUILD_DRIVER_PSMV\n")
 foreach(oxrsys_monado_config IN ITEMS build have drivers vulkan android)
@@ -245,6 +249,11 @@ if(OXRSYS_WMR_OPENCV)
         auxiliary/tracking/t_hsv_filter.c
         auxiliary/tracking/t_kalman.cpp
         auxiliary/tracking/t_tracker_psmv.cpp
+        # SLAM (6DoF) through a VIT plugin such as Basalt. The plugin loader
+        # itself is monado/t_vit_loader_macos.c (upstream's is Linux-only) and
+        # the OpenVR ground-truth tracker compiles to stubs without OpenVR.
+        auxiliary/tracking/t_openvr_tracker.cpp
+        auxiliary/tracking/t_tracker_slam.cpp
     )
     list(TRANSFORM OXRSYS_MONADO_OPENCV_SOURCES PREPEND "${OXRSYS_MONADO_XRT}/")
     list(APPEND OXRSYS_MONADO_WMR_SOURCES ${OXRSYS_MONADO_OPENCV_SOURCES})
@@ -255,9 +264,14 @@ set(OXRSYS_MONADO_PLATFORM_SOURCES
     monado/psmv_macos.c
     monado/t_euroc_recorder_stub.c
     monado/u_file_macos.c
+    monado/wmr_camera_tap.c
     monado/wmr_macos.c
     monado/wmr_psmv_tracking.c
+    monado/wmr_slam.c
 )
+if(OXRSYS_WMR_OPENCV)
+    list(APPEND OXRSYS_MONADO_PLATFORM_SOURCES monado/t_vit_loader_macos.c)
+endif()
 if(APPLE)
     # Objective-C++: presents warped eye images on the panel through Metal.
     list(APPEND OXRSYS_MONADO_PLATFORM_SOURCES monado/wmr_panel.mm)
@@ -287,6 +301,8 @@ target_include_directories(oxrsys_monado_wmr
 target_include_directories(oxrsys_monado_wmr SYSTEM PRIVATE "${eigen_SOURCE_DIR}")
 if(OXRSYS_WMR_OPENCV)
     target_include_directories(oxrsys_monado_wmr SYSTEM PUBLIC ${OpenCV_INCLUDE_DIRS})
+    # VIT plugin interface (vit/vit_interface.h) shared with Basalt.
+    target_include_directories(oxrsys_monado_wmr PRIVATE "${OXRSYS_MONADO_EXTERNAL}/vit_includes")
 endif()
 
 target_compile_definitions(oxrsys_monado_wmr
@@ -317,8 +333,11 @@ set_source_files_properties(
     monado/psmv_macos.c
     monado/t_euroc_recorder_stub.c
     monado/u_file_macos.c
+    monado/wmr_camera_tap.c
     monado/wmr_macos.c
     monado/wmr_psmv_tracking.c
+    monado/wmr_slam.c
+    monado/t_vit_loader_macos.c
     PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Wno-unused-parameter"
 )
 

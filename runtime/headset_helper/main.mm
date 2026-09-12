@@ -23,6 +23,7 @@
 #include "wmr_macos.h"
 #include "wmr_panel.h"
 #include "wmr_psmv_tracking.h"
+#include "wmr_slam.h"
 
 #include "os/os_time.h"
 #include "xrt/xrt_device.h"
@@ -34,6 +35,7 @@
 #import <Metal/Metal.h>
 #import <simd/simd.h>
 
+#include <mach-o/dyld.h>
 #include <mach/mach.h>
 #include <servers/bootstrap.h>
 
@@ -358,6 +360,9 @@ struct Options
 	CGDirectDisplayID displayId = 0;
 	bool capture = true;
 	enum u_logging_level logLevel = U_LOGGING_INFO;
+	//! VIT plugin (Basalt) for 6DoF head tracking; empty = search the usual
+	//! places, "none" = IMU only.
+	std::string vitLibrary;
 };
 
 struct ClientState
@@ -391,7 +396,9 @@ struct Helper
 	struct oxrsys_psmv_controller* psmv[4] = {};
 	size_t psmvCount = 0;
 	struct oxrsys_wmr_psmv_tracking* sphereTracking = nullptr;
+	struct oxrsys_wmr_slam* slam = nullptr;
 	std::string controllerKind = "none";
+	std::string trackingKind = "3DoF (IMU)";
 	float eyeHeightM = 1.6f;
 
 	// Metal.
@@ -481,8 +488,10 @@ MakeHeadsetInfo()
 	for (int i = 0; i < 4; i++) info.fov[i] = g.geometry.views[0].fov[i];
 	info.refreshHz = g.refreshHz;
 	info.displayReady = g.panel != nullptr && g.panel->IsReady();
+	info.positionTracked = g.slam != nullptr;
 	info.name = std::string("Windows Mixed Reality ") + oxrsys_wmr_headset_type_str(g.headset->type);
 	info.controllers = g.controllerKind;
+	info.tracking = g.trackingKind;
 	return info;
 }
 
@@ -700,6 +709,17 @@ TrackingLoop()
 			packet.headOrientation[2] = rel.pose.orientation.z;
 			packet.headOrientation[3] = rel.pose.orientation.w;
 		}
+		// 6DoF: the SLAM origin is where tracking started, at eye height.
+		if (valid && (rel.relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT) != 0) {
+			packet.headPosition[0] = rel.pose.position.x;
+			packet.headPosition[1] = g.eyeHeightM + rel.pose.position.y;
+			packet.headPosition[2] = rel.pose.position.z;
+		}
+		if ((rel.relation_flags & XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT) != 0) {
+			packet.headLinearVelocity[0] = rel.linear_velocity.x;
+			packet.headLinearVelocity[1] = rel.linear_velocity.y;
+			packet.headLinearVelocity[2] = rel.linear_velocity.z;
+		}
 		if ((rel.relation_flags & XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT) != 0) {
 			packet.headAngularVelocity[0] = rel.angular_velocity.x;
 			packet.headAngularVelocity[1] = rel.angular_velocity.y;
@@ -841,7 +861,9 @@ RenderLoop()
 				EyeUniforms u;
 				u.rotation = quat_to_simd_matrix(q);
 				const struct xrt_vec3 eyeOffset = quat_rotate(q, {i == 0 ? -0.0315f : 0.0315f, 0.0f, 0.0f});
-				u.position = simd_make_float3(eyeOffset.x, g.eyeHeightM + eyeOffset.y, eyeOffset.z);
+				u.position = simd_make_float3(packet.headPosition[0] + eyeOffset.x,
+				                              packet.headPosition[1] + eyeOffset.y,
+				                              packet.headPosition[2] + eyeOffset.z);
 				const float* fov = g.geometry.views[i].fov;
 				u.tan_fov = simd_make_float4(tanf(fov[0]), tanf(fov[1]), tanf(fov[2]), tanf(fov[3]));
 				u.time = (float)((double)(SteadyNowNs() - g.startNs) / 1e9);
@@ -876,8 +898,14 @@ RenderLoop()
 
 		const int64_t now = SteadyNowNs();
 		if (now - lastStatusNs >= 10000000000LL) {
-			LOGI("%llu frames presented (%llu lobby), client %s", (unsigned long long)g.presented,
-			     (unsigned long long)g.lobbyFrames, c ? "connected" : "none");
+			oxr::protocol::TrackingPacket p;
+			{
+				std::lock_guard<std::mutex> lock(g.poseMutex);
+				p = g.latestPacket;
+			}
+			LOGI("%llu frames presented (%llu lobby), client %s, head %s at (%.2f, %.2f, %.2f) m",
+			     (unsigned long long)g.presented, (unsigned long long)g.lobbyFrames, c ? "connected" : "none",
+			     g.trackingKind.c_str(), p.headPosition[0], p.headPosition[1], p.headPosition[2]);
 			lastStatusNs = now;
 		}
 		} // autoreleasepool
@@ -890,10 +918,64 @@ RenderLoop()
  *
  */
 
+static std::string
+FindVitLibrary()
+{
+	// Explicit choice first.
+	std::string chosen = g.opts.vitLibrary;
+	if (chosen.empty()) {
+		if (const char* env = getenv("OXRSYS_VIT_LIBRARY")) chosen = env;
+	}
+	if (chosen == "none") return std::string();
+	if (!chosen.empty()) return chosen;
+
+	// Otherwise the usual places: next to this executable, then the user's
+	// OXRSys support directory.
+	std::vector<std::string> candidates;
+	char exe[PATH_MAX];
+	uint32_t size = sizeof(exe);
+	if (_NSGetExecutablePath(exe, &size) == 0) {
+		std::string dir = exe;
+		const size_t slash = dir.find_last_of('/');
+		if (slash != std::string::npos) candidates.push_back(dir.substr(0, slash) + "/libbasalt.dylib");
+	}
+	if (const char* home = getenv("HOME")) {
+		candidates.push_back(std::string(home) + "/Library/Application Support/OXRSys/libbasalt.dylib");
+	}
+	for (const std::string& c : candidates) {
+		if (access(c.c_str(), R_OK) == 0) return c;
+	}
+	return std::string();
+}
+
+static void
+StartHeadTracking()
+{
+	if (!oxrsys_wmr_slam_available()) {
+		LOGI("6DoF head tracking not built into this helper (OXRSYS_WMR_OPENCV); IMU orientation only");
+		return;
+	}
+	const std::string lib = FindVitLibrary();
+	if (lib.empty()) {
+		LOGI("no VIT library (libbasalt.dylib) found; IMU orientation only. See docs/platforms/wmr.md (6DoF)");
+		return;
+	}
+	const enum oxrsys_wmr_slam_result r = oxrsys_wmr_slam_create(g.headset->hmd, lib.c_str(), g.opts.logLevel, &g.slam);
+	if (r != OXRSYS_WMR_SLAM_OK) {
+		LOGW("6DoF head tracking unavailable (%s); IMU orientation only", oxrsys_wmr_slam_result_str(r));
+		return;
+	}
+	g.trackingKind = "6DoF (Basalt)";
+	LOGI("6DoF head tracking through %s", lib.c_str());
+}
+
 static bool
 OpenHeadset()
 {
 	std::vector<CGDirectDisplayID> before = oxrsys::WmrPanel::OnlineDisplays();
+	// SLAM is started here, not by the driver, so a missing Basalt does not
+	// stop the headset from opening.
+	oxrsys_wmr_slam_prepare_environment();
 	const enum oxrsys_wmr_open_result result = oxrsys_wmr_headset_open(g.opts.logLevel, &g.headset);
 	if (result != OXRSYS_WMR_OPEN_OK) {
 		LOGE("no usable headset: %s", oxrsys_wmr_open_result_str(result));
@@ -914,13 +996,19 @@ OpenHeadset()
 		g.refreshHz = hz > 1.0 ? (uint32_t)lround(hz) : 90u;
 	}
 
+	// Head: 6DoF through Basalt when available, else the IMU.
+	StartHeadTracking();
+
 	// Controllers: the headset's own, else PS Moves (sphere-tracked with OpenCV).
 	if (g.headset->left != nullptr || g.headset->right != nullptr) {
 		g.controllers[0] = g.headset->left;
 		g.controllers[1] = g.headset->right;
 		g.controllerKind = g.headset->controllers_bluetooth ? "WMR controllers (Bluetooth)" : "WMR controllers (headset radio)";
+	} else if (oxrsys_psmv_count_usable() == 0) {
+		LOGI("no PS Move controller connected over Bluetooth; controllers none");
 	} else {
-		struct xrt_tracking_factory* factory = oxrsys_wmr_psmv_tracking_create(g.headset->hmd, g.opts.logLevel, &g.sphereTracking);
+		struct xrt_tracking_factory* factory = oxrsys_wmr_psmv_tracking_create(
+		    g.headset->hmd, oxrsys_wmr_slam_sinks(g.slam), g.opts.logLevel, &g.sphereTracking);
 		oxrsys_psmv_set_tracking_factory(factory);
 		if (oxrsys_psmv_open_all(g.opts.logLevel, g.psmv, 4, &g.psmvCount) == OXRSYS_PSMV_OPEN_OK) {
 			g.controllers[1] = g.psmv[0]->xdev;
@@ -931,9 +1019,10 @@ OpenHeadset()
 			oxrsys_wmr_psmv_tracking_destroy(&g.sphereTracking);
 		}
 	}
-	LOGI("%s open: panel %ux%u @ %u Hz, eyes %ux%u, controllers %s", oxrsys_wmr_headset_type_str(g.headset->type),
-	     g.geometry.panel_w, g.geometry.panel_h, g.refreshHz, g.geometry.views[0].render_w,
-	     g.geometry.views[0].render_h, g.controllerKind.c_str());
+	LOGI("%s open: panel %ux%u @ %u Hz, eyes %ux%u, head %s, controllers %s",
+	     oxrsys_wmr_headset_type_str(g.headset->type), g.geometry.panel_w, g.geometry.panel_h, g.refreshHz,
+	     g.geometry.views[0].render_w, g.geometry.views[0].render_h, g.trackingKind.c_str(),
+	     g.controllerKind.c_str());
 	return true;
 }
 
@@ -1014,6 +1103,7 @@ Shutdown()
 	for (size_t i = 0; i < g.psmvCount; i++) oxrsys_psmv_close(&g.psmv[i]);
 	oxrsys_psmv_set_tracking_factory(nullptr);
 	oxrsys_wmr_psmv_tracking_destroy(&g.sphereTracking);
+	oxrsys_wmr_slam_destroy(&g.slam);
 	if (g.panel) {
 		g.panel->Close();
 		delete g.panel;
@@ -1053,6 +1143,8 @@ main(int argc, char** argv)
 			g.opts.displayId = (CGDirectDisplayID)strtoul(argv[++i], nullptr, 0);
 		} else if (strcmp(argv[i], "--no-capture") == 0) {
 			g.opts.capture = false;
+		} else if (strcmp(argv[i], "--vit-library") == 0 && hasValue) {
+			g.opts.vitLibrary = argv[++i];
 		} else if (strcmp(argv[i], "--log-level") == 0 && hasValue) {
 			const char* l = argv[++i];
 			g.opts.logLevel = strcmp(l, "trace") == 0 ? U_LOGGING_TRACE
@@ -1061,7 +1153,10 @@ main(int argc, char** argv)
 			                  : strcmp(l, "error") == 0 ? U_LOGGING_ERROR
 			                                            : U_LOGGING_INFO;
 		} else {
-			fprintf(stderr, "usage: %s [--socket PATH] [--display-id ID] [--no-capture] [--log-level LEVEL]\n", argv[0]);
+			fprintf(stderr,
+			        "usage: %s [--socket PATH] [--display-id ID] [--no-capture] [--vit-library PATH|none] "
+			        "[--log-level LEVEL]\n",
+			        argv[0]);
 			return 2;
 		}
 	}
@@ -1069,6 +1164,7 @@ main(int argc, char** argv)
 	if (g.opts.logLevel <= U_LOGGING_ERROR) {
 		setenv("WMR_LOG", levelNames[g.opts.logLevel], 0);
 		setenv("PSMV_LOG", levelNames[g.opts.logLevel], 0);
+		setenv("SLAM_LOG", levelNames[g.opts.logLevel], 0);
 	}
 	if (const char* home = getenv("HOME")) {
 		std::string path = std::string(home) + "/Library/Application Support/OXRSys/oxrsys-headset-helper.log";

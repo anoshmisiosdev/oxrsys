@@ -6,10 +6,13 @@
  * their orientation and input state.
  *
  * Usage:
- *   oxrsys_wmr_probe [--list] [--controllers] [--psmove] [--seconds N] [--rate HZ] [--log-level LEVEL]
+ *   oxrsys_wmr_probe [--list] [--controllers] [--psmove] [--snapshot DIR] [--seconds N] [--rate HZ]
+ *                    [--log-level LEVEL]
  *
  *   --list         Dump every HID device hidapi sees and exit. With --psmove,
  *                  only the PS Move entries, with bus and serial.
+ *   --snapshot DIR Open the headset, write one frame of each tracking camera
+ *                  to DIR/cam0.pgm and DIR/cam1.pgm, and exit.
  *   --controllers  Skip the headset; open the WMR controllers paired over
  *                  Bluetooth and print their state.
  *   --psmove       Skip the headset; open every PlayStation Move controller
@@ -20,7 +23,9 @@
  */
 
 #include "psmv_macos.h"
+#include "wmr_camera_tap.h"
 #include "wmr_macos.h"
+#include "wmr_slam.h"
 
 #include "os/os_time.h"
 #include "util/u_logging.h"
@@ -29,6 +34,7 @@
 #include "xrt/xrt_device.h"
 
 #include <ctype.h>
+#include <inttypes.h>
 #include <math.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -50,7 +56,8 @@ static void
 usage(const char *argv0)
 {
 	fprintf(stderr,
-	        "usage: %s [--list] [--controllers] [--psmove] [--seconds N] [--rate HZ] [--log-level LEVEL]\n",
+	        "usage: %s [--list] [--controllers] [--psmove] [--snapshot DIR] [--seconds N] [--rate HZ] "
+	        "[--log-level LEVEL]\n",
 	        argv0);
 }
 
@@ -274,6 +281,43 @@ struct probe_device
 #define PROBE_MAX_DEVICES 16
 
 /*
+ * --snapshot: write one frame per camera as a binary PGM (8-bit grayscale).
+ */
+struct snapshot
+{
+	const char *dir;
+	volatile bool armed;
+	volatile uint32_t written;
+	bool done[2];
+};
+
+static void
+snapshot_frame(void *userdata, uint32_t cam_index, const struct xrt_frame *frame)
+{
+	struct snapshot *s = userdata;
+	if (!s->armed || cam_index >= 2 || s->done[cam_index] || frame->format != XRT_FORMAT_L8) {
+		return;
+	}
+	char path[1024];
+	snprintf(path, sizeof(path), "%s/cam%u.pgm", s->dir, cam_index);
+	FILE *f = fopen(path, "wb");
+	if (f == NULL) {
+		fprintf(stderr, "Cannot write %s\n", path);
+		s->done[cam_index] = true;
+		return;
+	}
+	fprintf(f, "P5\n%u %u\n255\n", frame->width, frame->height);
+	for (uint32_t y = 0; y < frame->height; y++) {
+		fwrite(frame->data + (size_t)y * frame->stride, 1, frame->width, f);
+	}
+	fclose(f);
+	printf("cam%u: %ux%u, t=%" PRId64 " -> %s\n", cam_index, frame->width, frame->height,
+	       (int64_t)frame->timestamp, path);
+	s->done[cam_index] = true;
+	s->written++;
+}
+
+/*
  * Poll at rate_hz until seconds elapse or a signal arrives.
  */
 static void
@@ -332,10 +376,13 @@ main(int argc, char **argv)
 	bool psmove_only = false;
 	double seconds = -1.0;
 	double rate_hz = 10.0;
+	const char *snapshot_dir = NULL;
 	enum u_logging_level log_level = U_LOGGING_INFO;
 
 	for (int i = 1; i < argc; i++) {
-		if (strcmp(argv[i], "--list") == 0) {
+		if (strcmp(argv[i], "--snapshot") == 0 && i + 1 < argc) {
+			snapshot_dir = argv[++i];
+		} else if (strcmp(argv[i], "--list") == 0) {
 			list_only = true;
 		} else if (strcmp(argv[i], "--controllers") == 0) {
 			controllers_only = true;
@@ -440,6 +487,7 @@ main(int argc, char **argv)
 	}
 
 	struct oxrsys_wmr_headset *headset = NULL;
+	oxrsys_wmr_slam_prepare_environment(); // IMU only; the probe never starts SLAM
 	enum oxrsys_wmr_open_result result = oxrsys_wmr_headset_open(log_level, &headset);
 	if (result != OXRSYS_WMR_OPEN_OK) {
 		fprintf(stderr, "No usable headset: %s\n", oxrsys_wmr_open_result_str(result));
@@ -447,6 +495,28 @@ main(int argc, char **argv)
 	}
 
 	print_hmd_info(headset);
+
+	if (snapshot_dir != NULL) {
+		struct snapshot snap = {.dir = snapshot_dir};
+		struct oxrsys_wmr_camera_tap *tap =
+		    oxrsys_wmr_camera_tap_create(headset->hmd, NULL, snapshot_frame, &snap, log_level);
+		if (tap == NULL) {
+			fprintf(stderr, "Could not tap the headset cameras.\n");
+			oxrsys_wmr_headset_close(&headset);
+			return 1;
+		}
+		// Let exposure settle, then take the next frame of each camera.
+		os_nanosleep(1500 * U_TIME_1MS_IN_NS);
+		snap.armed = true;
+		for (int i = 0; i < 200 && !g_stop && snap.written < oxrsys_wmr_camera_tap_count(tap); i++) {
+			os_nanosleep(10 * U_TIME_1MS_IN_NS);
+		}
+		oxrsys_wmr_camera_tap_destroy(&tap);
+		printf("%u camera frame(s) written to %s\n", snap.written, snapshot_dir);
+		oxrsys_wmr_headset_close(&headset);
+		return snap.written > 0 ? 0 : 1;
+	}
+
 	const struct probe_device devices[] = {
 	    {"head", headset->hmd, true},
 	    {"L", headset->left, false},

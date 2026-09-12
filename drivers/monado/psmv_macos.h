@@ -119,6 +119,14 @@ oxrsys_psmv_set_tracking_factory(struct xrt_tracking_factory *factory);
 int
 oxrsys_psmv_dump_hid_devices(void);
 
+/*!
+ * Number of PS Move controllers connected over Bluetooth (the only bus that
+ * delivers sensor data), without opening any. Cheap; lets a caller skip
+ * setting up sphere tracking when no controller is around.
+ */
+size_t
+oxrsys_psmv_count_usable(void);
+
 #ifdef __cplusplus
 }
 #endif

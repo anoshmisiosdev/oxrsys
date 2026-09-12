@@ -65,16 +65,19 @@ enum class SurfacesStatus : uint32_t
 // HeadsetInfo payload, all little-endian:
 //   u32 panelW, u32 panelH, u32 eyeW, u32 eyeH,
 //   f32 fovLeft, f32 fovRight, f32 fovUp, f32 fovDown   (left eye, radians)
-//   u32 refreshHz, u32 flags (bit0: display ready),
-//   u32 nameLen, bytes name, u32 controllersLen, bytes controllers
+//   u32 refreshHz, u32 flags (bit0: display ready, bit1: position tracked),
+//   u32 nameLen, bytes name, u32 controllersLen, bytes controllers,
+//   u32 trackingLen, bytes tracking
 struct HeadsetInfo
 {
     uint32_t panelW = 0, panelH = 0, eyeW = 0, eyeH = 0;
     float fov[4] = {};
     uint32_t refreshHz = 90;
     bool displayReady = false;
+    bool positionTracked = false;   // 6DoF (SLAM) head poses, else IMU orientation only
     std::string name;
     std::string controllers;
+    std::string tracking;           // human-readable, e.g. "6DoF (Basalt)"
 };
 
 inline void PutF32(std::vector<uint8_t>& b, float v)
@@ -115,9 +118,10 @@ inline std::vector<uint8_t> EncodeHeadsetInfo(const HeadsetInfo& info)
     enc_ipc::PutU32(p, info.eyeH);
     for (float f : info.fov) PutF32(p, f);
     enc_ipc::PutU32(p, info.refreshHz);
-    enc_ipc::PutU32(p, info.displayReady ? 1u : 0u);
+    enc_ipc::PutU32(p, (info.displayReady ? 1u : 0u) | (info.positionTracked ? 2u : 0u));
     PutString(p, info.name);
     PutString(p, info.controllers);
+    PutString(p, info.tracking);
     return p;
 }
 
@@ -130,9 +134,12 @@ inline bool DecodeHeadsetInfo(const std::vector<uint8_t>& payload, HeadsetInfo& 
     info.eyeH = r.U32();
     for (float& f : info.fov) f = GetF32(r);
     info.refreshHz = r.U32();
-    info.displayReady = (r.U32() & 1u) != 0;
+    const uint32_t flags = r.U32();
+    info.displayReady = (flags & 1u) != 0;
+    info.positionTracked = (flags & 2u) != 0;
     info.name = GetString(r);
     info.controllers = GetString(r);
+    info.tracking = GetString(r);
     return r.ok();
 }
 
