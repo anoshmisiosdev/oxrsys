@@ -105,6 +105,11 @@ FetchContent_Declare(
     GIT_SHALLOW ON
 )
 FetchContent_MakeAvailable(OpenXR)
+if(TARGET openxr_loader)
+    # The vendored jsoncpp tests an undefined macro; with the loader's -Werror
+    # that fails Release builds under -Wundef.
+    target_compile_options(openxr_loader PRIVATE -Wno-undef)
+endif()
 
 # Header-only Vulkan discovery. OXRSys must use the application's Vulkan
 # dispatch and therefore intentionally does not link a Vulkan loader.
