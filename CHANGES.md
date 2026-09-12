@@ -24,6 +24,7 @@ This file tracks user-facing, integration-facing, and runtime-relevant changes f
 - Added a local Quest/PICO shell that replaces standby/loading color clears with a 3D grid, upright status panel, reset button, optional `XR_FB_passthrough` mode, controller laser interaction, hand laser/pinch interaction, and visible hand-joint markers.
 - Added a runtime ABR controller with `off`, `bitrate`, and `full` modes, sliding-window hysteresis, fast bitrate downshift, slow recovery, and profile reporting for future session-safe resolution/foveation/upscaling transitions.
 - Added `drivers/`: the Monado Windows Mixed Reality headset driver built on macOS from a commit-pinned upstream checkout, with a hidapi HID backend, hidapi-based headset enumeration, and the `oxrsys_wmr_probe` bring-up tool that prints IMU orientation. Not yet connected to the OpenXR runtime.
+- Added `oxrsys_wmr_display`, which captures a Windows Mixed Reality headset's panel as a macOS display and renders an IMU-driven, distortion-corrected stereo test scene onto it with Metal, with a `--simulate` mode for checking the render path without hardware.
 
 ### Changed
 
