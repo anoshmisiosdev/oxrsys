@@ -143,7 +143,8 @@ add_subdirectory(runtime)
 
 # --- Headset helper: the native process that owns a wired headset ---
 # Host-native only: it links the driver and runs the panel; the runtime
-# (any architecture) talks to it over a socket.
+# (any architecture) talks to it over a socket. Brings the VIT monitor shim
+# (drivers/, oxrsys_vit_monitor) along, built under the same condition.
 if(OXRSYS_BUILD_WMR_DRIVER AND NOT OXRSYS_WMR_CROSS_ARCH)
     add_subdirectory(runtime/headset_helper)
 endif()
