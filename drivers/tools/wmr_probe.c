@@ -2,23 +2,29 @@
 /*!
  * @file
  * @brief Bring-up tool: open a Windows Mixed Reality headset and print its
- * IMU-driven orientation.
+ * IMU-driven orientation, or open the Bluetooth motion controllers and print
+ * their orientation and input state.
  *
  * Usage:
- *   oxrsys_wmr_probe [--list] [--seconds N] [--rate HZ] [--log-level LEVEL]
+ *   oxrsys_wmr_probe [--list] [--controllers] [--seconds N] [--rate HZ] [--log-level LEVEL]
  *
- *   --list       Dump every HID device hidapi sees and exit.
- *   --seconds N  Stop after N seconds (default: run until Ctrl-C).
- *   --rate HZ    Pose print rate (default 10).
- *   --log-level  trace|debug|info|warn|error for the driver (default info).
+ *   --list         Dump every HID device hidapi sees and exit.
+ *   --controllers  Skip the headset; open the controllers paired over
+ *                  Bluetooth and print their state.
+ *   --seconds N    Stop after N seconds (default: run until Ctrl-C).
+ *   --rate HZ      Print rate (default 10).
+ *   --log-level    trace|debug|info|warn|error for the driver (default info).
  */
 
 #include "wmr_macos.h"
 
 #include "os/os_time.h"
 #include "util/u_logging.h"
+#include "util/u_pretty_print.h"
+#include "xrt/xrt_defines.h"
 #include "xrt/xrt_device.h"
 
+#include <ctype.h>
 #include <math.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -39,7 +45,7 @@ on_signal(int sig)
 static void
 usage(const char *argv0)
 {
-	fprintf(stderr, "usage: %s [--list] [--seconds N] [--rate HZ] [--log-level LEVEL]\n", argv0);
+	fprintf(stderr, "usage: %s [--list] [--controllers] [--seconds N] [--rate HZ] [--log-level LEVEL]\n", argv0);
 }
 
 static bool
@@ -82,6 +88,77 @@ quat_to_yaw_pitch_roll(const struct xrt_quat *q, double *yaw, double *pitch, dou
 	*roll = atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (x * x + z * z));
 }
 
+/*
+ * "XRT_INPUT_WMR_TRIGGER_VALUE" / "XRT_INPUT_G2_CONTROLLER_TRIGGER_VALUE" ->
+ * "trigger_value". The tail after the device prefix is what varies per input.
+ */
+static void
+input_short_name(enum xrt_input_name name, char *out, size_t out_size)
+{
+	const char *full = u_str_xrt_input_name(name);
+	const char *tail = strstr(full, "_CONTROLLER_");
+	if (tail != NULL) {
+		tail += strlen("_CONTROLLER_");
+	} else if (strncmp(full, "XRT_INPUT_WMR_", strlen("XRT_INPUT_WMR_")) == 0) {
+		tail = full + strlen("XRT_INPUT_WMR_");
+	} else {
+		tail = full;
+	}
+	size_t i = 0;
+	for (; i + 1 < out_size && tail[i] != '\0'; i++) {
+		out[i] = (char)tolower((unsigned char)tail[i]);
+	}
+	out[i] = '\0';
+}
+
+static void
+print_input_value(const struct xrt_input *input)
+{
+	switch (XRT_GET_INPUT_TYPE(input->name)) {
+	case XRT_INPUT_TYPE_BOOLEAN: printf("%s", input->value.boolean ? "1" : "0"); break;
+	case XRT_INPUT_TYPE_VEC1_ZERO_TO_ONE:
+	case XRT_INPUT_TYPE_VEC1_MINUS_ONE_TO_ONE: printf("%.2f", input->value.vec1.x); break;
+	case XRT_INPUT_TYPE_VEC2_MINUS_ONE_TO_ONE:
+		printf("(%+.2f,%+.2f)", input->value.vec2.x, input->value.vec2.y);
+		break;
+	default: printf("?"); break;
+	}
+}
+
+/*
+ * The first pose-typed input is the grip pose on every WMR controller; the
+ * driver returns the same relation for grip and aim anyway.
+ */
+static enum xrt_input_name
+controller_pose_input(const struct xrt_device *xdev)
+{
+	for (size_t i = 0; i < xdev->input_count; i++) {
+		if (XRT_GET_INPUT_TYPE(xdev->inputs[i].name) == XRT_INPUT_TYPE_POSE) {
+			return xdev->inputs[i].name;
+		}
+	}
+	return XRT_INPUT_GENERIC_HEAD_POSE;
+}
+
+static void
+print_controller_info(const char *tag, const struct xrt_device *xdev)
+{
+	if (xdev == NULL) {
+		printf("%s: none\n", tag);
+		return;
+	}
+	printf("%s: %s (serial %s, %s), orientation=%s position=%s\n", tag, xdev->str, xdev->serial,
+	       u_str_xrt_device_name(xdev->name), xdev->supported.orientation_tracking ? "yes" : "no",
+	       xdev->supported.position_tracking ? "yes" : "no");
+	printf("  inputs:");
+	for (size_t i = 0; i < xdev->input_count; i++) {
+		char name[64];
+		input_short_name(xdev->inputs[i].name, name, sizeof(name));
+		printf(" %s", name);
+	}
+	printf("\n");
+}
+
 static void
 print_hmd_info(const struct oxrsys_wmr_headset *headset)
 {
@@ -94,8 +171,11 @@ print_hmd_info(const struct oxrsys_wmr_headset *headset)
 	       headset->companion_pid);
 	printf("Tracking:  orientation=%s position=%s\n", hmd->supported.orientation_tracking ? "yes" : "no",
 	       hmd->supported.position_tracking ? "yes" : "no");
-	printf("Left ctrl: %s\n", headset->left != NULL ? headset->left->str : "none");
-	printf("Right ctrl:%s\n", headset->right != NULL ? headset->right->str : "none");
+	if (headset->left != NULL || headset->right != NULL) {
+		printf("Controllers: %s\n", headset->controllers_bluetooth ? "Bluetooth" : "headset radio");
+	}
+	print_controller_info("Left ctrl", headset->left);
+	print_controller_info("Right ctrl", headset->right);
 
 	if (parts == NULL) {
 		printf("Display:   (no HMD parts reported)\n");
@@ -119,10 +199,120 @@ print_hmd_info(const struct oxrsys_wmr_headset *headset)
 	       (unsigned)parts->distortion.preferred);
 }
 
+/*
+ * Print one pose line: "<t> <tag> qx qy qz qw yaw pitch roll flags".
+ * Returns false when the orientation was not valid.
+ */
+static bool
+print_pose(const char *tag, struct xrt_device *xdev, enum xrt_input_name pose_name, double t_s, int64_t now_ns)
+{
+	struct xrt_space_relation relation;
+	memset(&relation, 0, sizeof(relation));
+	xrt_result_t xret = xrt_device_get_tracked_pose(xdev, pose_name, now_ns, &relation);
+	if (xret != XRT_SUCCESS) {
+		fprintf(stderr, "%s: get_tracked_pose failed: %d\n", tag, (int)xret);
+		return false;
+	}
+
+	const bool orientation_valid = (relation.relation_flags & XRT_SPACE_RELATION_ORIENTATION_VALID_BIT) != 0;
+	const bool orientation_tracked = (relation.relation_flags & XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT) != 0;
+
+	double yaw, pitch, roll;
+	quat_to_yaw_pitch_roll(&relation.pose.orientation, &yaw, &pitch, &roll);
+	printf("%10.3f %-4s %8.4f %8.4f %8.4f %8.4f  %7.1f %7.1f %7.1f  %s%s\n", t_s, tag,
+	       relation.pose.orientation.x, relation.pose.orientation.y, relation.pose.orientation.z,
+	       relation.pose.orientation.w, rad_to_deg(yaw), rad_to_deg(pitch), rad_to_deg(roll),
+	       orientation_valid ? "valid" : "INVALID", orientation_tracked ? ",tracked" : "");
+	return orientation_valid;
+}
+
+/*
+ * Pose line plus a second line with every non-pose input, name=value.
+ */
+static bool
+print_controller_state(const char *tag, struct xrt_device *xdev, double t_s, int64_t now_ns)
+{
+	xrt_result_t xret = xrt_device_update_inputs(xdev);
+	if (xret != XRT_SUCCESS) {
+		fprintf(stderr, "%s: update_inputs failed: %d\n", tag, (int)xret);
+	}
+
+	const bool valid = print_pose(tag, xdev, controller_pose_input(xdev), t_s, now_ns);
+
+	printf("%15s", "");
+	for (size_t i = 0; i < xdev->input_count; i++) {
+		const struct xrt_input *input = &xdev->inputs[i];
+		if (XRT_GET_INPUT_TYPE(input->name) == XRT_INPUT_TYPE_POSE) {
+			continue;
+		}
+		char name[64];
+		input_short_name(input->name, name, sizeof(name));
+		printf(" %s=", name);
+		print_input_value(input);
+	}
+	printf("\n");
+	return valid;
+}
+
+/*
+ * Poll at rate_hz until seconds elapse or a signal arrives. Any of the
+ * devices may be NULL.
+ */
+static void
+run_loop(double seconds,
+         double rate_hz,
+         struct xrt_device *hmd,
+         struct xrt_device *left,
+         struct xrt_device *right)
+{
+	printf("\nPrinting at %.0f Hz. Ctrl-C to stop.\n", rate_hz);
+	printf("%10s %-4s %8s %8s %8s %8s  %7s %7s %7s  %s\n", "t(s)", "dev", "qx", "qy", "qz", "qw", "yaw", "pitch",
+	       "roll", "flags");
+
+	signal(SIGINT, on_signal);
+	signal(SIGTERM, on_signal);
+
+	const int64_t start_ns = os_monotonic_get_ns();
+	const int64_t period_ns = (int64_t)(1e9 / rate_hz);
+	int64_t next_ns = start_ns;
+	int printed = 0;
+	int untracked = 0;
+
+	while (!g_stop) {
+		const int64_t now_ns = os_monotonic_get_ns();
+		const double t_s = (double)(now_ns - start_ns) / 1e9;
+		if (seconds >= 0.0 && t_s >= seconds) {
+			break;
+		}
+		if (now_ns < next_ns) {
+			const int64_t sleep_ns = next_ns - now_ns;
+			struct timespec ts = {.tv_sec = sleep_ns / 1000000000LL, .tv_nsec = sleep_ns % 1000000000LL};
+			nanosleep(&ts, NULL);
+			continue;
+		}
+		next_ns += period_ns;
+
+		if (hmd != NULL) {
+			untracked += !print_pose("head", hmd, XRT_INPUT_GENERIC_HEAD_POSE, t_s, now_ns);
+		}
+		if (left != NULL) {
+			untracked += !print_controller_state("L", left, t_s, now_ns);
+		}
+		if (right != NULL) {
+			untracked += !print_controller_state("R", right, t_s, now_ns);
+		}
+		fflush(stdout);
+		printed++;
+	}
+
+	printf("\n%d samples printed, %d without a valid orientation.\n", printed, untracked);
+}
+
 int
 main(int argc, char **argv)
 {
 	bool list_only = false;
+	bool controllers_only = false;
 	double seconds = -1.0;
 	double rate_hz = 10.0;
 	enum u_logging_level log_level = U_LOGGING_INFO;
@@ -130,6 +320,8 @@ main(int argc, char **argv)
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--list") == 0) {
 			list_only = true;
+		} else if (strcmp(argv[i], "--controllers") == 0) {
+			controllers_only = true;
 		} else if (strcmp(argv[i], "--seconds") == 0 && i + 1 < argc) {
 			seconds = atof(argv[++i]);
 		} else if (strcmp(argv[i], "--rate") == 0 && i + 1 < argc) {
@@ -159,6 +351,32 @@ main(int argc, char **argv)
 		setenv("WMR_LOG", level_names[log_level], 0);
 	}
 
+	if (controllers_only) {
+		struct xrt_device *left = NULL;
+		struct xrt_device *right = NULL;
+		int count = oxrsys_wmr_open_bt_controllers(log_level, &left, &right);
+		if (count == 0) {
+			fprintf(stderr,
+			        "No Windows Mixed Reality controllers connected over Bluetooth.\n"
+			        "Pair each one in System Settings > Bluetooth: hold the pairing button inside the\n"
+			        "battery compartment until the LEDs flash, then connect 'Motion controller - Left'\n"
+			        "and 'Motion controller - Right'. Run with --list to see what hidapi reports.\n");
+			return 1;
+		}
+
+		print_controller_info("Left ctrl", left);
+		print_controller_info("Right ctrl", right);
+		run_loop(seconds, rate_hz, NULL, left, right);
+
+		if (left != NULL) {
+			xrt_device_destroy(&left);
+		}
+		if (right != NULL) {
+			xrt_device_destroy(&right);
+		}
+		return 0;
+	}
+
 	struct oxrsys_wmr_headset *headset = NULL;
 	enum oxrsys_wmr_open_result result = oxrsys_wmr_headset_open(log_level, &headset);
 	if (result != OXRSYS_WMR_OPEN_OK) {
@@ -167,59 +385,7 @@ main(int argc, char **argv)
 	}
 
 	print_hmd_info(headset);
-	printf("\nPrinting head orientation at %.0f Hz. Ctrl-C to stop.\n", rate_hz);
-	printf("%10s  %8s %8s %8s %8s  %7s %7s %7s  %s\n", "t(s)", "qx", "qy", "qz", "qw", "yaw", "pitch", "roll",
-	       "flags");
-
-	signal(SIGINT, on_signal);
-	signal(SIGTERM, on_signal);
-
-	const int64_t start_ns = os_monotonic_get_ns();
-	const int64_t period_ns = (int64_t)(1e9 / rate_hz);
-	int64_t next_ns = start_ns;
-	int printed = 0;
-	int untracked = 0;
-
-	while (!g_stop) {
-		const int64_t now_ns = os_monotonic_get_ns();
-		if (seconds >= 0.0 && (double)(now_ns - start_ns) / 1e9 >= seconds) {
-			break;
-		}
-		if (now_ns < next_ns) {
-			const int64_t sleep_ns = next_ns - now_ns;
-			struct timespec ts = {.tv_sec = sleep_ns / 1000000000LL, .tv_nsec = sleep_ns % 1000000000LL};
-			nanosleep(&ts, NULL);
-			continue;
-		}
-		next_ns += period_ns;
-
-		struct xrt_space_relation relation;
-		memset(&relation, 0, sizeof(relation));
-		xrt_result_t xret = xrt_device_get_tracked_pose(headset->hmd, XRT_INPUT_GENERIC_HEAD_POSE, now_ns, &relation);
-		if (xret != XRT_SUCCESS) {
-			fprintf(stderr, "get_tracked_pose failed: %d\n", (int)xret);
-			untracked++;
-			continue;
-		}
-
-		const bool orientation_valid = (relation.relation_flags & XRT_SPACE_RELATION_ORIENTATION_VALID_BIT) != 0;
-		const bool orientation_tracked =
-		    (relation.relation_flags & XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT) != 0;
-		if (!orientation_valid) {
-			untracked++;
-		}
-
-		double yaw, pitch, roll;
-		quat_to_yaw_pitch_roll(&relation.pose.orientation, &yaw, &pitch, &roll);
-		printf("%10.3f  %8.4f %8.4f %8.4f %8.4f  %7.1f %7.1f %7.1f  %s%s\n", (double)(now_ns - start_ns) / 1e9,
-		       relation.pose.orientation.x, relation.pose.orientation.y, relation.pose.orientation.z,
-		       relation.pose.orientation.w, rad_to_deg(yaw), rad_to_deg(pitch), rad_to_deg(roll),
-		       orientation_valid ? "valid" : "INVALID", orientation_tracked ? ",tracked" : "");
-		fflush(stdout);
-		printed++;
-	}
-
-	printf("\n%d samples printed, %d without a valid orientation.\n", printed, untracked);
+	run_loop(seconds, rate_hz, headset->hmd, headset->left, headset->right);
 	oxrsys_wmr_headset_close(&headset);
 	return 0;
 }

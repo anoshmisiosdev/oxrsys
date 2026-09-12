@@ -9,6 +9,7 @@
 #include "os_hid_hidapi.h"
 
 #include "util/u_misc.h"
+#include "wmr/wmr_bt_controller.h"
 #include "wmr/wmr_hmd.h"
 
 #include <stdio.h>
@@ -23,6 +24,64 @@
  */
 #define WMR_HOLO_INTERFACE 2
 #define WMR_COMPANION_INTERFACE 0
+
+/*
+ * Bluetooth motion controllers. hidapi cannot read a USB interface number for
+ * Bluetooth HID on macOS and reports -1; newer hidapi also tags the bus.
+ */
+#define WMR_BLUETOOTH_INTERFACE -1
+
+static bool
+is_bt_controller_pid(uint16_t pid)
+{
+	return pid == WMR_CONTROLLER_PID || pid == ODYSSEY_CONTROLLER_PID || pid == REVERB_G2_CONTROLLER_PID;
+}
+
+static bool
+is_bt_controller(const struct hid_device_info *info)
+{
+	if (info->vendor_id != MICROSOFT_VID || !is_bt_controller_pid(info->product_id)) {
+		return false;
+	}
+#if HID_API_VERSION >= HID_API_MAKE_VERSION(0, 13, 0)
+	if (info->bus_type == HID_API_BUS_BLUETOOTH) {
+		return true;
+	}
+	if (info->bus_type != HID_API_BUS_UNKNOWN) {
+		return false;
+	}
+#endif
+	return info->interface_number == WMR_BLUETOOTH_INTERFACE;
+}
+
+/*
+ * Left/right is only told apart by the product string, as in Monado's
+ * wmr_prober.c. Prefix match so a firmware that appends to the name still
+ * classifies.
+ */
+static enum xrt_device_type
+classify_controller_side(const char *product)
+{
+	if (strncmp(product, WMR_CONTROLLER_LEFT_PRODUCT_STRING, strlen(WMR_CONTROLLER_LEFT_PRODUCT_STRING)) == 0) {
+		return XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER;
+	}
+	if (strncmp(product, WMR_CONTROLLER_RIGHT_PRODUCT_STRING, strlen(WMR_CONTROLLER_RIGHT_PRODUCT_STRING)) ==
+	    0) {
+		return XRT_DEVICE_TYPE_RIGHT_HAND_CONTROLLER;
+	}
+	return XRT_DEVICE_TYPE_UNKNOWN;
+}
+
+static const char *
+controller_pid_str(uint16_t pid)
+{
+	switch (pid) {
+	case WMR_CONTROLLER_PID: return "WMR motion controller";
+	case ODYSSEY_CONTROLLER_PID: return "Samsung Odyssey controller";
+	case REVERB_G2_CONTROLLER_PID: return "HP Reverb G2 controller";
+	default: return "unknown controller";
+	}
+}
 
 /*
  * Vendor/product table copied from wmr_prober.c so both stay in step.
@@ -160,10 +219,14 @@ oxrsys_wmr_dump_hid_devices(void)
 		} else if (classify_companion(info->vendor_id, info->product_id, &type)) {
 			note = info->interface_number == WMR_COMPANION_INTERFACE ? "<- display control interface"
 			                                                          : oxrsys_wmr_headset_type_str(type);
-		} else if (info->vendor_id == MICROSOFT_VID &&
-		           (info->product_id == WMR_CONTROLLER_PID || info->product_id == ODYSSEY_CONTROLLER_PID ||
-		            info->product_id == REVERB_G2_CONTROLLER_PID)) {
-			note = "WMR motion controller";
+		} else if (is_bt_controller(info)) {
+			switch (classify_controller_side(product)) {
+			case XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER: note = "<- Bluetooth motion controller (left)"; break;
+			case XRT_DEVICE_TYPE_RIGHT_HAND_CONTROLLER: note = "<- Bluetooth motion controller (right)"; break;
+			default: note = "Bluetooth motion controller (side unknown)"; break;
+			}
+		} else if (info->vendor_id == MICROSOFT_VID && is_bt_controller_pid(info->product_id)) {
+			note = "WMR motion controller (not Bluetooth)";
 		}
 
 		printf("%04x:%04x %-5d 0x%04x 0x%04x %-30.30s %s\n", info->vendor_id, info->product_id,
@@ -186,6 +249,142 @@ find_interface(const struct hid_device_info *list, uint16_t vid, uint16_t pid, i
 		}
 	}
 	return NULL;
+}
+
+/*
+ * One Bluetooth controller candidate from the enumeration. hidapi on macOS
+ * lists one entry per top-level HID collection, all sharing the device path,
+ * so a controller shows up several times; the path identifies the device.
+ */
+struct bt_candidate
+{
+	const struct hid_device_info *info;
+	char product[128];
+};
+
+struct bt_pair
+{
+	struct bt_candidate left;
+	struct bt_candidate right;
+};
+
+static void
+bt_pair_assign(struct bt_pair *pair, const struct hid_device_info *info, enum u_logging_level log_level)
+{
+	char product[128];
+	wcs_to_utf8(info->product_string, product, sizeof(product));
+
+	struct bt_candidate *slot = NULL;
+	switch (classify_controller_side(product)) {
+	case XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER: slot = &pair->left; break;
+	case XRT_DEVICE_TYPE_RIGHT_HAND_CONTROLLER: slot = &pair->right; break;
+	default:
+		U_LOG_IFL_W(log_level, "Ignoring %s %04x:%04x with unrecognised product string '%s'",
+		            controller_pid_str(info->product_id), info->vendor_id, info->product_id, product);
+		return;
+	}
+
+	if (slot->info != NULL) {
+		if (strcmp(slot->info->path, info->path) != 0) {
+			U_LOG_IFL_W(log_level, "Several %s devices report '%s'; using the first (%s).",
+			            controller_pid_str(info->product_id), product, slot->info->path);
+		}
+		return;
+	}
+	slot->info = info;
+	snprintf(slot->product, sizeof(slot->product), "%s", product);
+}
+
+static struct xrt_device *
+open_bt_controller(const struct bt_candidate *candidate,
+                   enum xrt_device_type controller_type,
+                   enum u_logging_level log_level)
+{
+	const struct hid_device_info *info = candidate->info;
+	if (info == NULL) {
+		return NULL;
+	}
+
+	U_LOG_IFL_I(log_level, "Found %s '%s' (%04x:%04x) over Bluetooth", controller_pid_str(info->product_id),
+	            candidate->product, info->vendor_id, info->product_id);
+
+	struct os_hid_device *hid = NULL;
+	int ret = os_hid_open_hidapi_path(info->path, &hid);
+	if (ret != 0) {
+		U_LOG_IFL_E(log_level, "Failed to open Bluetooth controller '%s' (%s): %d", candidate->product,
+		            info->path, ret);
+		return NULL;
+	}
+
+	// The driver owns the HID device from here on, also when it fails. It
+	// reads the controller's calibration over the link, which takes a moment.
+	struct xrt_device *xdev =
+	    wmr_bt_controller_create(hid, controller_type, info->vendor_id, info->product_id, log_level);
+	if (xdev == NULL) {
+		U_LOG_IFL_E(log_level, "Monado WMR driver failed to create the Bluetooth controller '%s'.",
+		            candidate->product);
+	}
+	return xdev;
+}
+
+int
+oxrsys_wmr_open_bt_controllers(enum u_logging_level log_level,
+                               struct xrt_device **out_left,
+                               struct xrt_device **out_right)
+{
+	*out_left = NULL;
+	*out_right = NULL;
+
+	if (hid_init() != 0) {
+		U_LOG_IFL_E(log_level, "hid_init failed");
+		return 0;
+	}
+
+	struct hid_device_info *list = hid_enumerate(MICROSOFT_VID, 0);
+
+	// Group by model so a matched pair is preferred, as wmr_prober.c does.
+	struct bt_pair wmr = {0};
+	struct bt_pair odyssey = {0};
+	struct bt_pair g2 = {0};
+	for (const struct hid_device_info *info = list; info != NULL; info = info->next) {
+		if (!is_bt_controller(info)) {
+			continue;
+		}
+		switch (info->product_id) {
+		case WMR_CONTROLLER_PID: bt_pair_assign(&wmr, info, log_level); break;
+		case ODYSSEY_CONTROLLER_PID: bt_pair_assign(&odyssey, info, log_level); break;
+		case REVERB_G2_CONTROLLER_PID: bt_pair_assign(&g2, info, log_level); break;
+		default: break;
+		}
+	}
+
+	struct bt_pair chosen = {0};
+	if (odyssey.left.info != NULL && odyssey.right.info != NULL) {
+		chosen = odyssey;
+	} else if (g2.left.info != NULL && g2.right.info != NULL) {
+		chosen = g2;
+	} else if (wmr.left.info != NULL && wmr.right.info != NULL) {
+		chosen = wmr;
+	} else {
+		chosen.left = g2.left.info != NULL ? g2.left : odyssey.left.info != NULL ? odyssey.left : wmr.left;
+		chosen.right = g2.right.info != NULL ? g2.right : odyssey.right.info != NULL ? odyssey.right : wmr.right;
+	}
+
+	if (chosen.left.info == NULL && chosen.right.info == NULL) {
+		U_LOG_IFL_I(log_level, "No WMR motion controllers connected over Bluetooth.");
+		hid_free_enumeration(list);
+		return 0;
+	}
+
+	// Paths are only valid while the list lives.
+	int opened = 0;
+	*out_left = open_bt_controller(&chosen.left, XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER, log_level);
+	opened += *out_left != NULL;
+	*out_right = open_bt_controller(&chosen.right, XRT_DEVICE_TYPE_RIGHT_HAND_CONTROLLER, log_level);
+	opened += *out_right != NULL;
+	hid_free_enumeration(list);
+
+	return opened;
 }
 
 enum oxrsys_wmr_open_result
@@ -289,6 +488,13 @@ oxrsys_wmr_headset_open(enum u_logging_level log_level, struct oxrsys_wmr_headse
 	// Hand tracking is not built; the driver never returns one here.
 	if (hand_tracker != NULL) {
 		xrt_device_destroy(&hand_tracker);
+	}
+
+	// 5. Headsets without their own controller radio: pick up the
+	// controllers paired to this machine over Bluetooth instead.
+	if (headset->left == NULL && headset->right == NULL) {
+		int count = oxrsys_wmr_open_bt_controllers(log_level, &headset->left, &headset->right);
+		headset->controllers_bluetooth = count > 0;
 	}
 
 	*out_headset = headset;
