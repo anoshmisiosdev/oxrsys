@@ -203,6 +203,49 @@ With `wired_headset = true` in the config, the panel shows the grid and the
 log reports the session presenting on the headset at 90 Hz with the panel's
 eye size recommended.
 
+## Controllers
+
+Three kinds of controller work with the wired backend, all orientation-only
+(3DoF) for now: the controller's IMU gives its rotation and the runtime places
+it with a fixed arm model around the head that follows head yaw.
+
+| Controller | Link | Inputs mapped |
+|---|---|---|
+| WMR motion controllers (original, Odyssey, Reverb G2) | Bluetooth to the Mac, or the headset's own radio on Reverb G2 / Odyssey+ | trigger, squeeze (grip), menu, thumbstick and click, trackpad click as the lower face button; G2 A/B/X/Y and analog squeeze |
+| PlayStation Move (ZCM1, ZCM2) | Bluetooth to the Mac | trigger, Move button (grip), Start (menu), Cross/Circle as the face buttons |
+
+The runtime prefers the headset's controllers and falls back to PS Moves; with
+Moves, the first one found is the right hand and the second the left. Inputs
+land on the packet's Touch-style fields, so games see an Oculus Touch
+profile.
+
+### Pairing
+
+- **WMR controllers.** Open the battery cover; hold the small pairing button
+  inside until the LEDs flash, then connect `Motion controller - Left` /
+  `Motion controller - Right` in System Settings → Bluetooth. Both must be
+  paired to the Mac, not to a Windows PC. Check with
+  `oxrsys_wmr_probe --list` (they show as `Bluetooth motion controller`) and
+  watch them with `oxrsys_wmr_probe --controllers`.
+- **PS Move ZCM2** (PS4 era, micro-USB): hold PS until the LED blinks and
+  pair it in System Settings → Bluetooth like any gamepad.
+- **PS Move ZCM1** (PS3 era, mini-USB): it only pairs to the host whose
+  Bluetooth address was written to it over USB. Pair it once with a tool that
+  does that (for example `psmove pair` from psmoveapi), then unplug USB; the
+  controller only streams sensor data over Bluetooth, and the runtime skips
+  USB-attached Moves. `oxrsys_wmr_probe --psmove --list` shows the bus each
+  Move is on; `oxrsys_wmr_probe --psmove` prints their state.
+
+### Positional tracking (not built)
+
+The headset's two 640x480 monochrome cameras can locate a lit PS Move
+sphere by brightness (Monado's PS Move tracker) and the WMR controllers' LED
+rings (Monado's constellation module). Both need OpenCV: configure with
+`-DOXRSYS_WMR_OPENCV=ON` after `brew install opencv`. The tracking sources
+and the camera-to-tracker plumbing are the next step; today the camera
+frames go into a no-op sink. With mono cameras only one sphere can be told
+apart at a time unless the controllers use different brightness.
+
 ### Known gaps in the runtime path
 
 - Orientation only; the head sits at a fixed height. Positional tracking
