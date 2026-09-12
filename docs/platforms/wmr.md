@@ -236,15 +236,28 @@ profile.
   USB-attached Moves. `oxrsys_wmr_probe --psmove --list` shows the bus each
   Move is on; `oxrsys_wmr_probe --psmove` prints their state.
 
-### Positional tracking (not built)
+### PS Move sphere position from the headset cameras
 
-The headset's two 640x480 monochrome cameras can locate a lit PS Move
-sphere by brightness (Monado's PS Move tracker) and the WMR controllers' LED
-rings (Monado's constellation module). Both need OpenCV: configure with
-`-DOXRSYS_WMR_OPENCV=ON` after `brew install opencv`. The tracking sources
-and the camera-to-tracker plumbing are the next step; today the camera
-frames go into a no-op sink. With mono cameras only one sphere can be told
-apart at a time unless the controllers use different brightness.
+With OpenCV (`brew install opencv`, configure with `-DOXRSYS_WMR_OPENCV=ON`)
+the runtime tracks one PS Move sphere positionally using the headset's two
+640x480 monochrome head-tracking cameras. `drivers/monado/wmr_psmv_tracking.c`
+builds a stereo calibration from the headset's own calibration blob, runs
+Monado's PS Move sphere tracker on a side-by-side frame combined from both
+cameras, and hands the PS Move driver a tracking factory, so the Move's
+pose carries a position. The sphere is lit white and segmented by brightness
+(the cameras have no colour), so only the first Move gets a position; the
+second stays orientation-only with the arm model. Positions come out in the
+camera frame, which moves with the head; the runtime rotates them by the head
+orientation, treating the first camera as coincident with the head.
+
+The tracker is created only when a Move is connected and torn down otherwise,
+restarting the headset cameras each time (the driver starts them at open).
+Camera exposure and gain are left on the driver's automatic control.
+Not yet verified with a Move in hand: pair one and run
+`oxrsys_wmr_probe --psmove` first (orientation only), then the runtime.
+
+The WMR controllers' LED rings would need Monado's constellation module,
+which is not built.
 
 ### Known gaps in the runtime path
 
