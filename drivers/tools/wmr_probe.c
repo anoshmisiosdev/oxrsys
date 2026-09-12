@@ -6,16 +6,20 @@
  * their orientation and input state.
  *
  * Usage:
- *   oxrsys_wmr_probe [--list] [--controllers] [--seconds N] [--rate HZ] [--log-level LEVEL]
+ *   oxrsys_wmr_probe [--list] [--controllers] [--psmove] [--seconds N] [--rate HZ] [--log-level LEVEL]
  *
- *   --list         Dump every HID device hidapi sees and exit.
- *   --controllers  Skip the headset; open the controllers paired over
+ *   --list         Dump every HID device hidapi sees and exit. With --psmove,
+ *                  only the PS Move entries, with bus and serial.
+ *   --controllers  Skip the headset; open the WMR controllers paired over
  *                  Bluetooth and print their state.
+ *   --psmove       Skip the headset; open every PlayStation Move controller
+ *                  paired over Bluetooth and print its state.
  *   --seconds N    Stop after N seconds (default: run until Ctrl-C).
  *   --rate HZ      Print rate (default 10).
  *   --log-level    trace|debug|info|warn|error for the driver (default info).
  */
 
+#include "psmv_macos.h"
 #include "wmr_macos.h"
 
 #include "os/os_time.h"
@@ -45,7 +49,9 @@ on_signal(int sig)
 static void
 usage(const char *argv0)
 {
-	fprintf(stderr, "usage: %s [--list] [--controllers] [--seconds N] [--rate HZ] [--log-level LEVEL]\n", argv0);
+	fprintf(stderr,
+	        "usage: %s [--list] [--controllers] [--psmove] [--seconds N] [--rate HZ] [--log-level LEVEL]\n",
+	        argv0);
 }
 
 static bool
@@ -255,15 +261,23 @@ print_controller_state(const char *tag, struct xrt_device *xdev, double t_s, int
 }
 
 /*
- * Poll at rate_hz until seconds elapse or a signal arrives. Any of the
- * devices may be NULL.
+ * One device to poll in the loop: a head (pose only) or a controller (pose
+ * and every input). NULL devices are skipped.
+ */
+struct probe_device
+{
+	const char *tag;
+	struct xrt_device *xdev;
+	bool is_head;
+};
+
+#define PROBE_MAX_DEVICES 16
+
+/*
+ * Poll at rate_hz until seconds elapse or a signal arrives.
  */
 static void
-run_loop(double seconds,
-         double rate_hz,
-         struct xrt_device *hmd,
-         struct xrt_device *left,
-         struct xrt_device *right)
+run_loop(double seconds, double rate_hz, const struct probe_device *devices, size_t device_count)
 {
 	printf("\nPrinting at %.0f Hz. Ctrl-C to stop.\n", rate_hz);
 	printf("%10s %-4s %8s %8s %8s %8s  %7s %7s %7s  %s\n", "t(s)", "dev", "qx", "qy", "qz", "qw", "yaw", "pitch",
@@ -292,14 +306,16 @@ run_loop(double seconds,
 		}
 		next_ns += period_ns;
 
-		if (hmd != NULL) {
-			untracked += !print_pose("head", hmd, XRT_INPUT_GENERIC_HEAD_POSE, t_s, now_ns);
-		}
-		if (left != NULL) {
-			untracked += !print_controller_state("L", left, t_s, now_ns);
-		}
-		if (right != NULL) {
-			untracked += !print_controller_state("R", right, t_s, now_ns);
+		for (size_t i = 0; i < device_count; i++) {
+			const struct probe_device *dev = &devices[i];
+			if (dev->xdev == NULL) {
+				continue;
+			}
+			if (dev->is_head) {
+				untracked += !print_pose(dev->tag, dev->xdev, XRT_INPUT_GENERIC_HEAD_POSE, t_s, now_ns);
+			} else {
+				untracked += !print_controller_state(dev->tag, dev->xdev, t_s, now_ns);
+			}
 		}
 		fflush(stdout);
 		printed++;
@@ -313,6 +329,7 @@ main(int argc, char **argv)
 {
 	bool list_only = false;
 	bool controllers_only = false;
+	bool psmove_only = false;
 	double seconds = -1.0;
 	double rate_hz = 10.0;
 	enum u_logging_level log_level = U_LOGGING_INFO;
@@ -322,6 +339,8 @@ main(int argc, char **argv)
 			list_only = true;
 		} else if (strcmp(argv[i], "--controllers") == 0) {
 			controllers_only = true;
+		} else if (strcmp(argv[i], "--psmove") == 0) {
+			psmove_only = true;
 		} else if (strcmp(argv[i], "--seconds") == 0 && i + 1 < argc) {
 			seconds = atof(argv[++i]);
 		} else if (strcmp(argv[i], "--rate") == 0 && i + 1 < argc) {
@@ -341,14 +360,53 @@ main(int argc, char **argv)
 	}
 
 	if (list_only) {
-		oxrsys_wmr_dump_hid_devices();
+		if (psmove_only) {
+			oxrsys_psmv_dump_hid_devices();
+		} else {
+			oxrsys_wmr_dump_hid_devices();
+		}
 		return 0;
 	}
 
-	// The driver reads its own log level from the environment.
+	// The drivers read their own log level from the environment.
 	static const char *level_names[] = {"trace", "debug", "info", "warn", "error"};
 	if (log_level <= U_LOGGING_ERROR) {
 		setenv("WMR_LOG", level_names[log_level], 0);
+		setenv("PSMV_LOG", level_names[log_level], 0);
+	}
+
+	if (psmove_only) {
+		struct oxrsys_psmv_controller *controllers[PROBE_MAX_DEVICES];
+		size_t count = 0;
+		enum oxrsys_psmv_open_result result =
+		    oxrsys_psmv_open_all(log_level, controllers, PROBE_MAX_DEVICES, &count);
+		if (result != OXRSYS_PSMV_OPEN_OK) {
+			fprintf(stderr, "No usable PS Move controller: %s.\n", oxrsys_psmv_open_result_str(result));
+			if (result == OXRSYS_PSMV_OPEN_NONE_FOUND) {
+				fprintf(stderr,
+				        "Pair the controller in System Settings > Bluetooth (hold PS until the LED blinks; a "
+				        "ZCM1 must first be paired over USB) and check it with --psmove --list.\n");
+			}
+			return 1;
+		}
+
+		struct probe_device devices[PROBE_MAX_DEVICES];
+		char tags[PROBE_MAX_DEVICES][8];
+		for (size_t i = 0; i < count; i++) {
+			snprintf(tags[i], sizeof(tags[i]), "M%zu", i);
+			printf("Controller %zu: %s (%04x:%04x, serial '%s')\n", i, oxrsys_psmv_model_str(controllers[i]->model),
+			       controllers[i]->vid, controllers[i]->pid, controllers[i]->serial);
+			print_controller_info(tags[i], controllers[i]->xdev);
+			devices[i].tag = tags[i];
+			devices[i].xdev = controllers[i]->xdev;
+			devices[i].is_head = false;
+		}
+		run_loop(seconds, rate_hz, devices, count);
+
+		for (size_t i = 0; i < count; i++) {
+			oxrsys_psmv_close(&controllers[i]);
+		}
+		return 0;
 	}
 
 	if (controllers_only) {
@@ -366,7 +424,11 @@ main(int argc, char **argv)
 
 		print_controller_info("Left ctrl", left);
 		print_controller_info("Right ctrl", right);
-		run_loop(seconds, rate_hz, NULL, left, right);
+		const struct probe_device devices[] = {
+		    {"L", left, false},
+		    {"R", right, false},
+		};
+		run_loop(seconds, rate_hz, devices, 2);
 
 		if (left != NULL) {
 			xrt_device_destroy(&left);
@@ -385,7 +447,12 @@ main(int argc, char **argv)
 	}
 
 	print_hmd_info(headset);
-	run_loop(seconds, rate_hz, headset->hmd, headset->left, headset->right);
+	const struct probe_device devices[] = {
+	    {"head", headset->hmd, true},
+	    {"L", headset->left, false},
+	    {"R", headset->right, false},
+	};
+	run_loop(seconds, rate_hz, devices, 3);
 	oxrsys_wmr_headset_close(&headset);
 	return 0;
 }
