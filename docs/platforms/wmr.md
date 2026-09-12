@@ -75,6 +75,7 @@ cmake -B build -G Ninja -DFETCHCONTENT_SOURCE_DIR_MONADO=/path/to/monado
 ./build/drivers/oxrsys_wmr_probe --list                # dump every HID device hidapi sees
 ./build/drivers/oxrsys_wmr_probe                       # open the headset, print orientation at 10 Hz
 ./build/drivers/oxrsys_wmr_probe --seconds 5 --rate 2 --log-level debug
+./build/drivers/oxrsys_wmr_probe --snapshot /tmp/snap   # one frame per tracking camera, as PGM
 ```
 
 On success the probe prints the headset model, the panel resolution and refresh
@@ -199,8 +200,9 @@ sizes before it creates a session.
   two frames ahead, and streams `TrackingPacket`s (with the headset's left-eye
   FOV and a default IPD) over the socket; the client injects them into a
   `TrackingReceiver`, so `InputManager`, spaces and reference-space handling
-  see the same data a streaming client would send. Position is fixed at the
-  helper's eye height above the STAGE floor.
+  see the same data a streaming client would send. With Basalt (below) the
+  position is the SLAM position plus the eye height; without it the head
+  sits at the helper's eye height above the STAGE floor.
 - **Frames.** `Session::StartStreamingIfNeeded` attaches the session's Metal
   device instead of starting the streaming server. `Session::EndFrame` hands
   the projection layer's snapshot images to a latest-frame-only queue; a
@@ -306,15 +308,76 @@ Not yet verified with a Move in hand: pair one and run
 The WMR controllers' LED rings would need Monado's constellation module,
 which is not built.
 
+### 6DoF head tracking with Basalt
+
+Monado tracks position with an external visual-inertial system loaded at run
+time through its VIT plugin interface; the supported one is Basalt (Monado's
+fork). The driver library builds Monado's SLAM tracker whenever
+`OXRSYS_WMR_OPENCV=ON` (a macOS `dlopen` loader replaces upstream's
+Linux-only one), and the helper uses it when it finds a Basalt library:
+
+1. Build Basalt once (needs Homebrew `eigen tbb fmt opencv cmake ninja`;
+   a few minutes):
+
+   ```bash
+   drivers/tools/build_basalt.sh
+   ```
+
+   It clones the pinned commit into `~/Library/Caches/OXRSys/basalt`, fetches
+   only the submodules the shared library needs, and builds
+   `libbasalt.dylib` (no Pangolin, no ROS).
+2. Put the library where the helper looks: next to `oxrsys-headset-helper`,
+   or `~/Library/Application Support/OXRSys/libbasalt.dylib`. Or point at it
+   explicitly with `--vit-library PATH` / `OXRSYS_VIT_LIBRARY`;
+   `--vit-library none` forces IMU-only tracking.
+3. Restart the helper. Its log says `6DoF head tracking through ...` and the
+   open line reports `head 6DoF (Basalt)`; the status line every ten seconds
+   prints the head position. `HeadsetInfo` carries a tracking description
+   and a position flag to the runtime.
+
+How it is wired: the driver can start SLAM itself, but then a missing plugin
+makes headset creation fail, so the helper opens the headset with
+`WMR_SLAM=false` and creates the tracker afterwards
+(`drivers/monado/wmr_slam.c`) from the calibration the driver already
+computed (`wh->tracking.slam_calib`), routes both cameras and the IMU into
+it, and flips the driver to `slam_over_3dof`. The driver then applies
+Basalt's pose (with its IMU-to-eye offset) in `xrt_device_get_tracked_pose`,
+predicted with the IMU. The SLAM origin is wherever tracking started; the
+helper adds the eye height so the floor stays where it was. `SLAM_LOG=trace`
+prints every frame and IMU sample handed to Basalt; `SLAM_*` variables from
+Monado (`SLAM_PREDICTION_TYPE`, `SLAM_CONFIG` for a Basalt config file
+instead of the driver calibration) work unchanged.
+
+Camera restarts: the WMR source only takes new sinks by stopping and
+restarting the cameras, and its stop merely requests cancellation of the USB
+transfers; a start before libusb finishes cancelling fails with
+`LIBUSB_ERROR_BUSY`, which the driver treats as fatal. Every consumer (SLAM,
+the PS Move sphere tracker, the camera tap) therefore goes through
+`oxrsys_wmr_camera_route()`, which waits in between, and later consumers
+split the frames with earlier ones instead of replacing them.
+
+What the cameras see: `oxrsys_wmr_probe --snapshot DIR` writes one frame of
+each camera as `DIR/cam0.pgm` and `DIR/cam1.pgm` (8-bit grayscale, 640x480).
+Basalt needs a textured scene at a reasonable distance; a headset lying in a
+lap looking at a cable and a leg gives it nothing usable, and a
+visual-inertial tracker without visual constraints drifts away quadratically
+on the IMU alone. Verify with the headset worn, or on a desk facing the room.
+
 ### Known gaps in the runtime path
 
-- Orientation only; the head sits at a fixed height. Positional tracking
-  needs SLAM or an external tracker.
+- Positional tracking needs Basalt (above); without it the head sits at a
+  fixed height.
+- Slow initial levelling. Monado's 3DoF fusion starts from identity and pulls
+  toward gravity at only 3°/s while the headset is still (faster while it
+  moves), so a headset picked up off a desk reads a wrong pitch for up to
+  half a minute. Worn from the start, or moved around for a few seconds, it
+  levels quickly. On a Dell Visor the fusion was verified to converge and hold
+  (yaw drift about 1°/s from gyro bias, no positional reference to correct it).
 - The protocol carries one FOV for both eyes; the right eye is mirrored from
   the left. WMR eyes differ by well under a degree, so this is tolerable.
 - No timewarp: a late frame is shown as rendered. Prediction covers the
   nominal pipeline latency only.
-- Timewarp and positional head tracking are still missing; see above.
+- Timewarp is still missing; see above.
 
 ### x86_64 build for the Wine bridge
 
@@ -383,12 +446,9 @@ read the USB interface number; report that with the full `--list` output.
 - **Cameras are mandatory in the driver.** `wmr_hmd_create()` fails if libusb
   cannot claim interface 3 of the sensors device. If macOS ever holds that
   interface, the fix is a small Monado patch to make the source optional.
-- **Orientation only.** Positional (6DoF) tracking in Monado comes from its
-  Basalt SLAM integration, which is not built here.
-- **No runtime integration yet.** The display tool proves the presentation
-  path; the next step is a local wired backend in the runtime that feeds
-  `xrt_device` poses into the tracking path and presents submitted OpenXR
-  layers through the same warp instead of a test scene.
+- **6DoF needs a separately built Basalt.** The SLAM tracker is built in,
+  the visual-inertial system is not; see "6DoF head tracking with Basalt".
+  Its quality on a Dell Visor is not yet characterised.
 - **Display detection is by pixel size.** The panel is matched by a display
   mode equal to `screens[0]`; a monitor with the same native resolution would
   also match, so use `--display-id` in that case.
