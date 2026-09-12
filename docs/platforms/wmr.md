@@ -84,24 +84,30 @@ arguments.
 ## Display
 
 ```bash
-./build/drivers/oxrsys_wmr_display                     # room scene on the headset, Ctrl-C to stop
+./build/drivers/oxrsys_wmr_display --list-displays     # what macOS sees right now, with modes
+./build/drivers/oxrsys_wmr_display --solid             # cycle red/green/blue on the panel
 ./build/drivers/oxrsys_wmr_display --pattern           # lens-calibration rings and crosshair
+./build/drivers/oxrsys_wmr_display                     # room scene on the headset, Ctrl-C to stop
 ./build/drivers/oxrsys_wmr_display --no-distortion     # raw eye images, for comparison
 ./build/drivers/oxrsys_wmr_display --simulate --screenshot out.png   # no hardware: synthetic headset
 ```
 
 What it does, in order:
 
-1. Opens the headset through the driver. `wmr_hmd_create()` sends the
-   panel-on command, so the display hot-plugs a moment later.
+1. Records which displays are online, then opens the headset through the
+   driver. `wmr_hmd_create()` sends the panel-on command, so the display
+   hot-plugs a moment later.
 2. Waits up to `--display-timeout` seconds (default 20) for a non-built-in
-   display that has a mode matching the panel's pixel size, or uses
-   `--display-id`. If nothing appears it lists the online displays and exits 1.
-3. Takes the display out of any mirror set, switches it to the panel's native
-   mode at the highest refresh rate, and captures it (`CGDisplayCapture`), so
-   the desktop never shows on the panel.
-4. Covers it with a borderless window at the shielding level holding a
-   `CAMetalLayer` whose drawable is exactly the panel size.
+   display that has a mode matching the panel's pixel size, or failing that
+   any display that was not online in step 1, or uses `--display-id`. If
+   nothing appears it lists the online displays with their modes and exits 1.
+3. Takes the display out of any mirror set and switches it to the panel's
+   native mode at the highest refresh rate (or its largest mode, with a
+   warning, when no exact one exists). With `--capture` it also captures the
+   display through `CGDisplayCapture`; by default it does not.
+4. Covers it with a borderless window at the screen-saver level (shielding
+   level when captured) holding a `CAMetalLayer` whose drawable matches the
+   display's pixel size.
 5. Each refresh: predicts the eye poses ~16 ms ahead with the driver's
    `get_view_poses`, renders a procedural room per eye (coloured walls, 0.5 m
    grid, bright marker straight ahead) into eye-sized textures, then draws the
@@ -119,6 +125,31 @@ A frame is: two eye passes, one warp pass into a panel-sized texture, one blit
 into the drawable. The panel texture is CPU-shared only so `--screenshot` can
 read it; the runtime integration should render the warp straight into the
 drawable.
+
+### Troubleshooting a blank panel
+
+The tool prints a status line every two seconds (frames, fps, whether the
+display link or the fallback timer is pacing, drawable size, window
+visibility). Read it together with the display lines printed at start-up.
+
+- **Uniform light gray, and the tool said no display appeared.** The panel's
+  backlight is on but macOS never brought up a DisplayPort link, and a backlit
+  LCD with no pixel data is light gray. Check `--list-displays` while the
+  headset is on: if only the built-in display is listed, the problem is the
+  cable or adapter. 4320x2160 at 90 Hz needs DP 1.4 HBR3 end to end; many
+  USB-C to DisplayPort cables and hubs only carry HBR2. Also plug USB before
+  running the tool, since the panel only enables its DP link after the
+  activate command.
+- **A new display appeared but with a smaller mode.** The link came up at
+  reduced bandwidth. The tool uses the largest mode and scales; the image will
+  be soft. Same cable/adapter advice applies.
+- **Display appeared and frames are rendering but the panel stays gray.** Try
+  `--solid` (cycling colours, no scene) and then `--capture`, which switches
+  to the shielding-level window path. Report the start-up lines and status
+  lines.
+- **Oasis or other Windows drivers.** Oasis rebinds the Windows USB driver on
+  that PC only; it does not change the headset, so a headset set up with Oasis
+  works here unchanged.
 
 ## How A Headset Is Opened
 
