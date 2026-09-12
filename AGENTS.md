@@ -124,12 +124,15 @@ As of March 17, 2026, the pinned non-interactive OpenXR-CTS baseline is green lo
   pieces under `drivers/monado/` and keep the source lists in `drivers/CMakeLists.txt` in step with
   the pinned revision. See `docs/platforms/wmr.md`.
 - A wired headset (`WiredHeadset`, enabled by `wired_headset = true`) replaces the streaming
-  server for a session: it must be opened in `Instance::GetSystem` so the recommended eye size
-  matches the panel, its tracking is injected through the normal `TrackingReceiver`, and its
-  presenter consumes `FrameSource` snapshots through a latest-frame-only queue, waiting on the
-  snapshot's shared event on the GPU. `Session::EndFrame` must stay non-blocking on that path
-  too. Only one process can hold the headset's camera interface, so hardware tests must not
-  run concurrently.
+  server for a session. The headset itself is owned by `oxrsys-headset-helper`
+  (`runtime/headset_helper/`, native arm64: driver, captured display, tracking, idle lobby); the
+  runtime is only a socket client that must connect in `Instance::GetSystem` so the recommended eye
+  size matches the panel, injects the helper's tracking through the normal `TrackingReceiver`, and
+  composes `FrameSource` snapshots into shared IOSurface slots on its own thread, waiting on the
+  snapshot's shared event on the GPU. Keep the runtime side free of USB, Monado and AppKit so it
+  works inside a Wine process. `Session::EndFrame` must stay non-blocking on that path too. Only
+  one process can hold the headset's camera interface, so hardware tests must not run concurrently
+  and the helper must be stopped before running the probe or display tools.
 
 ## Runtime Files And Registration
 

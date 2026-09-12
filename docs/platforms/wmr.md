@@ -162,32 +162,76 @@ patch changes two bytes.
 
 ## Runtime Integration
 
-`runtime/src/WiredHeadset.mm` is the wired backend. It is a process-wide
-singleton because the panel window and the USB driver outlive sessions, and
-because the app asks for view sizes before it creates a session.
+The headset is owned by its own process, `oxrsys-headset-helper`
+(`runtime/headset_helper/`), not by the game. It opens the headset through
+the driver, captures the panel's display with `CGDisplayCapture` and covers it
+with a shielding-level window so no other window can ever appear on it, runs
+tracking, and renders a head-tracked lobby whenever no session is submitting
+frames. The runtime inside the game process, `runtime/src/WiredHeadset.mm`, is
+a thin client: it connects to the helper's Unix socket (starting the helper if
+it is not running), receives tracking packets, shares four side-by-side frame
+surfaces once through a Mach rendezvous (the same scheme as the encoder
+helper), and then submits frames by slot number. Nothing in the game process
+touches USB or AppKit, which is why this works inside an x86_64 Wine process
+where an in-process window did not.
+
+```
+  game process (any arch)                        oxrsys-headset-helper (arm64)
+  WiredHeadset ─ Unix socket ─────────────────►  socket server
+    Hello / Surfaces / SubmitFrame(slot)          Monado driver, tracking thread
+    ◄── HeadsetInfo, Tracking, FrameReleased      WmrPanel (captured display)
+    IOSurface x4  ── Mach send rights ────────►   lobby or client frame, 90 Hz
+```
+
+`WiredHeadset` is a process-wide singleton because the app asks for view
+sizes before it creates a session.
 
 - **Config.** `wired_headset = true` in `oxrsys-runtime.toml` (plus optional
   `wired_display_id` and `wired_eye_height_m`). Off by default; streaming
   setups are untouched.
 - **Open.** `Instance::GetSystem` calls `WiredHeadset::EnsureOpen`, which
-  opens the headset through the driver (panel on), finds its display, switches
-  it to native mode, and sets `Instance::EyeWidth/EyeHeight` to the panel's
-  per-eye size so `xrEnumerateViewConfigurationViews` recommends it.
-- **Tracking.** A thread polls the driver's head pose at 250 Hz, predicted two
-  frames ahead, and injects it into a `TrackingReceiver` as a
-  `TrackingPacket`, carrying the headset's left-eye FOV and a default IPD.
-  `InputManager`, spaces, and reference-space handling see the same data a
-  streaming client would send. Position is fixed at `wired_eye_height_m`
-  above the STAGE floor.
+  connects to the helper (spawning `wired_helper_path`, or the
+  `oxrsys-headset-helper` next to the runtime dylib, in its own session so it
+  outlives the game), receives the headset description, and sets
+  `Instance::EyeWidth/EyeHeight` to the panel's per-eye size so
+  `xrEnumerateViewConfigurationViews` recommends it.
+- **Tracking.** The helper polls the driver's head pose at 250 Hz, predicted
+  two frames ahead, and streams `TrackingPacket`s (with the headset's left-eye
+  FOV and a default IPD) over the socket; the client injects them into a
+  `TrackingReceiver`, so `InputManager`, spaces and reference-space handling
+  see the same data a streaming client would send. Position is fixed at the
+  helper's eye height above the STAGE floor.
 - **Frames.** `Session::StartStreamingIfNeeded` attaches the session's Metal
   device instead of starting the streaming server. `Session::EndFrame` hands
   the projection layer's snapshot images to a latest-frame-only queue; a
-  presenter thread waits on the snapshot's shared event on the GPU and draws
-  both eyes through the distortion mesh (`drivers/monado/wmr_panel.mm`) into
-  the panel's drawable. `xrWaitFrame` paces at the panel's refresh rate.
-  `xrEndFrame` never blocks on the GPU or the display.
+  compose thread waits on the snapshot's shared event on the GPU, draws both
+  eyes side by side into a free IOSurface slot, waits for that GPU work, and
+  sends the slot number. The helper warps the newest slot through the
+  distortion mesh (`drivers/monado/wmr_panel.mm`) at the panel's refresh and
+  returns superseded slots. `xrWaitFrame` paces at the panel's refresh rate.
+  `xrEndFrame` never blocks on the GPU, the socket, or the display.
+- **Lobby.** With no client, or half a second after the last frame, the
+  helper renders a head-tracked room so the panel is never blank and a game
+  launch or crash never leaves the headset showing the desktop.
 - **Status.** `runtime_status.json` reports `state = "streaming"`,
   `transport = "wired"`, `device_type = "wmr"`.
+
+### Deploying
+
+Put `oxrsys-headset-helper` (from the native arm64 build,
+`build/runtime/headset_helper/`) next to `liboxrsys-runtime.dylib` and ad-hoc
+sign both, as for the encoder helper. The runtime starts it on demand; you
+can also start it yourself (or from Home) to get the lobby before any game:
+
+```bash
+cp build/runtime/headset_helper/oxrsys-headset-helper ~/liboxrsys-runtime-1.1.0/
+codesign --force --sign - ~/liboxrsys-runtime-1.1.0/oxrsys-headset-helper
+~/liboxrsys-runtime-1.1.0/oxrsys-headset-helper &      # optional: lobby now
+```
+
+It logs to `~/Library/Application Support/OXRSys/oxrsys-headset-helper.log`
+and listens on `/tmp/oxrsys-headset-<uid>.sock`. Stop it before using the
+probe or display tools, which need the headset for themselves.
 
 ### Smoke test
 

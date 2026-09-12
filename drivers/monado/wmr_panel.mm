@@ -41,13 +41,19 @@ struct MeshOut {
     float2 b_uv;
 };
 
-vertex MeshOut mesh_vertex(MeshIn in [[stage_in]]) {
+struct MeshUniforms {
+    float2 uv_offset;
+    float2 uv_scale;
+};
+
+vertex MeshOut mesh_vertex(MeshIn in [[stage_in]], constant MeshUniforms &u [[buffer(1)]]) {
     MeshOut out;
     // Monado meshes are Vulkan-oriented (y = -1 is the top); Metal has +y up.
     out.position = float4(in.pos_ruv.x, -in.pos_ruv.y, 0.0, 1.0);
-    out.r_uv = in.pos_ruv.zw;
-    out.g_uv = in.guv_buv.xy;
-    out.b_uv = in.guv_buv.zw;
+    // The eye may live in a sub-rectangle of a shared texture.
+    out.r_uv = in.pos_ruv.zw * u.uv_scale + u.uv_offset;
+    out.g_uv = in.guv_buv.xy * u.uv_scale + u.uv_offset;
+    out.b_uv = in.guv_buv.zw * u.uv_scale + u.uv_offset;
     return out;
 }
 
@@ -133,9 +139,11 @@ find_native_mode(CGDirectDisplayID display, uint32_t w, uint32_t h, bool *out_ex
 static CGDirectDisplayID
 find_panel_display(uint32_t w, uint32_t h, const std::vector<CGDirectDisplayID> &before)
 {
+	// The panel may well be the main display (macOS picks it when the
+	// built-in screen is off), so only the built-in screen is excluded.
 	const std::vector<CGDirectDisplayID> now = online_displays();
 	for (CGDirectDisplayID id : now) {
-		if (CGDisplayIsMain(id) || CGDisplayIsBuiltin(id)) {
+		if (CGDisplayIsBuiltin(id)) {
 			continue;
 		}
 		bool exact = false;
@@ -152,7 +160,7 @@ find_panel_display(uint32_t w, uint32_t h, const std::vector<CGDirectDisplayID> 
 		for (CGDirectDisplayID old : before) {
 			was_online |= old == id;
 		}
-		if (!was_online && !CGDisplayIsMain(id) && !CGDisplayIsBuiltin(id)) {
+		if (!was_online && !CGDisplayIsBuiltin(id)) {
 			return id;
 		}
 	}
@@ -537,6 +545,9 @@ WmrPanel::Present(id<MTLCommandQueue> queue,
 			MTLScissorRect sc = {(NSUInteger)(v.x_pixels * sx), (NSUInteger)(v.y_pixels * sy),
 			                     (NSUInteger)(v.w_pixels * sx), (NSUInteger)(v.h_pixels * sy)};
 			[enc setScissorRect:sc];
+			const float uniforms[4] = {eyes[i]->uvOffset[0], eyes[i]->uvOffset[1], eyes[i]->uvScale[0],
+			                           eyes[i]->uvScale[1]};
+			[enc setVertexBytes:uniforms length:sizeof(uniforms) atIndex:1];
 			[enc setFragmentTexture:eyes[i]->texture atIndex:0];
 			[enc drawIndexedPrimitives:MTLPrimitiveTypeTriangleStrip
 			                indexCount:impl_->meshIndexCounts[i]

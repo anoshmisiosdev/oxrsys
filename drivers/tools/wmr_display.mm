@@ -536,9 +536,10 @@ find_native_mode(CGDirectDisplayID display, uint32_t w, uint32_t h, bool *out_ex
 static CGDirectDisplayID
 find_panel_display(uint32_t w, uint32_t h, const std::vector<CGDirectDisplayID> &before, bool *out_exact)
 {
+	// The panel may be the main display when the built-in screen is off.
 	const std::vector<CGDirectDisplayID> now = online_displays();
 	for (CGDirectDisplayID id : now) {
-		if (CGDisplayIsMain(id) || CGDisplayIsBuiltin(id)) {
+		if (CGDisplayIsBuiltin(id)) {
 			continue;
 		}
 		bool exact = false;
@@ -556,7 +557,7 @@ find_panel_display(uint32_t w, uint32_t h, const std::vector<CGDirectDisplayID> 
 		for (CGDirectDisplayID old : before) {
 			was_online |= old == id;
 		}
-		if (!was_online && !CGDisplayIsMain(id) && !CGDisplayIsBuiltin(id)) {
+		if (!was_online && !CGDisplayIsBuiltin(id)) {
 			*out_exact = false;
 			return id;
 		}

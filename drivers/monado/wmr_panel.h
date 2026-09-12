@@ -58,6 +58,10 @@ struct WmrPanelEyeInput
 	id<MTLTexture> texture = nil;
 	id<MTLSharedEvent> waitEvent = nil;
 	uint64_t waitValue = 0;
+	//! Sub-rectangle of the texture holding this eye, in normalised
+	//! coordinates: uv' = uv * scale + offset. Default: the whole texture.
+	float uvOffset[2] = {0.0f, 0.0f};
+	float uvScale[2] = {1.0f, 1.0f};
 };
 
 class WmrPanel
