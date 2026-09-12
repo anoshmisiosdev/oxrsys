@@ -179,6 +179,12 @@ static struct xrt_prober g_shim_prober = {
     .get_string_descriptor = shim_get_string_descriptor,
 };
 
+void
+oxrsys_psmv_set_tracking_factory(struct xrt_tracking_factory *factory)
+{
+	g_shim_prober.tracking = factory;
+}
+
 /*
  *
  * Enumeration.

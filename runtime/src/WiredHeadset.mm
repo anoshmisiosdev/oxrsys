@@ -20,6 +20,7 @@
 #include "psmv_macos.h"
 #include "wmr_macos.h"
 #include "wmr_panel.h"
+#include "wmr_psmv_tracking.h"
 
 #include "os/os_time.h"
 #include "xrt/xrt_device.h"
@@ -152,6 +153,18 @@ void MapControllerInputs(const struct xrt_device* xdev, Hand hand, oxr::protocol
     }
 }
 
+// Rotate a vector by a quaternion: v' = v + 2w(q x v) + 2 q x (q x v).
+struct xrt_vec3 quat_rotate(const struct xrt_quat& q, const struct xrt_vec3& v)
+{
+    const float cx = q.y * v.z - q.z * v.y;
+    const float cy = q.z * v.x - q.x * v.z;
+    const float cz = q.x * v.y - q.y * v.x;
+    const float ccx = q.y * cz - q.z * cy;
+    const float ccy = q.z * cx - q.x * cz;
+    const float ccz = q.x * cy - q.y * cx;
+    return {v.x + 2.0f * (q.w * cx + ccx), v.y + 2.0f * (q.w * cy + ccy), v.z + 2.0f * (q.w * cz + ccz)};
+}
+
 // Rotate a vector by the yaw component of a quaternion only.
 struct xrt_vec3 YawRotate(const struct xrt_quat& q, float x, float y, float z)
 {
@@ -180,6 +193,8 @@ struct WiredHeadset::Impl
     struct oxrsys_psmv_controller* psmv[kMaxPsMove] = {};
     size_t psmvCount = 0;
     std::string controllerKind;
+    // Sphere tracking on the headset cameras (OpenCV builds only).
+    struct oxrsys_wmr_psmv_tracking* sphereTracking = nullptr;
 
     // Tracking.
     std::unique_ptr<TrackingReceiver> tracking;
@@ -267,6 +282,12 @@ bool WiredHeadset::EnsureOpen(const ConfigValues& config)
     }
     else
     {
+        // Sphere position from the headset cameras when the library has
+        // OpenCV; the factory must exist before the Moves are created.
+        struct xrt_tracking_factory* factory =
+            oxrsys_wmr_psmv_tracking_create(headset->hmd, U_LOGGING_INFO, &impl_->sphereTracking);
+        oxrsys_psmv_set_tracking_factory(factory);
+
         const enum oxrsys_psmv_open_result psmvResult =
             oxrsys_psmv_open_all(U_LOGGING_INFO, impl_->psmv, kMaxPsMove, &impl_->psmvCount);
         if (psmvResult == OXRSYS_PSMV_OPEN_OK)
@@ -281,6 +302,9 @@ bool WiredHeadset::EnsureOpen(const ConfigValues& config)
         else
         {
             impl_->controllerKind = "none";
+            // No Move to track: do not keep the camera pipeline running.
+            oxrsys_psmv_set_tracking_factory(nullptr);
+            oxrsys_wmr_psmv_tracking_destroy(&impl_->sphereTracking);
         }
     }
     spdlog::info("WiredHeadset: controllers: {} (left {}, right {})", impl_->controllerKind,
@@ -352,6 +376,8 @@ void WiredHeadset::Close()
         oxrsys_psmv_close(&impl_->psmv[i]);
     }
     impl_->psmvCount = 0;
+    oxrsys_psmv_set_tracking_factory(nullptr);
+    oxrsys_wmr_psmv_tracking_destroy(&impl_->sphereTracking);
     if (impl_->headset != nullptr)
     {
         oxrsys_wmr_headset_close(&impl_->headset);
@@ -549,9 +575,20 @@ void WiredHeadset::Impl::TrackingLoop()
 
             float* pos = hand == Hand::Left ? packet.leftControllerPos : packet.rightControllerPos;
             float* rot = hand == Hand::Left ? packet.leftControllerRot : packet.rightControllerRot;
-            const struct xrt_vec3 offset = YawRotate(relation.pose.orientation,
-                                                     hand == Hand::Left ? -kArmOffsetX : kArmOffsetX,
-                                                     kArmOffsetY, kArmOffsetZ);
+            const bool positionTracked =
+                (ctrlRelation.relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT) != 0;
+            struct xrt_vec3 offset;
+            if (positionTracked)
+            {
+                // Sphere position is in the headset camera frame, which rides
+                // on the head: rotate it by the full head orientation.
+                offset = quat_rotate(relation.pose.orientation, ctrlRelation.pose.position);
+            }
+            else
+            {
+                offset = YawRotate(relation.pose.orientation, hand == Hand::Left ? -kArmOffsetX : kArmOffsetX,
+                                   kArmOffsetY, kArmOffsetZ);
+            }
             pos[0] = packet.headPosition[0] + offset.x;
             pos[1] = packet.headPosition[1] + offset.y;
             pos[2] = packet.headPosition[2] + offset.z;

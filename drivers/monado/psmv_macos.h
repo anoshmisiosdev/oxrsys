@@ -103,6 +103,14 @@ void
 oxrsys_psmv_close(struct oxrsys_psmv_controller **controller_ptr);
 
 /*!
+ * Tracking factory handed to the PS Move driver for every controller opened
+ * afterwards (see wmr_psmv_tracking.h). NULL (the default) means orientation
+ * only. The factory must outlive the controllers.
+ */
+void
+oxrsys_psmv_set_tracking_factory(struct xrt_tracking_factory *factory);
+
+/*!
  * Print every PS Move HID device hidapi can see, with bus and serial.
  * Diagnostic aid for pairing.
  *
