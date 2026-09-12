@@ -212,6 +212,7 @@ set(OXRSYS_MONADO_PLATFORM_SOURCES
     monado/t_euroc_recorder_stub.c
     monado/u_file_macos.c
     monado/wmr_macos.c
+    monado/wmr_psmv_tracking.c
 )
 if(APPLE)
     # Objective-C++: presents warped eye images on the panel through Metal.
@@ -266,6 +267,7 @@ set_source_files_properties(
     monado/t_euroc_recorder_stub.c
     monado/u_file_macos.c
     monado/wmr_macos.c
+    monado/wmr_psmv_tracking.c
     PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Wno-unused-parameter"
 )
 
