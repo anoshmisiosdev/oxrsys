@@ -374,6 +374,15 @@ ConfigValues ParseConfigToml(std::istream& input, const ConfigValues& defaults)
                     values.wiredEyeHeightM = val;
                 }
             }
+            else if (key == "wired_helper_path")
+            {
+                std::string path = value;
+                if (path.size() >= 2 && path.front() == '"' && path.back() == '"')
+                {
+                    path = path.substr(1, path.size() - 2);
+                }
+                values.wiredHelperPath = path;
+            }
             else if (key == "keyframe_interval_sec")
             {
                 int val = std::stoi(value);

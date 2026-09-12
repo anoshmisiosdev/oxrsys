@@ -59,6 +59,7 @@ struct ConfigValues
     bool wiredHeadset = false;
     uint32_t wiredDisplayId = 0;     // CGDirectDisplayID of the panel; 0 = auto-detect
     float wiredEyeHeightM = 1.6f;    // Orientation-only tracking reports the head at this height
+    std::string wiredHelperPath = ""; // oxrsys-headset-helper binary; empty = sibling of the runtime dylib
 
     bool fileLogging = true;        // Write logs to oxrsys-runtime.log
     bool questLogcat = false;       // Capture Quest logcat to oxrsys-headset.log

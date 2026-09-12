@@ -96,6 +96,12 @@ wired_display_id = 0
 # height above the STAGE floor, in meters.
 wired_eye_height_m = 1.6
 
+# The headset is owned by a separate native process, oxrsys-headset-helper,
+# which shows a lobby on the panel between sessions. The runtime connects to
+# it and starts it if it is not running. Empty = look next to the runtime
+# dylib (also $OXRSYS_HEADSET_HELPER_PATH).
+wired_helper_path = ""
+
 [logging]
 # Write server logs to the platform state directory.
 #   macOS: ~/Library/Application Support/OXRSys/oxrsys-runtime.log

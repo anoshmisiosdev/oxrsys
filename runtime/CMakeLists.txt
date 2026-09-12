@@ -26,11 +26,9 @@ if(APPLE)
         src/HevcEncoderHelperClient.mm
         src/AudioCapture.mm
     )
-    if(OXRSYS_BUILD_WMR_DRIVER)
-        list(APPEND OXRSYS_RUNTIME_SOURCES src/WiredHeadset.mm)
-    else()
-        list(APPEND OXRSYS_RUNTIME_SOURCES src/WiredHeadsetStub.cpp)
-    endif()
+    # Client of oxrsys-headset-helper; pure Metal/IOSurface/Mach, no driver.
+    list(APPEND OXRSYS_RUNTIME_SOURCES src/WiredHeadset.mm)
+    set_source_files_properties(src/WiredHeadset.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     list(APPEND OXRSYS_RUNTIME_SOURCES src/WiredHeadsetStub.cpp)
     list(APPEND OXRSYS_RUNTIME_SOURCES
@@ -98,12 +96,6 @@ target_link_libraries(oxrsys_runtime PRIVATE
     ${OXRSYS_RUNTIME_LINK_LIBRARIES}
 )
 
-if(APPLE AND OXRSYS_BUILD_WMR_DRIVER)
-    # Wired Windows Mixed Reality headsets through the Monado driver (drivers/).
-    target_link_libraries(oxrsys_runtime PRIVATE oxrsys_monado_wmr)
-    target_compile_definitions(oxrsys_runtime PRIVATE OXRSYS_HAVE_WMR=1)
-    set_source_files_properties(src/WiredHeadset.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc;-Wno-unused-parameter")
-endif()
 
 if(APPLE)
     target_link_libraries(oxrsys_runtime PRIVATE

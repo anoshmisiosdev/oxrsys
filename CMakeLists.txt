@@ -99,10 +99,21 @@ endif()
 # Declared before the runtime so the option and the oxrsys_monado_wmr target
 # exist when runtime/CMakeLists.txt decides whether to link them.
 option(OXRSYS_BUILD_WMR_DRIVER "Build the Monado-derived Windows Mixed Reality headset driver" ${APPLE})
+set(OXRSYS_WMR_CROSS_ARCH OFF)
+if(CMAKE_OSX_ARCHITECTURES AND NOT CMAKE_OSX_ARCHITECTURES STREQUAL CMAKE_HOST_SYSTEM_PROCESSOR)
+    set(OXRSYS_WMR_CROSS_ARCH ON)
+endif()
 add_subdirectory(drivers)
 
 # --- Our runtime ---
 add_subdirectory(runtime)
+
+# --- Headset helper: the native process that owns a wired headset ---
+# Host-native only: it links the driver and runs the panel; the runtime
+# (any architecture) talks to it over a socket.
+if(APPLE AND OXRSYS_BUILD_WMR_DRIVER AND NOT OXRSYS_WMR_CROSS_ARCH)
+    add_subdirectory(runtime/headset_helper)
+endif()
 
 find_package(Vulkan REQUIRED)
 
