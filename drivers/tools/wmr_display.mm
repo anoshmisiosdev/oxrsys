@@ -12,16 +12,20 @@
  *      then warp both eyes through the driver's per-channel distortion mesh.
  *
  * Usage:
- *   oxrsys_wmr_display [--simulate] [--display-id ID] [--display-timeout S]
- *                      [--seconds N] [--pattern] [--no-distortion]
- *                      [--screenshot PATH] [--log-level LEVEL]
+ *   oxrsys_wmr_display [--simulate] [--list-displays] [--display-id ID]
+ *                      [--display-timeout S] [--seconds N] [--pattern] [--solid]
+ *                      [--no-distortion] [--capture] [--screenshot PATH]
+ *                      [--log-level LEVEL]
  *
  *   --simulate        Synthetic headset in a desktop window; no hardware needed.
+ *   --list-displays   Print the online displays and their modes, then exit.
  *   --display-id ID   Use this CGDirectDisplayID instead of auto-detecting.
  *   --display-timeout Seconds to wait for the panel to appear (default 20).
  *   --seconds N       Exit after N seconds.
  *   --pattern         Draw a lens-calibration pattern instead of the room.
+ *   --solid           Cycle solid red/green/blue; isolates presentation.
  *   --no-distortion   Blit the eye images straight to the panel.
+ *   --capture         Also CGDisplayCapture() the panel (shielding-level window).
  *   --screenshot PATH Write the panel image as PNG after ~30 frames, then exit.
  */
 
@@ -56,7 +60,10 @@ struct options
 {
 	bool simulate = false;
 	bool pattern = false;
+	bool solid = false;
 	bool distortion = true;
+	bool capture = false;
+	bool list_displays = false;
 	CGDirectDisplayID display_id = kCGNullDirectDisplay;
 	double display_timeout_s = 20.0;
 	double seconds = -1.0;
@@ -69,8 +76,9 @@ static void
 usage(const char *argv0)
 {
 	fprintf(stderr,
-	        "usage: %s [--simulate] [--display-id ID] [--display-timeout S] [--seconds N]\n"
-	        "          [--pattern] [--no-distortion] [--screenshot PATH] [--log-level LEVEL]\n",
+	        "usage: %s [--simulate] [--list-displays] [--display-id ID] [--display-timeout S]\n"
+	        "          [--seconds N] [--pattern] [--solid] [--no-distortion] [--capture]\n"
+	        "          [--screenshot PATH] [--log-level LEVEL]\n",
 	        argv0);
 }
 
@@ -102,8 +110,14 @@ parse_options(int argc, char **argv, options *opts)
 		const bool has_value = i + 1 < argc;
 		if (strcmp(arg, "--simulate") == 0) {
 			opts->simulate = true;
+		} else if (strcmp(arg, "--list-displays") == 0) {
+			opts->list_displays = true;
 		} else if (strcmp(arg, "--pattern") == 0) {
 			opts->pattern = true;
+		} else if (strcmp(arg, "--solid") == 0) {
+			opts->solid = true;
+		} else if (strcmp(arg, "--capture") == 0) {
+			opts->capture = true;
 		} else if (strcmp(arg, "--no-distortion") == 0) {
 			opts->distortion = false;
 		} else if (strcmp(arg, "--display-id") == 0 && has_value) {
@@ -381,31 +395,17 @@ simulated_display_source_init(simulated_display_source *src)
  *
  */
 
-static void
-list_online_displays(void)
+static std::vector<CGDirectDisplayID>
+online_displays(void)
 {
 	CGDirectDisplayID ids[16];
 	uint32_t count = 0;
 	CGGetOnlineDisplayList(16, ids, &count);
-	fprintf(stderr, "Online displays:\n");
-	for (uint32_t i = 0; i < count; i++) {
-		CGDisplayModeRef mode = CGDisplayCopyDisplayMode(ids[i]);
-		fprintf(stderr, "  id %u: %zux%zu px @ %.1f Hz, vendor 0x%x model 0x%x%s%s\n", ids[i],
-		        mode ? CGDisplayModeGetPixelWidth(mode) : 0, mode ? CGDisplayModeGetPixelHeight(mode) : 0,
-		        mode ? CGDisplayModeGetRefreshRate(mode) : 0.0, CGDisplayVendorNumber(ids[i]),
-		        CGDisplayModelNumber(ids[i]), CGDisplayIsMain(ids[i]) ? " (main)" : "",
-		        CGDisplayIsInMirrorSet(ids[i]) ? " (mirrored)" : "");
-		if (mode) {
-			CGDisplayModeRelease(mode);
-		}
-	}
+	return std::vector<CGDirectDisplayID>(ids, ids + count);
 }
 
-/*!
- * Best mode for the panel: exact pixel size, highest refresh rate.
- */
-static CGDisplayModeRef
-find_native_mode(CGDirectDisplayID display, uint32_t w, uint32_t h)
+static CFArrayRef
+copy_all_modes(CGDirectDisplayID display)
 {
 	const void *keys[] = {kCGDisplayShowDuplicateLowResolutionModes};
 	const void *values[] = {kCFBooleanTrue};
@@ -413,51 +413,167 @@ find_native_mode(CGDirectDisplayID display, uint32_t w, uint32_t h)
 	                                          &kCFTypeDictionaryValueCallBacks);
 	CFArrayRef modes = CGDisplayCopyAllDisplayModes(display, opts);
 	CFRelease(opts);
+	return modes;
+}
+
+static void
+describe_display(FILE *out, CGDirectDisplayID id, bool with_modes)
+{
+	CGDisplayModeRef mode = CGDisplayCopyDisplayMode(id);
+	const CGRect bounds = CGDisplayBounds(id);
+	fprintf(out, "  id %u: %zux%zu px @ %.1f Hz, bounds %.0f,%.0f %.0fx%.0f, vendor 0x%x model 0x%x%s%s%s%s\n", id,
+	        mode ? CGDisplayModeGetPixelWidth(mode) : 0, mode ? CGDisplayModeGetPixelHeight(mode) : 0,
+	        mode ? CGDisplayModeGetRefreshRate(mode) : 0.0, bounds.origin.x, bounds.origin.y, bounds.size.width,
+	        bounds.size.height, CGDisplayVendorNumber(id), CGDisplayModelNumber(id),
+	        CGDisplayIsMain(id) ? " (main)" : "", CGDisplayIsBuiltin(id) ? " (built-in)" : "",
+	        CGDisplayIsInMirrorSet(id) ? " (mirrored)" : "", CGDisplayIsActive(id) ? "" : " (inactive)");
+	if (mode) {
+		CGDisplayModeRelease(mode);
+	}
+	if (!with_modes) {
+		return;
+	}
+	CFArrayRef modes = copy_all_modes(id);
+	if (modes == NULL) {
+		return;
+	}
+	// Print the largest few pixel sizes with their best refresh rate.
+	const CFIndex n = CFArrayGetCount(modes);
+	fprintf(out, "    modes:");
+	int printed = 0;
+	for (CFIndex i = 0; i < n && printed < 8; i++) {
+		CGDisplayModeRef m = (CGDisplayModeRef)CFArrayGetValueAtIndex(modes, i);
+		const size_t w = CGDisplayModeGetPixelWidth(m), h = CGDisplayModeGetPixelHeight(m);
+		bool dup = false;
+		for (CFIndex j = 0; j < i; j++) {
+			CGDisplayModeRef p = (CGDisplayModeRef)CFArrayGetValueAtIndex(modes, j);
+			if (CGDisplayModeGetPixelWidth(p) == w && CGDisplayModeGetPixelHeight(p) == h) {
+				dup = true;
+				break;
+			}
+		}
+		if (dup) {
+			continue;
+		}
+		double best = 0.0;
+		for (CFIndex j = 0; j < n; j++) {
+			CGDisplayModeRef p = (CGDisplayModeRef)CFArrayGetValueAtIndex(modes, j);
+			if (CGDisplayModeGetPixelWidth(p) == w && CGDisplayModeGetPixelHeight(p) == h) {
+				best = fmax(best, CGDisplayModeGetRefreshRate(p));
+			}
+		}
+		fprintf(out, " %zux%zu@%.0f", w, h, best);
+		printed++;
+	}
+	fprintf(out, "\n");
+	CFRelease(modes);
+}
+
+static void
+list_online_displays(FILE *out, bool with_modes)
+{
+	fprintf(out, "Online displays:\n");
+	for (CGDirectDisplayID id : online_displays()) {
+		describe_display(out, id, with_modes);
+	}
+}
+
+/*!
+ * Best mode for the panel: exact pixel size, highest refresh rate.
+ */
+/*!
+ * Best mode for the panel: exact pixel size if available (else the largest
+ * pixel area), highest refresh rate among those.
+ */
+static CGDisplayModeRef
+find_native_mode(CGDirectDisplayID display, uint32_t w, uint32_t h, bool *out_exact)
+{
+	CFArrayRef modes = copy_all_modes(display);
 	if (modes == NULL) {
 		return NULL;
 	}
 
 	CGDisplayModeRef best = NULL;
+	bool best_exact = false;
+	size_t best_area = 0;
 	double best_rate = -1.0;
 	for (CFIndex i = 0; i < CFArrayGetCount(modes); i++) {
 		CGDisplayModeRef mode = (CGDisplayModeRef)CFArrayGetValueAtIndex(modes, i);
-		if (CGDisplayModeGetPixelWidth(mode) != w || CGDisplayModeGetPixelHeight(mode) != h) {
-			continue;
-		}
+		const size_t mw = CGDisplayModeGetPixelWidth(mode), mh = CGDisplayModeGetPixelHeight(mode);
+		const bool exact = mw == w && mh == h;
+		const size_t area = mw * mh;
 		const double rate = CGDisplayModeGetRefreshRate(mode);
-		if (rate > best_rate) {
-			best_rate = rate;
+		bool better;
+		if (exact != best_exact) {
+			better = exact;
+		} else if (!exact && area != best_area) {
+			better = area > best_area;
+		} else {
+			better = rate > best_rate;
+		}
+		if (better) {
 			best = mode;
+			best_exact = exact;
+			best_area = area;
+			best_rate = rate;
 		}
 	}
 	if (best != NULL) {
 		CGDisplayModeRetain(best);
 	}
 	CFRelease(modes);
+	if (out_exact != NULL) {
+		*out_exact = best_exact;
+	}
 	return best;
 }
 
 /*!
- * Look for a display whose native pixel size matches the panel. Returns
- * kCGNullDirectDisplay if none is online yet.
+ * Pick the headset's display: first a display with a mode of exactly the
+ * panel's pixel size, otherwise any display that was not online before the
+ * panel was switched on. Returns kCGNullDirectDisplay if neither exists yet.
  */
 static CGDirectDisplayID
-find_panel_display(uint32_t w, uint32_t h)
+find_panel_display(uint32_t w, uint32_t h, const std::vector<CGDirectDisplayID> &before, bool *out_exact)
 {
-	CGDirectDisplayID ids[16];
-	uint32_t count = 0;
-	CGGetOnlineDisplayList(16, ids, &count);
-	for (uint32_t i = 0; i < count; i++) {
-		if (CGDisplayIsMain(ids[i]) || CGDisplayIsBuiltin(ids[i])) {
+	const std::vector<CGDirectDisplayID> now = online_displays();
+	for (CGDirectDisplayID id : now) {
+		if (CGDisplayIsMain(id) || CGDisplayIsBuiltin(id)) {
 			continue;
 		}
-		CGDisplayModeRef mode = find_native_mode(ids[i], w, h);
+		bool exact = false;
+		CGDisplayModeRef mode = find_native_mode(id, w, h, &exact);
 		if (mode != NULL) {
 			CGDisplayModeRelease(mode);
-			return ids[i];
+		}
+		if (exact) {
+			*out_exact = true;
+			return id;
+		}
+	}
+	for (CGDirectDisplayID id : now) {
+		bool was_online = false;
+		for (CGDirectDisplayID old : before) {
+			was_online |= old == id;
+		}
+		if (!was_online && !CGDisplayIsMain(id) && !CGDisplayIsBuiltin(id)) {
+			*out_exact = false;
+			return id;
 		}
 	}
 	return kCGNullDirectDisplay;
+}
+
+/*!
+ * Convert Core Graphics display bounds (origin top-left of the main display,
+ * y down) to Cocoa screen coordinates (origin bottom-left, y up).
+ */
+static NSRect
+cocoa_rect_from_cg_bounds(CGRect bounds)
+{
+	const CGFloat main_h = CGDisplayBounds(CGMainDisplayID()).size.height;
+	return NSMakeRect(bounds.origin.x, main_h - bounds.origin.y - bounds.size.height, bounds.size.width,
+	                  bounds.size.height);
 }
 
 static bool
@@ -764,10 +880,27 @@ struct EyeUniforms
 /*!
  * Render one frame into the panel texture, then blit it to the drawable.
  */
-- (void)renderToDrawable:(id<CAMetalDrawable>)drawable
+- (void)renderToDrawable:(id<CAMetalDrawable>)drawable solid:(bool)solid
 {
 	display_source *src = self.source;
 	const int64_t now_ns = os_monotonic_get_ns();
+
+	if (solid) {
+		// Cycle red, green, blue once a second: proves the drawable reaches
+		// the panel independently of the scene and the distortion mesh.
+		const int phase = (int)((now_ns - self.startNs) / 1000000000LL) % 3;
+		id<MTLCommandBuffer> cmd = [self.queue commandBuffer];
+		MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+		rp.colorAttachments[0].texture = drawable.texture;
+		rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+		rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+		rp.colorAttachments[0].clearColor = MTLClearColorMake(phase == 0, phase == 1, phase == 2, 1);
+		id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:rp];
+		[enc endEncoding];
+		[cmd presentDrawable:drawable];
+		[cmd commit];
+		return;
+	}
 	// Predict a little ahead: one frame of render plus half a scanout.
 	const int64_t predict_ns = now_ns + 16000000;
 
@@ -900,6 +1033,7 @@ struct EyeUniforms
 @end
 
 static WmrDisplayApp *g_app = nil;
+static std::vector<CGDirectDisplayID> g_displays_before_open;
 
 static void
 on_signal(int sig)
@@ -952,7 +1086,7 @@ on_signal(int sig)
 		if (drawable == nil) {
 			return;
 		}
-		[self.renderer renderToDrawable:drawable];
+		[self.renderer renderToDrawable:drawable solid:self.opts.solid];
 		self.frames++;
 
 		const options &opts = self.opts;
@@ -986,6 +1120,20 @@ on_signal(int sig)
 	(void)timer;
 	const options &opts = self.opts;
 	const double elapsed = (double)(os_monotonic_get_ns() - self.startNs) / 1e9;
+
+	// Status line every two seconds so a headset run can be diagnosed from
+	// the terminal alone.
+	static double last_status_s = 0.0;
+	static int last_status_frames = 0;
+	if (elapsed - last_status_s >= 2.0) {
+		const double fps = (self.frames - last_status_frames) / (elapsed - last_status_s);
+		printf("[%6.1f s] %d frames, %.1f fps via %s, drawable %.0fx%.0f, window visible=%d on screen\n", elapsed,
+		       self.frames, fps, self.fallbackTimerActive ? "timer" : "display link", self.layer.drawableSize.width,
+		       self.layer.drawableSize.height, (int)self.window.isVisible);
+		fflush(stdout);
+		last_status_s = elapsed;
+		last_status_frames = self.frames;
+	}
 
 	if (self.displayLinkFrames == 0 && elapsed > 1.0) {
 		if (!self.fallbackTimerActive) {
@@ -1022,15 +1170,23 @@ on_signal(int sig)
 	self.window = [[NSWindow alloc] initWithContentRect:frame styleMask:style backing:NSBackingStoreBuffered defer:NO screen:screen];
 	self.window.title = @"OXRSys WMR display";
 	self.window.releasedWhenClosed = NO;
+	self.window.backgroundColor = [NSColor blackColor];
 	if (fullscreen) {
-		self.window.level = CGShieldingWindowLevel();
+		// Above everything, including a captured display's shield if --capture
+		// was used; otherwise the screen-saver level keeps the menu bar and
+		// Dock underneath on that screen.
+		self.window.level = self.capturedDisplay != kCGNullDirectDisplay ? CGShieldingWindowLevel()
+		                                                                 : NSScreenSaverWindowLevel;
 		self.window.hidesOnDeactivate = NO;
-		self.window.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces | NSWindowCollectionBehaviorStationary;
+		self.window.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces |
+		                                 NSWindowCollectionBehaviorStationary |
+		                                 NSWindowCollectionBehaviorFullScreenAuxiliary;
+		[NSApp setPresentationOptions:NSApplicationPresentationHideDock | NSApplicationPresentationHideMenuBar];
 		[NSCursor hide];
 	}
 
+	// Layer-hosting view: install the layer first, then opt in to layers.
 	NSView *view = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, frame.size.width, frame.size.height)];
-	view.wantsLayer = YES;
 	self.layer = [CAMetalLayer layer];
 	self.layer.device = self.renderer.device;
 	self.layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
@@ -1038,9 +1194,17 @@ on_signal(int sig)
 	self.layer.contentsScale = screen.backingScaleFactor;
 	self.layer.drawableSize = pixels;
 	self.layer.displaySyncEnabled = YES;
+	self.layer.frame = view.bounds;
 	view.layer = self.layer;
+	view.wantsLayer = YES;
+	view.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
 	self.window.contentView = view;
+	[self.window setFrame:frame display:YES];
 	[self.window makeKeyAndOrderFront:nil];
+	[self.window orderFrontRegardless];
+	printf("Window: frame %.0f,%.0f %.0fx%.0f on screen '%s' (scale %.1f), drawable %.0fx%.0f, level %ld\n",
+	       frame.origin.x, frame.origin.y, frame.size.width, frame.size.height, screen.localizedName.UTF8String,
+	       screen.backingScaleFactor, pixels.width, pixels.height, (long)self.window.level);
 
 	self.displayLink = [view displayLinkWithTarget:self selector:@selector(onDisplayLink:)];
 	[self.displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
@@ -1068,6 +1232,14 @@ on_signal(int sig)
 
 - (BOOL)startHeadset
 {
+	// Snapshot the displays before the driver switches the panel on, so a
+	// hot-plugged display can be recognised even without a matching mode.
+	g_displays_before_open = online_displays();
+	printf("Displays before opening the headset:\n");
+	for (CGDirectDisplayID id : g_displays_before_open) {
+		describe_display(stdout, id, false);
+	}
+
 	auto *src = new wmr_display_source();
 	if (!wmr_display_source_init(src, self.opts.log_level)) {
 		delete src;
@@ -1081,71 +1253,91 @@ on_signal(int sig)
 
 	// The panel was switched on by the driver; give macOS time to see it.
 	CGDirectDisplayID display = self.opts.display_id;
+	bool exact = true;
 	if (display == kCGNullDirectDisplay) {
 		const int64_t deadline = os_monotonic_get_ns() + (int64_t)(self.opts.display_timeout_s * 1e9);
-		printf("Waiting up to %.0f s for a %ux%u display to appear...\n", self.opts.display_timeout_s, src->panel_w,
-		       src->panel_h);
+		printf("Waiting up to %.0f s for a %ux%u display (or any new display) to appear...\n",
+		       self.opts.display_timeout_s, src->panel_w, src->panel_h);
 		while (display == kCGNullDirectDisplay && os_monotonic_get_ns() < deadline) {
-			display = find_panel_display(src->panel_w, src->panel_h);
+			display = find_panel_display(src->panel_w, src->panel_h, g_displays_before_open, &exact);
 			if (display == kCGNullDirectDisplay) {
 				[[NSRunLoop mainRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.5]];
 			}
 		}
 		if (display == kCGNullDirectDisplay) {
-			fprintf(stderr, "No display with a %ux%u mode appeared. Pass --display-id to force one.\n",
+			fprintf(stderr,
+			        "No new display appeared and none has a %ux%u mode.\n"
+			        "macOS never brought up a DisplayPort link to the panel. A backlit panel with no\n"
+			        "signal looks light gray. Check the DP cable/adapter (4320x2160@90 needs DP 1.4 HBR3),\n"
+			        "then re-run; pass --display-id to force a display listed below.\n",
 			        src->panel_w, src->panel_h);
-			list_online_displays();
+			list_online_displays(stderr, true);
 			return NO;
 		}
 	}
+	printf("Using display %u%s:\n", display, exact ? "" : " (new display without an exact panel-size mode)");
+	describe_display(stdout, display, true);
 
 	if (!unmirror_display(display)) {
 		fprintf(stderr, "Could not take display %u out of its mirror set.\n", display);
 	}
 
-	CGDisplayModeRef mode = find_native_mode(display, src->panel_w, src->panel_h);
+	CGDisplayModeRef mode = find_native_mode(display, src->panel_w, src->panel_h, &exact);
 	if (mode == NULL) {
-		fprintf(stderr, "Display %u has no %ux%u mode.\n", display, src->panel_w, src->panel_h);
-		list_online_displays();
+		fprintf(stderr, "Display %u reports no modes at all.\n", display);
 		return NO;
 	}
 
-	if (CGDisplayCapture(display) != kCGErrorSuccess) {
-		fprintf(stderr, "CGDisplayCapture failed for display %u.\n", display);
-		CGDisplayModeRelease(mode);
-		return NO;
+	if (self.opts.capture) {
+		if (CGDisplayCapture(display) != kCGErrorSuccess) {
+			fprintf(stderr, "CGDisplayCapture failed for display %u.\n", display);
+			CGDisplayModeRelease(mode);
+			return NO;
+		}
+		self.capturedDisplay = display;
 	}
-	self.capturedDisplay = display;
 
 	CGDisplayModeRef current = CGDisplayCopyDisplayMode(display);
 	const bool needs_switch = current == NULL || !CFEqual(current, mode);
 	if (current != NULL) {
 		CGDisplayModeRelease(current);
 	}
-	if (needs_switch && CGDisplaySetDisplayMode(display, mode, NULL) != kCGErrorSuccess) {
-		fprintf(stderr, "Could not switch display %u to %ux%u.\n", display, src->panel_w, src->panel_h);
+	if (needs_switch) {
+		const CGError err = CGDisplaySetDisplayMode(display, mode, NULL);
+		if (err != kCGErrorSuccess) {
+			fprintf(stderr, "Could not switch display %u to %zux%zu (CGError %d); using its current mode.\n",
+			        display, CGDisplayModeGetPixelWidth(mode), CGDisplayModeGetPixelHeight(mode), (int)err);
+		}
 	}
-	printf("Display %u: %zux%zu @ %.1f Hz, captured\n", display, CGDisplayModeGetPixelWidth(mode),
-	       CGDisplayModeGetPixelHeight(mode), CGDisplayModeGetRefreshRate(mode));
 	CGDisplayModeRelease(mode);
-
-	// Let the window server settle after a mode switch before we look up the screen.
-	[[NSRunLoop mainRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.5]];
+	// Let the window server settle after a mode switch, then read back what we got.
+	[[NSRunLoop mainRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.7]];
+	mode = CGDisplayCopyDisplayMode(display);
+	const size_t got_w = mode ? CGDisplayModeGetPixelWidth(mode) : 0;
+	const size_t got_h = mode ? CGDisplayModeGetPixelHeight(mode) : 0;
+	printf("Display %u now: %zux%zu @ %.1f Hz%s\n", display, got_w, got_h, mode ? CGDisplayModeGetRefreshRate(mode) : 0.0,
+	       self.capturedDisplay != kCGNullDirectDisplay ? ", captured" : "");
+	if (mode) {
+		CGDisplayModeRelease(mode);
+	}
+	if (got_w != src->panel_w || got_h != src->panel_h) {
+		fprintf(stderr, "Warning: display is %zux%zu but the panel is %ux%u; the image will be scaled.\n", got_w,
+		        got_h, src->panel_w, src->panel_h);
+	}
 
 	NSScreen *screen = screen_for_display(display);
-	NSRect frame;
+	NSRect frame = cocoa_rect_from_cg_bounds(CGDisplayBounds(display));
 	if (screen != nil) {
 		frame = screen.frame;
 	} else {
-		// Fall back to CG bounds; Cocoa's y axis is flipped relative to CG.
-		CGRect bounds = CGDisplayBounds(display);
-		frame = NSMakeRect(bounds.origin.x, bounds.origin.y, bounds.size.width, bounds.size.height);
+		fprintf(stderr, "AppKit has no NSScreen for display %u; placing the window by CG bounds.\n", display);
 		screen = [NSScreen mainScreen];
 	}
+	const CGFloat scale = screen != nil ? screen.backingScaleFactor : 1.0;
 	return [self createWindowOnScreen:screen
 	                            frame:frame
 	                       fullscreen:YES
-	                        pixelSize:CGSizeMake(src->panel_w, src->panel_h)];
+	                        pixelSize:CGSizeMake(frame.size.width * scale, frame.size.height * scale)];
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification
@@ -1181,6 +1373,11 @@ main(int argc, char **argv)
 	static const char *level_names[] = {"trace", "debug", "info", "warn", "error"};
 	if (opts.log_level <= U_LOGGING_ERROR) {
 		setenv("WMR_LOG", level_names[opts.log_level], 0);
+	}
+
+	if (opts.list_displays) {
+		list_online_displays(stdout, true);
+		return 0;
 	}
 
 	@autoreleasepool {
