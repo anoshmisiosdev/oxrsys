@@ -231,7 +231,10 @@ codesign --force --sign - ~/liboxrsys-runtime-1.1.0/oxrsys-headset-helper
 
 It logs to `~/Library/Application Support/OXRSys/oxrsys-headset-helper.log`
 and listens on `/tmp/oxrsys-headset-<uid>.sock`. Stop it before using the
-probe or display tools, which need the headset for themselves.
+probe or display tools, which need the headset for themselves. If it aborts
+at start-up with `LIBUSB_ERROR_BUSY` (Monado asserts when the cameras cannot
+start), another process still holds the headset's camera interface: find it
+with `pgrep -fl oxrsys`, or unplug and replug the headset's USB.
 
 ### Smoke test
 

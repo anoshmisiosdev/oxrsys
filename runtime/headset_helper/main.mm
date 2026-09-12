@@ -769,6 +769,9 @@ RenderLoop()
 	bool wasClientFrame = false;
 
 	while (g.running.load()) {
+		// Metal objects created here are autoreleased; without a pool per
+		// iteration this thread would leak them for the helper's lifetime.
+		@autoreleasepool {
 		if (!g.panel->IsReady()) {
 			// Nothing to show on; hand every submitted slot straight back so
 			// the client keeps running (tracking still works without a panel).
@@ -877,6 +880,7 @@ RenderLoop()
 			     (unsigned long long)g.lobbyFrames, c ? "connected" : "none");
 			lastStatusNs = now;
 		}
+		} // autoreleasepool
 	}
 }
 
