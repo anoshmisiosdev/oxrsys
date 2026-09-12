@@ -273,8 +273,27 @@ which is not built.
   the left. WMR eyes differ by well under a degree, so this is tolerable.
 - No timewarp: a late frame is shown as rendered. Prediction covers the
   nominal pipeline latency only.
-- The x86_64 (Rosetta) runtime build used by the Wine bridge needs x86_64
-  hidapi and libusb; Homebrew's arm64 libraries do not link into it.
+- Timewarp and positional head tracking are still missing; see above.
+
+### x86_64 build for the Wine bridge
+
+The bridge loads the runtime inside an x86_64 (Rosetta) Wine process, so the
+dylib must be x86_64. Homebrew's hidapi and libusb are arm64 only, so when
+`CMAKE_OSX_ARCHITECTURES` differs from the host the driver builds both from
+source (pinned hidapi 0.15.0 and libusb-cmake 1.0.30; `OXRSYS_WMR_BUNDLED_USB`
+forces either behaviour). Monado's Eigen sources are compiled at `-O1` in that
+configuration because Apple clang crashes on them at `-O3` for x86_64. OpenCV
+sphere tracking stays off in the x86_64 build unless an x86_64 OpenCV is
+available.
+
+```bash
+cmake -S . -B build-x86 -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=x86_64
+cmake --build build-x86 --target oxrsys_runtime
+lipo -info build-x86/runtime/liboxrsys-runtime.dylib   # x86_64
+```
+
+Verified on the Dell Visor: the x86_64 probe runs under Rosetta and the
+x86_64 runtime presents through the loader with `wired_headset = true`.
 
 ### Troubleshooting a blank panel
 

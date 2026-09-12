@@ -14,11 +14,55 @@ if(NOT OXRSYS_BUILD_WMR_DRIVER)
     return()
 endif()
 
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(OXRSYS_HIDAPI REQUIRED IMPORTED_TARGET hidapi)
-pkg_check_modules(OXRSYS_LIBUSB REQUIRED IMPORTED_TARGET libusb-1.0)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 find_package(Threads REQUIRED)
+
+# hidapi and libusb: Homebrew's copies through pkg-config for a host-native
+# build; built from source when targeting another architecture (the x86_64
+# runtime the Wine bridge loads under Rosetta), since Homebrew libraries only
+# exist for the host. OXRSYS_WMR_BUNDLED_USB forces either choice.
+set(OXRSYS_WMR_CROSS_ARCH OFF)
+if(CMAKE_OSX_ARCHITECTURES AND NOT CMAKE_OSX_ARCHITECTURES STREQUAL CMAKE_HOST_SYSTEM_PROCESSOR)
+    set(OXRSYS_WMR_CROSS_ARCH ON)
+endif()
+option(OXRSYS_WMR_BUNDLED_USB "Build hidapi and libusb from source instead of using Homebrew" ${OXRSYS_WMR_CROSS_ARCH})
+
+include(FetchContent)
+
+if(OXRSYS_WMR_BUNDLED_USB)
+    set(HIDAPI_BUILD_HIDTEST OFF CACHE BOOL "" FORCE)
+    set(HIDAPI_WITH_TESTS OFF CACHE BOOL "" FORCE)
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(
+        hidapi
+        GIT_REPOSITORY https://github.com/libusb/hidapi.git
+        GIT_TAG dbff4ea89f55a572aeb0c53a7b32ea70853ec260 # hidapi-0.15.0
+        GIT_SHALLOW OFF
+    )
+    set(LIBUSB_BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+    set(LIBUSB_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(LIBUSB_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+    set(LIBUSB_INSTALL_TARGETS OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(
+        libusb
+        GIT_REPOSITORY https://github.com/libusb/libusb-cmake.git
+        GIT_TAG bd098071279b954acd491a4da34fd999b66a5afb # v1.0.30-0
+        GIT_SHALLOW OFF
+    )
+    FetchContent_MakeAvailable(hidapi libusb)
+    add_library(oxrsys_usb_libs INTERFACE)
+    # libusb-cmake's plain target name; the libusb:: alias only exists on newer revisions.
+    target_link_libraries(oxrsys_usb_libs INTERFACE hidapi::hidapi usb-1.0)
+    # hidapi.h lives in hidapi/, the macOS extras in mac/.
+    target_include_directories(oxrsys_usb_libs INTERFACE "${hidapi_SOURCE_DIR}/hidapi" "${hidapi_SOURCE_DIR}/mac")
+    message(STATUS "WMR driver: building hidapi and libusb from source for ${CMAKE_OSX_ARCHITECTURES}")
+else()
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(OXRSYS_HIDAPI REQUIRED IMPORTED_TARGET hidapi)
+    pkg_check_modules(OXRSYS_LIBUSB REQUIRED IMPORTED_TARGET libusb-1.0)
+    add_library(oxrsys_usb_libs INTERFACE)
+    target_link_libraries(oxrsys_usb_libs INTERFACE PkgConfig::OXRSYS_HIDAPI PkgConfig::OXRSYS_LIBUSB)
+endif()
 
 # Optional OpenCV, needed by Monado's camera-based (controller/SLAM) tracking
 # code. Off by default so the plain headset build stays dependency-light.
@@ -261,6 +305,13 @@ set_source_files_properties(
     "${OXRSYS_MONADO_EXTERNAL}/cjson/cjson/cJSON.c"
     PROPERTIES COMPILE_OPTIONS "-w"
 )
+if(OXRSYS_WMR_CROSS_ARCH)
+    # Apple clang crashes (SIGSEGV in the frontend) compiling Monado's Eigen
+    # code at -O3 for x86_64 on an arm64 host. -O1 is plenty for this math.
+    set(OXRSYS_MONADO_CXX_SOURCES ${OXRSYS_MONADO_WMR_SOURCES})
+    list(FILTER OXRSYS_MONADO_CXX_SOURCES INCLUDE REGEX "\\.cpp$")
+    set_source_files_properties(${OXRSYS_MONADO_CXX_SOURCES} PROPERTIES COMPILE_OPTIONS "-w;-O1")
+endif()
 set_source_files_properties(
     monado/os_hid_hidapi.c
     monado/psmv_macos.c
@@ -273,8 +324,7 @@ set_source_files_properties(
 
 target_link_libraries(oxrsys_monado_wmr
     PUBLIC
-        PkgConfig::OXRSYS_HIDAPI
-        PkgConfig::OXRSYS_LIBUSB
+        oxrsys_usb_libs
         Threads::Threads
 )
 if(OXRSYS_WMR_OPENCV)

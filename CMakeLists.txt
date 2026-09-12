@@ -89,6 +89,11 @@ FetchContent_Declare(
 # no Debug configuration, which breaks the loader link with jsoncpp_lib-NOTFOUND.
 set(BUILD_WITH_SYSTEM_JSONCPP OFF CACHE BOOL "Use system jsoncpp instead of vendored source" FORCE)
 FetchContent_MakeAvailable(OpenXR)
+if(TARGET openxr_loader)
+    # The vendored jsoncpp tests an undefined macro; with the loader's -Werror
+    # that fails Release builds under -Wundef.
+    target_compile_options(openxr_loader PRIVATE -Wno-undef)
+endif()
 
 # --- Wired-headset drivers (Monado-derived) ---
 # Declared before the runtime so the option and the oxrsys_monado_wmr target
