@@ -328,12 +328,25 @@ profile.
   watch them with `oxrsys_wmr_probe --controllers`.
 - **PS Move ZCM2** (PS4 era, micro-USB): hold PS until the LED blinks and
   pair it in System Settings → Bluetooth like any gamepad.
-- **PS Move ZCM1** (PS3 era, mini-USB): it only pairs to the host whose
-  Bluetooth address was written to it over USB. Pair it once with a tool that
-  does that (for example `psmove pair` from psmoveapi), then unplug USB; the
-  controller only streams sensor data over Bluetooth, and the runtime skips
-  USB-attached Moves. `oxrsys_wmr_probe --psmove --list` shows the bus each
-  Move is on; `oxrsys_wmr_probe --psmove` prints their state.
+- **PS Move ZCM1** (PS3 era, mini-USB): it only connects to the host whose
+  Bluetooth address was written to it over USB, and it never shows up in a
+  pairing list. Plug it in and run `oxrsys_psmv_pair` (built with the driver;
+  `--dry-run` only reads, `--wait 60` then watches for the controller on the
+  Bluetooth bus), unplug the cable, press PS. The controller only streams
+  sensor data over Bluetooth, so the runtime skips USB-attached Moves.
+  `oxrsys_wmr_probe --psmove --list` shows the bus each Move is on;
+  `oxrsys_wmr_probe --psmove` prints their state.
+
+  **macOS 12 and later refuse the ZCM1's connection.** It connects the way
+  the DualShock 3 does (no pairing dialog, the host must accept an incoming
+  HID connection from a device it has never paired with), and Apple removed
+  that path from the Bluetooth HID driver in Monterey; psmoveapi's own
+  pairing declares macOS 13+ unsupported for the same reason
+  (thp/psmoveapi issues 456 and 457). The address write succeeds, the
+  controller blinks, macOS drops the connection. There is no user-space way
+  around this on the Mac's own Bluetooth stack. Options: a PS4-era ZCM2 Move
+  (pairs in System Settings, works with the same driver), or the WMR motion
+  controllers.
 
 ### PS Move sphere position from the headset cameras
 

@@ -390,6 +390,15 @@ target_compile_features(oxrsys_wmr_probe PRIVATE c_std_11)
 target_compile_options(oxrsys_wmr_probe PRIVATE -Wall -Wextra -Wno-unused-parameter)
 target_link_libraries(oxrsys_wmr_probe PRIVATE oxrsys_monado_wmr)
 
+# --- PS Move pairing tool -----------------------------------------------------
+# Writes this Mac's Bluetooth address into a USB-attached PlayStation Move
+# (psmoveapi's "psmove pair" step). Only hidapi and IOBluetooth.
+if(APPLE AND NOT OXRSYS_WMR_CROSS_ARCH)
+    add_executable(oxrsys_psmv_pair tools/psmv_pair.m)
+    target_compile_options(oxrsys_psmv_pair PRIVATE -Wall -Wextra -fobjc-arc)
+    target_link_libraries(oxrsys_psmv_pair PRIVATE oxrsys_usb_libs "-framework IOBluetooth" "-framework Foundation")
+endif()
+
 # --- OpenXR smoke tool ------------------------------------------------------
 # Native OpenXR client (loader -> runtime -> WiredHeadset): the end-to-end
 # check that a wired headset works through the runtime.
