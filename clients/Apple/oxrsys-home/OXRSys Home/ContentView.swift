@@ -378,6 +378,8 @@ struct ContentView: View {
     private var streamingTab: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
+                headsetSection
+
                 GroupBox("Streaming Configuration") {
                     VStack(alignment: .leading, spacing: 16) {
                         Toggle("Runtime enabled", isOn: streamingBinding(\.runtimeEnabled))
@@ -588,6 +590,60 @@ struct ContentView: View {
             runtimeStatsSection
                 .padding(.top, 14)
         }
+    }
+
+    private var headsetSection: some View {
+        GroupBox("Headset") {
+            VStack(alignment: .leading, spacing: 16) {
+                Picker("Headset mode", selection: streamingBinding(\.headsetMode)) {
+                    ForEach(HeadsetModeSetting.allCases) { mode in
+                        Text(mode.displayName).tag(mode)
+                    }
+                }
+
+                if model.serverConfig.wiredHeadset {
+                    LabeledSlider(
+                        title: "Eye height",
+                        value: streamingBinding(\.wiredEyeHeightM),
+                        range: OXRSysServerConfig.minWiredEyeHeightM...OXRSysServerConfig.maxWiredEyeHeightM,
+                        displayValue: String(format: "%.2f m", model.serverConfig.wiredEyeHeightM)
+                    )
+
+                    HStack {
+                        Text("Panel display ID")
+                        Spacer()
+                        TextField(
+                            "0 = auto",
+                            value: streamingBinding(\.wiredDisplayId),
+                            format: .number
+                        )
+                        .textFieldStyle(.roundedBorder)
+                        .multilineTextAlignment(.trailing)
+                        .frame(width: 120)
+                        Text("0 = auto-detect")
+                            .foregroundStyle(.secondary)
+                    }
+
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("The headset replaces the streaming client while it is plugged in over USB and HDMI/DisplayPort. Head tracking is orientation-only; the eye height sets where the head sits above the floor.")
+                        Text("macOS hides Windows Mixed Reality panels until the one-time EDID display override is installed (`sudo python3 drivers/tools/wmr_edid_override.py --install`, then replug the video cable). Without it the panel stays black. See docs/platforms/wmr.md.")
+                        Text("Controllers: Windows Mixed Reality motion controllers over Bluetooth, or PlayStation Move.")
+                    }
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    Text("Quest, PICO, visionOS, and the simulator connect as streaming clients over WiFi or USB ADB.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.top, 8)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.top, 14)
     }
 
     private var runtimeStatsSection: some View {

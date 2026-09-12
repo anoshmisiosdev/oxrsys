@@ -188,7 +188,11 @@ sizes before it creates a session.
 
 - **Config.** `wired_headset = true` in `oxrsys-runtime.toml` (plus optional
   `wired_display_id` and `wired_eye_height_m`). Off by default; streaming
-  setups are untouched.
+  setups are untouched. The Home app's Streaming tab has a Headset section
+  that writes these keys: pick `Wired Windows Mixed Reality headset (USB)` as
+  the headset mode, then adjust the eye height and, if auto-detection picks
+  the wrong display, the panel display ID (see
+  [macos-home.md](macos-home.md)).
 - **Open.** `Instance::GetSystem` calls `WiredHeadset::EnsureOpen`, which
   connects to the helper (spawning `wired_helper_path`, or the
   `oxrsys-headset-helper` next to the runtime dylib, in its own session so it

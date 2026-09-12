@@ -122,7 +122,7 @@ final class HomeAppModel: ObservableObject, @unchecked Sendable {
                 return .wifi
             case .usbAdb:
                 return .usbAdb
-            case nil:
+            case .wired, nil:
                 break
             }
         }

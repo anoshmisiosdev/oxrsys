@@ -10,6 +10,7 @@
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDesktopServices>
+#include <QDoubleSpinBox>
 #include <QDragEnterEvent>
 #include <QDropEvent>
 #include <QFileDialog>
@@ -32,6 +33,7 @@
 #include <QScrollArea>
 #include <QSizePolicy>
 #include <QSlider>
+#include <QSpinBox>
 #include <QStyle>
 #include <QTabWidget>
 #include <QToolButton>
@@ -40,6 +42,7 @@
 #include <QVector>
 
 #include <algorithm>
+#include <limits>
 #include <functional>
 
 namespace
@@ -759,6 +762,41 @@ QWidget* MainWindow::buildStreamingTab()
     auto* layout = new QVBoxLayout(content);
     layout->setSpacing(14);
 
+    auto* headsetModeBox = new QGroupBox("Headset", content);
+    auto* headsetModeLayout = new QVBoxLayout(headsetModeBox);
+    auto* headsetModeForm = new QFormLayout();
+    headsetModeCombo_ = new QComboBox(headsetModeBox);
+    headsetModeCombo_->addItem(headsetModeDisplayName(false), false);
+    headsetModeCombo_->addItem(headsetModeDisplayName(true), true);
+    headsetModeForm->addRow("Headset mode", headsetModeCombo_);
+    headsetModeLayout->addLayout(headsetModeForm);
+    wiredHeadsetOptions_ = new QWidget(headsetModeBox);
+    auto* wiredLayout = new QVBoxLayout(wiredHeadsetOptions_);
+    wiredLayout->setContentsMargins(0, 0, 0, 0);
+    auto* wiredForm = new QFormLayout();
+    wiredEyeHeightSpin_ = new QDoubleSpinBox(wiredHeadsetOptions_);
+    wiredEyeHeightSpin_->setRange(ServerConfig::MinWiredEyeHeightM, ServerConfig::MaxWiredEyeHeightM);
+    wiredEyeHeightSpin_->setDecimals(2);
+    wiredEyeHeightSpin_->setSingleStep(0.05);
+    wiredEyeHeightSpin_->setSuffix(" m");
+    wiredForm->addRow("Eye height", wiredEyeHeightSpin_);
+    wiredDisplayIdSpin_ = new QSpinBox(wiredHeadsetOptions_);
+    wiredDisplayIdSpin_->setRange(0, std::numeric_limits<int>::max());
+    wiredDisplayIdSpin_->setSpecialValueText("Auto-detect");
+    wiredForm->addRow("Panel display ID", wiredDisplayIdSpin_);
+    wiredLayout->addLayout(wiredForm);
+    auto* wiredHelp = secondaryLabel(
+        "macOS only. The headset replaces the streaming client while it is plugged in over USB and "
+        "HDMI/DisplayPort. Head tracking is orientation-only; the eye height sets where the head sits "
+        "above the floor. macOS hides Windows Mixed Reality panels until the one-time EDID display "
+        "override is installed (drivers/tools/wmr_edid_override.py --install, then replug the video "
+        "cable); without it the panel stays black. See docs/platforms/wmr.md. Controllers: Windows "
+        "Mixed Reality motion controllers over Bluetooth, or PlayStation Move.");
+    wiredHelp->setWordWrap(true);
+    wiredLayout->addWidget(wiredHelp);
+    headsetModeLayout->addWidget(wiredHeadsetOptions_);
+    layout->addWidget(headsetModeBox);
+
     auto* configBox = new QGroupBox("Streaming Configuration", content);
     auto* configLayout = new QVBoxLayout(configBox);
     runtimeEnabledCheckBox_ = new QCheckBox("Runtime enabled", configBox);
@@ -864,6 +902,9 @@ QWidget* MainWindow::buildStreamingTab()
     connect(clientReprojectionCombo_, qOverload<int>(&QComboBox::currentIndexChanged), this, connectConfigChanged);
     connect(abrModeCombo_, qOverload<int>(&QComboBox::currentIndexChanged), this, connectConfigChanged);
     connect(configTransportCombo_, qOverload<int>(&QComboBox::currentIndexChanged), this, connectConfigChanged);
+    connect(headsetModeCombo_, qOverload<int>(&QComboBox::currentIndexChanged), this, connectConfigChanged);
+    connect(wiredEyeHeightSpin_, qOverload<double>(&QDoubleSpinBox::valueChanged), this, connectConfigChanged);
+    connect(wiredDisplayIdSpin_, qOverload<int>(&QSpinBox::valueChanged), this, connectConfigChanged);
 
     auto* configButtons = new QHBoxLayout();
     auto* defaultButton = iconButton(configBox, QStyle::SP_BrowserReload, "Default");
@@ -1185,7 +1226,8 @@ void MainWindow::refreshStreaming()
         bitrateSlider_, resolutionSlider_, keyframeSlider_,
         refreshRateCombo_, encoderPresetCombo_, foveatedEncodingPresetCombo_,
         clientFoveationPresetCombo_, clientReprojectionCombo_, abrModeCombo_,
-        configTransportCombo_, usbDeviceCombo_,
+        configTransportCombo_, headsetModeCombo_, wiredEyeHeightSpin_, wiredDisplayIdSpin_,
+        usbDeviceCombo_,
     };
     for (QWidget* control : controls)
     {
@@ -1210,6 +1252,10 @@ void MainWindow::refreshStreaming()
         std::max(clientReprojectionCombo_->findData(config.clientReprojection), 0));
     abrModeCombo_->setCurrentIndex(std::max(abrModeCombo_->findData(config.abrMode), 0));
     configTransportCombo_->setCurrentIndex(std::max(configTransportCombo_->findData(config.transport), 0));
+    headsetModeCombo_->setCurrentIndex(std::max(headsetModeCombo_->findData(config.wiredHeadset), 0));
+    wiredEyeHeightSpin_->setValue(config.wiredEyeHeightM);
+    wiredDisplayIdSpin_->setValue(config.wiredDisplayId);
+    wiredHeadsetOptions_->setVisible(config.wiredHeadset);
 
     usbDeviceCombo_->clear();
     usbDeviceCombo_->addItem("Select a device", QString());
@@ -1402,6 +1448,10 @@ void MainWindow::updateConfigFromControls()
     config.clientReprojection = clientReprojectionCombo_->currentData().toString();
     config.abrMode = abrModeCombo_->currentData().toString();
     config.transport = configTransportCombo_->currentData().toString();
+    config.wiredHeadset = headsetModeCombo_->currentData().toBool();
+    config.wiredEyeHeightM = wiredEyeHeightSpin_->value();
+    config.wiredDisplayId = wiredDisplayIdSpin_->value();
+    wiredHeadsetOptions_->setVisible(config.wiredHeadset);
 
     bitrateValueLabel_->setText(QString("%1 Mbps").arg(config.bitrateMbps));
     resolutionValueLabel_->setText(QString::number(config.resolutionScale, 'f', 2));

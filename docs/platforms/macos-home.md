@@ -108,8 +108,9 @@ The file is updated when an OpenXR app creates or destroys an instance, when the
 starts or stops, and when a headset client connects or disconnects. The Home app polls it once per
 second and shows:
 
-- state: `Idle`, `Streaming (WiFi)`, or `Streaming (USB)`
-- device: `Quest`, `Pico`, `Simulator`, `Vision Pro`, or `Unknown`
+- state: `Idle`, `Streaming (WiFi)`, `Streaming (USB)`, or `Wired headset` (transport `wired`)
+- device: `Quest`, `Pico`, `Simulator`, `Vision Pro`, `Windows Mixed Reality (wired)` (device type
+  `wmr`), or `Unknown`
 - profile app: the OpenXR application name from `XrInstanceCreateInfo`, with the Home-launched
   app as a fallback before the runtime has written status
 
@@ -179,6 +180,9 @@ The structured editor covers the current runtime keys:
 - `streaming.client_reprojection`
 - `streaming.abr_mode`
 - `streaming.headset_audio`
+- `wired.wired_headset`
+- `wired.wired_display_id`
+- `wired.wired_eye_height_m`
 - `logging.file_logging`
 - `logging.quest_logcat`
 
@@ -206,6 +210,17 @@ foveated encoding and does not change the desktop OpenXR application's rendering
 config and protocol, but the runtime does not advertise audio as active until a real
 capture/playback path is attached.
 
+The Headset section at the top of the Streaming tab picks the headset mode. `Streaming (Quest /
+PICO / visionOS / simulator)` is the default and writes `wired.wired_headset = false`. `Wired Windows
+Mixed Reality headset (USB)` writes `wired_headset = true`: a Windows Mixed Reality headset plugged
+into the Mac over USB and HDMI/DisplayPort then replaces the streaming client (see
+[wmr.md](wmr.md)). With wired selected, the section also exposes `wired_eye_height_m` (`1.0` to
+`2.2` m, the head height above the floor while tracking is orientation-only) and
+`wired_display_id` (the panel's `CGDirectDisplayID`; `0` auto-detects), and reminds the user that
+the one-time EDID display override from `drivers/tools/wmr_edid_override.py` is required before
+macOS shows the panel. Home does not edit `wired_helper_path`; the runtime looks for
+`oxrsys-headset-helper` next to the runtime dylib unless the key is set by hand.
+
 `client_reprojection` controls short missing-frame smoothing on the Quest client. The default
 `pose` reuses a recent decoded texture with the matched server render pose; `pose_warp` additionally
 allows a small GLES image-space orientation correction when safety checks pass. `off` disables the
@@ -232,6 +247,8 @@ The runtime reloads config file changes opportunistically:
   `foveated_encoding_preset`, `client_foveation_preset`, `client_upscaling`,
   `client_reprojection`, `abr_mode`, and `headset_audio` apply when streaming or the
   encoder/client connection is recreated
+- `wired_headset`, `wired_display_id`, and `wired_eye_height_m` are read when an app calls
+  `xrGetSystem`, so switching headset mode takes effect for the next OpenXR app launch
 - file logger sink setup still requires a restart
 
 The Quest USB ADB section detects authorized `adb` devices, applies reverse mappings for ports `9944`, `9945`, and `9946`, then verifies them with `adb reverse --list`. This prepares the USB TCP transport; it is separate from Android `UsbManager` app permission prompts.

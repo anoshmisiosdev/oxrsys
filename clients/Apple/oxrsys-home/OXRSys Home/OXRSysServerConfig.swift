@@ -6,6 +6,8 @@ struct OXRSysServerConfig: Equatable {
     static let minBitrateMbps = 1
     static let maxBitrateMbps = 200
     static let supportedRefreshRates = [60, 72, 80, 90, 120]
+    static let minWiredEyeHeightM = 1.0
+    static let maxWiredEyeHeightM = 2.2
 
     var runtimeEnabled = true
     var bitrateMbps = 50
@@ -20,8 +22,16 @@ struct OXRSysServerConfig: Equatable {
     var clientReprojection: ClientReprojectionSetting = .pose
     var abrMode: AbrModeSetting = .bitrate
     var headsetAudio = false
+    var wiredHeadset = false
+    var wiredDisplayId = 0
+    var wiredEyeHeightM = 1.6
     var fileLogging = true
     var questLogcat = false
+
+    var headsetMode: HeadsetModeSetting {
+        get { wiredHeadset ? .wired : .streaming }
+        set { wiredHeadset = newValue == .wired }
+    }
 
     static let defaultText = """
     # OXRSys Runtime Configuration
@@ -78,6 +88,20 @@ struct OXRSysServerConfig: Equatable {
     # a platform capture/playback path is attached.
     headset_audio = false
 
+    [wired]
+    # Wired headset (Windows Mixed Reality over USB + HDMI/DisplayPort, macOS only).
+    # When true and a headset is plugged in, it replaces the streaming client.
+    # The panel must be visible to macOS as a display; see docs/platforms/wmr.md
+    # for the one-time EDID override.
+    wired_headset = false
+
+    # CGDirectDisplayID of the headset panel. 0 = auto-detect.
+    wired_display_id = 0
+
+    # Head tracking is orientation-only; the head is reported at this height
+    # above the floor, in meters.
+    wired_eye_height_m = 1.6
+
     [logging]
     # Write server logs to ~/Library/Application Support/OXRSys/oxrsys-runtime.log.
     file_logging = true
@@ -130,6 +154,16 @@ struct OXRSysServerConfig: Equatable {
         if let value = boolValue("headset_audio", in: text) {
             config.headsetAudio = value
         }
+        if let value = boolValue("wired_headset", in: text) {
+            config.wiredHeadset = value
+        }
+        if let value = intValue("wired_display_id", in: text), value >= 0 {
+            config.wiredDisplayId = value
+        }
+        if let value = doubleValue("wired_eye_height_m", in: text),
+           (Self.minWiredEyeHeightM...Self.maxWiredEyeHeightM).contains(value) {
+            config.wiredEyeHeightM = value
+        }
         if let value = boolValue("file_logging", in: text) {
             config.fileLogging = value
         }
@@ -164,6 +198,11 @@ struct OXRSysServerConfig: Equatable {
                 ("client_reprojection", "\"\(clientReprojection.rawValue)\""),
                 ("abr_mode", "\"\(abrMode.rawValue)\""),
                 ("headset_audio", boolString(headsetAudio)),
+            ]),
+            ("wired", [
+                ("wired_headset", boolString(wiredHeadset)),
+                ("wired_display_id", "\(wiredDisplayId)"),
+                ("wired_eye_height_m", decimalString(wiredEyeHeightM)),
             ]),
             ("logging", [
                 ("file_logging", boolString(fileLogging)),
