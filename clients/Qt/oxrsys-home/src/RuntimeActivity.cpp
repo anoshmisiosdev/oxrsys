@@ -112,6 +112,10 @@ QString RuntimeActivity::stateDisplayName() const
     {
         return "Streaming (USB)";
     }
+    if (transport == "wired")
+    {
+        return "Wired headset";
+    }
     return "Streaming";
 }
 
@@ -136,6 +140,10 @@ QString RuntimeActivity::deviceDisplayName() const
     if (deviceType == "vision_pro")
     {
         return "Vision Pro";
+    }
+    if (deviceType == "wmr")
+    {
+        return "Windows Mixed Reality (wired)";
     }
     return "Unknown";
 }

@@ -77,6 +77,11 @@ void testServerConfigRoundTrip()
         abr_mode = "full"
         headset_audio = true
 
+        [wired]
+        wired_headset = true
+        wired_display_id = 69734400
+        wired_eye_height_m = 1.75
+
         [logging]
         quest_logcat = yes
     )");
@@ -92,6 +97,9 @@ void testServerConfigRoundTrip()
     expect(parsed.clientReprojection == "pose_warp", "Expected reprojection parse");
     expect(parsed.abrMode == "full", "Expected ABR parse");
     expect(parsed.headsetAudio, "Expected audio parse");
+    expect(parsed.wiredHeadset, "Expected wired headset parse");
+    expect(parsed.wiredDisplayId == 69734400, "Expected wired display id parse");
+    expect(parsed.wiredEyeHeightM == 1.75, "Expected wired eye height parse");
     expect(parsed.questLogcat, "Expected quest_logcat parse");
 
     const QString merged = parsed.mergedInto(ServerConfig::defaultText());
@@ -105,6 +113,9 @@ void testServerConfigRoundTrip()
     expect(merged.contains("client_reprojection = \"pose_warp\""), "Expected reprojection serialization");
     expect(merged.contains("abr_mode = \"full\""), "Expected ABR serialization");
     expect(merged.contains("headset_audio = true"), "Expected audio serialization");
+    expect(merged.contains("wired_headset = true"), "Expected wired headset serialization");
+    expect(merged.contains("wired_display_id = 69734400"), "Expected wired display id serialization");
+    expect(merged.contains("wired_eye_height_m = 1.75"), "Expected wired eye height serialization");
 }
 
 void testHomeModelResetsStreamingConfigToDefaults()

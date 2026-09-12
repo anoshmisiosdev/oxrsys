@@ -61,6 +61,14 @@ headset-audio toggle live there as well. `client_reprojection` controls Quest/PI
 smoothing with `off`, `pose`, and `pose_warp`. Audio is not reported active by the runtime until a
 real capture/playback stream is implemented.
 
+The Headset section at the top of the Streaming tab mirrors the SwiftUI Home headset mode: the
+streaming default writes `wired.wired_headset = false`, and `Wired Windows Mixed Reality headset
+(USB)` writes `wired_headset = true` together with `wired_eye_height_m` and `wired_display_id`
+(`0` = auto-detect). The wired backend itself is macOS only (see
+[wmr.md](wmr.md)); on other platforms the keys are written but ignored by the runtime. Runtime
+activity shows `Wired headset` / `Windows Mixed Reality (wired)` when the status file reports
+transport `wired` and device type `wmr`.
+
 Transport readiness work is asynchronous. Qt Home shows checking/configuring status while the
 worker is running, ignores stale results after ADB path, selected serial, or transport changes, and
 keeps the previous main transport selection if USB validation fails.

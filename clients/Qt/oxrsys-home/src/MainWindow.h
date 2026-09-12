@@ -9,6 +9,7 @@
 
 class QCheckBox;
 class QComboBox;
+class QDoubleSpinBox;
 class QFormLayout;
 class QGridLayout;
 class QLabel;
@@ -18,6 +19,7 @@ class QPlainTextEdit;
 class QPushButton;
 class QScrollArea;
 class QSlider;
+class QSpinBox;
 class QTabWidget;
 class QVBoxLayout;
 
@@ -104,6 +106,10 @@ private:
     QComboBox* clientReprojectionCombo_ = nullptr;
     QComboBox* abrModeCombo_ = nullptr;
     QComboBox* configTransportCombo_ = nullptr;
+    QComboBox* headsetModeCombo_ = nullptr;
+    QWidget* wiredHeadsetOptions_ = nullptr;
+    QDoubleSpinBox* wiredEyeHeightSpin_ = nullptr;
+    QSpinBox* wiredDisplayIdSpin_ = nullptr;
     QComboBox* usbDeviceCombo_ = nullptr;
     QLabel* adbStatusLabel_ = nullptr;
     QLabel* usbStatusLabel_ = nullptr;

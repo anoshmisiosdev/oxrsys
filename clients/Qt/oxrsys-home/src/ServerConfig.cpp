@@ -251,6 +251,12 @@ QString ServerConfig::defaultText()
         "abr_mode = \"bitrate\"\n"
         "headset_audio = false\n"
         "\n"
+        "[wired]\n"
+        "# Wired Windows Mixed Reality headset (macOS only); replaces the streaming client.\n"
+        "wired_headset = false\n"
+        "wired_display_id = 0\n"
+        "wired_eye_height_m = 1.6\n"
+        "\n"
         "[logging]\n"
         "file_logging = true\n"
         "quest_logcat = false\n");
@@ -340,6 +346,25 @@ ServerConfig ServerConfig::parse(const QString& text)
         config.headsetAudio = headsetAudio;
     }
 
+    const bool wiredHeadset = boolValue("wired_headset", text, &ok);
+    if (ok)
+    {
+        config.wiredHeadset = wiredHeadset;
+    }
+
+    const int wiredDisplayId = rawValue("wired_display_id", text).toInt(&ok);
+    if (ok && wiredDisplayId >= 0)
+    {
+        config.wiredDisplayId = wiredDisplayId;
+    }
+
+    const double wiredEyeHeightM = rawValue("wired_eye_height_m", text).toDouble(&ok);
+    if (ok && wiredEyeHeightM >= ServerConfig::MinWiredEyeHeightM &&
+        wiredEyeHeightM <= ServerConfig::MaxWiredEyeHeightM)
+    {
+        config.wiredEyeHeightM = wiredEyeHeightM;
+    }
+
     const bool fileLogging = boolValue("file_logging", text, &ok);
     if (ok)
     {
@@ -380,6 +405,11 @@ QString ServerConfig::mergedInto(const QString& currentText) const
         {"client_reprojection", QString("\"%1\"").arg(clientReprojection)},
         {"abr_mode", QString("\"%1\"").arg(abrMode)},
         {"headset_audio", boolString(headsetAudio)},
+    });
+    text = upsertSection(text, "wired", {
+        {"wired_headset", boolString(wiredHeadset)},
+        {"wired_display_id", QString::number(wiredDisplayId)},
+        {"wired_eye_height_m", decimalString(wiredEyeHeightM)},
     });
     text = upsertSection(text, "logging", {
         {"file_logging", boolString(fileLogging)},
@@ -460,4 +490,10 @@ QString abrModeDisplayName(const QString& value)
         return "Full";
     }
     return "Bitrate";
+}
+
+QString headsetModeDisplayName(bool wiredHeadset)
+{
+    return wiredHeadset ? "Wired Windows Mixed Reality headset (USB)"
+                        : "Streaming (Quest / PICO / visionOS / simulator)";
 }

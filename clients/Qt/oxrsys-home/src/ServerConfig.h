@@ -26,8 +26,14 @@ struct ServerConfig
     QString clientReprojection = "pose";
     QString abrMode = "bitrate";
     bool headsetAudio = false;
+    bool wiredHeadset = false;
+    int wiredDisplayId = 0;
+    double wiredEyeHeightM = 1.6;
     bool fileLogging = true;
     bool questLogcat = false;
+
+    static constexpr double MinWiredEyeHeightM = 1.0;
+    static constexpr double MaxWiredEyeHeightM = 2.2;
 
     static QString defaultText();
     static ServerConfig parse(const QString& text);
@@ -39,3 +45,4 @@ QString transportDisplayName(const QString& value);
 QString foveationPresetDisplayName(const QString& value);
 QString clientReprojectionDisplayName(const QString& value);
 QString abrModeDisplayName(const QString& value);
+QString headsetModeDisplayName(bool wiredHeadset);
