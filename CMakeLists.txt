@@ -84,6 +84,10 @@ FetchContent_Declare(
     GIT_TAG release-1.1.57
     GIT_SHALLOW ON
 )
+# Always build the loader with its vendored jsoncpp. A Homebrew jsoncpp (pulled
+# in by OpenCV, among others) is found by the SDK but its imported target has
+# no Debug configuration, which breaks the loader link with jsoncpp_lib-NOTFOUND.
+set(BUILD_WITH_SYSTEM_JSONCPP OFF CACHE BOOL "Use system jsoncpp instead of vendored source" FORCE)
 FetchContent_MakeAvailable(OpenXR)
 
 # --- Wired-headset drivers (Monado-derived) ---

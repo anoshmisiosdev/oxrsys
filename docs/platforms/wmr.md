@@ -207,6 +207,12 @@ eye size recommended.
 
 - Orientation only; the head sits at a fixed height. Positional tracking
   needs SLAM or an external tracker.
+- Slow initial levelling. Monado's 3DoF fusion starts from identity and pulls
+  toward gravity at only 3°/s while the headset is still (faster while it
+  moves), so a headset picked up off a desk reads a wrong pitch for up to
+  half a minute. Worn from the start, or moved around for a few seconds, it
+  levels quickly. On a Dell Visor the fusion was verified to converge and hold
+  (yaw drift about 1°/s from gyro bias, no positional reference to correct it).
 - The protocol carries one FOV for both eyes; the right eye is mirrored from
   the left. WMR eyes differ by well under a degree, so this is tolerable.
 - No timewarp: a late frame is shown as rendered. Prediction covers the
