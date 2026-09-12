@@ -27,6 +27,7 @@ This file tracks user-facing, integration-facing, and runtime-relevant changes f
 - Added `oxrsys_wmr_display`, which captures a Windows Mixed Reality headset's panel as a macOS display and renders an IMU-driven, distortion-corrected stereo test scene onto it with Metal, with a `--simulate` mode for checking the render path without hardware.
 - Added `wmr_edid_override.py`, which writes the macOS display override that stops macOS hiding WMR panels as non-desktop head-mounted displays.
 - Added a wired-headset runtime backend (`WiredHeadset`, `wired_headset = true`): a Windows Mixed Reality headset replaces the streaming client, the runtime recommends the panel's eye size, paces at its refresh rate, takes orientation from its IMU, and presents projection layers on the panel through the lens distortion warp. Plus `oxrsys_wmr_xr_smoke`, a native OpenXR client for checking it end to end.
+- Added orientation-only controller support to the wired backend: Windows Mixed Reality motion controllers over Bluetooth (or the Reverb G2 / Odyssey+ radio) and PlayStation Move controllers (ZCM1/ZCM2) through Monado's drivers, with an arm-model position and inputs mapped onto the streaming packet; `oxrsys_wmr_probe --controllers` and `--psmove` print their state. An `OXRSYS_WMR_OPENCV` option prepares for camera-based positional tracking.
 
 ### Changed
 
