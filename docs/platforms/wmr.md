@@ -288,10 +288,26 @@ side by side at about 30 Hz, and over them:
   active and reports a position, projected with the camera's pinhole
   parameters from the headset's calibration (distortion ignored, so it
   drifts a little towards the image edges).
-- **Two status lines**: the head tracking kind (`6DoF (Basalt)` or
+- **WMR controllers** (with controller tracking running, see "WMR
+  controller position from the headset cameras"): the LED blobs found in the
+  latest short-exposure controller frame as small dots, a solid box labelled
+  `L` (cyan) or `R` (orange) around the blobs the tracker assigned to each
+  controller, and a dashed yellow `? N` box around each cluster of three or
+  more blobs not assigned to a controller yet (a controller the tracker has
+  not locked onto, or a stray light). The camera label adds the blob count.
+- **Status lines**: the head tracking kind (`6DoF (Basalt)` or
   `3DoF (IMU)` with `no VIT library` / `IMU only` when SLAM is off), the head
   position, poses per second from the tracker, feature counts per camera,
   IMU and image samples pushed, and each camera's frame rate in its label.
+  With controller tracking, a third line: LED frames per second and, per
+  hand, `seen cam0/cam1` or `not seen`, `(LED sync waiting)` until timesync
+  packets go out, and the head-relative position and poses per second while
+  it is tracked, e.g. `L seen cam0 (0.12, -0.31, -0.38) m 42/s, R not seen`.
+
+`OXRSYS_HEADSET_MONITOR_LED_FRAMES=1` shows the short-exposure controller
+frames instead of the SLAM frames (at about 60 Hz; nearly black except for
+the LEDs), which is the quickest way to see whether the controllers' LEDs
+flash in sync.
 
 Closing the window hides it; the helper keeps running. The frames come from
 `oxrsys_wmr_camera_tap` (`drivers/monado/wmr_camera_tap.c`), which splits
@@ -309,9 +325,11 @@ the squares.
 
 ## Controllers
 
-Three kinds of controller work with the wired backend, all orientation-only
-(3DoF) for now: the controller's IMU gives its rotation and the runtime places
-it with a fixed arm model around the head that follows head yaw.
+Three kinds of controller work with the wired backend. The controller's IMU
+gives its rotation. Position comes from the headset cameras when they see the
+controller (1st-gen WMR controllers through their LEDs, one PS Move through its
+sphere, both below); otherwise the runtime places the controller with a fixed
+arm model around the head that follows head yaw.
 
 | Controller | Link | Inputs mapped |
 |---|---|---|
@@ -404,8 +422,9 @@ over libusb, bypassing macOS's stack:
   `wmr_btstack_hci.pklg`, a PacketLogger HCI trace of the last run.
 - **Limits.** The helper opens controllers once, when it opens the headset;
   one switched on later is used after the helper restarts. The controllers
-  send motion reports at roughly 50-65 Hz over this link. Pose is 3DoF like
-  the other controller paths.
+  send motion reports at roughly 50-65 Hz over this link. Rotation comes
+  from the IMU; position from the headset cameras (below) when they see the
+  controller.
 
 ### PS Move sphere position from the headset cameras
 
@@ -427,8 +446,61 @@ Camera exposure and gain are left on the driver's automatic control.
 Not yet verified with a Move in hand: pair one and run
 `oxrsys_wmr_probe --psmove` first (orientation only), then the runtime.
 
-The WMR controllers' LED rings would need Monado's constellation module,
-which is not built.
+### WMR controller position from the headset cameras
+
+With OpenCV (`-DOXRSYS_WMR_OPENCV=ON`) the helper tracks 1st-gen WMR motion
+controllers' LED rings with the headset's own cameras
+(`drivers/monado/wmr_controller_tracking.c`); `--no-controller-tracking`
+turns it off.
+
+- **Frames.** A WMR headset runs its cameras at 90 Hz in a SLAM, controller,
+  controller cadence. The controller frames have a very short exposure in
+  which only the controllers' infrared LEDs show. Monado's camera code already
+  delivers them on the source's camera sinks 2 and 3; on a Dell Visor they
+  arrive at 60 Hz with no controller connected.
+- **LED sync.** The controllers pulse their LEDs only when the host keeps
+  telling them, in the controller's own clock, when the next controller
+  exposure starts. Upstream Monado does not send that yet, so the module
+  wraps each controller's report handler: it tracks the controller clock from
+  the tick counter in its IMU reports (1st-gen report layout only), and on the
+  second controller frame of each cycle sends a timesync packet (report
+  `0x03`: next exposure time, LED intensity 1..399, adjusted from the
+  brightness of matched blobs) plus a keepalive (`0x05`) every 125 ms. The
+  protocol and timing follow Jan Schmidt's and Beyley Cardellio's
+  `dev-constellation-controller-tracking` Monado branch.
+- **Blobs and poses.** Monado's `t_rift_blobwatch` finds LED blobs in each
+  camera (thresholds `OXRSYS_WMR_CT_PIXEL_THRESHOLD`, default `0x04`, and
+  `OXRSYS_WMR_CT_BLOB_THRESHOLD`, default `0x10`), and Monado's generic
+  constellation tracker (`src/xrt/tracking/constellation`, built from the
+  pinned checkout) matches them against each controller's LED model from its
+  calibration (32 LEDs on a 1st-gen controller), with the ring occlusion model
+  from the same branch. Cameras are placed with the SLAM calibration's
+  extrinsics in the frame the driver reports head poses in, and the tracker's
+  world is the head orientation at the frame time (position ignored, so a
+  wandering SLAM estimate costs nothing), which gives poses relative to the
+  head.
+- **Runtime.** A controller seen within the last 150 ms is placed at its
+  optical position (the LED ring's centre), carried along with the current
+  head pose; rotation stays the IMU's. Otherwise the arm model applies.
+- **Diagnostics.** The helper logs a `controller tracking:` line every two
+  seconds in the driver log (LED frame rate, blobs per camera, and per hand
+  sync state, timesyncs sent, LED intensity, poses per second, last position,
+  camera, matched LEDs and reprojection error), plus the camera poses it
+  derived at start. `OXRSYS_WMR_CT_LED_SYNC=0` stops the timesync packets,
+  `OXRSYS_WMR_CT_TIME_OFFSET=N` delays them by N x 0.5 ms for tuning, and
+  `OXRSYS_WMR_CT_WITHOUT_CONTROLLERS=1` runs the blob detector with no
+  controller connected. `oxrsys_wmr_ct_selftest` (a CTest) renders a
+  controller's constellation into the cameras and checks the tracker solves
+  it, with no hardware.
+- **Status.** Controller frames, blob detection, the tracker and the monitor
+  overlay run on a Dell Visor; the self-test solves synthetic views to about a
+  millimetre. Not yet verified with the controllers switched on: whether the
+  LEDs flash in sync over the `wmr_btstack` link, and how the solved positions
+  hold up in real use. Still missing: fusing optical and IMU rotation (the
+  IMU yaw is not aligned with the head's), a grip offset from the ring centre,
+  motion prediction, and tracking source priors for faster reacquisition.
+  Reverb G2 / Odyssey controllers report a different IMU layout and get no
+  LED sync.
 
 ### 6DoF head tracking with Basalt
 
