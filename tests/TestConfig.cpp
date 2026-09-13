@@ -186,17 +186,20 @@ quest_logcat = true
 TEST_CASE("Config parser reads the wired controller adapter switch", "[config][wired]")
 {
     CHECK(ConfigValues{}.wiredControllerAdapter == false);
+    CHECK(ConfigValues{}.wiredCameraMonitor == true);
 
     std::istringstream input(R"TOML(
 [wired]
 wired_headset = true
 wired_controller_adapter = true
+wired_camera_monitor = false
 )TOML");
 
     const ConfigValues values = ParseConfigToml(input);
 
     CHECK(values.wiredHeadset == true);
     CHECK(values.wiredControllerAdapter == true);
+    CHECK(values.wiredCameraMonitor == false);
 }
 
 TEST_CASE("Config singleton initializes with bounded Quest logcat clear", "[config][logcat]")

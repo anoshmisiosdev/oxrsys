@@ -188,8 +188,9 @@ where an in-process window did not.
 sizes before it creates a session.
 
 - **Config.** `wired_headset = true` in `oxrsys-runtime.toml` (plus optional
-  `wired_display_id`, `wired_eye_height_m`, `wired_position_tracking` and
-  `wired_vit_library`; the runtime passes them to the helper when it starts
+  `wired_display_id`, `wired_eye_height_m`, `wired_position_tracking`,
+  `wired_vit_library`, `wired_camera_monitor` (default `true`) and
+  `wired_controller_adapter`; the runtime passes them to the helper when it starts
   it). Off by default; streaming setups are untouched. The Home app's Streaming tab has a Headset section
   that writes these keys: pick `Wired Windows Mixed Reality headset (USB)` as
   the headset mode, then adjust the eye height and, if auto-detection picks
@@ -237,6 +238,8 @@ codesign --force --sign - ~/liboxrsys-runtime-1.1.0/oxrsys-headset-helper
 ```
 
 It logs to `~/Library/Application Support/OXRSys/oxrsys-headset-helper.log`
+(and, when started without a terminal, Monado's own driver/SLAM messages to
+`oxrsys-headset-helper-driver.log`)
 and listens on `/tmp/oxrsys-headset-<uid>.sock`. Stop it before using the
 probe or display tools, which need the headset for themselves. If it aborts
 at start-up with `LIBUSB_ERROR_BUSY` (Monado asserts when the cameras cannot
@@ -261,7 +264,9 @@ eye size recommended.
 
 To see what the headset's tracking cameras see, and what the trackers make
 of it, start the helper with `--monitor` (or `OXRSYS_HEADSET_MONITOR=1` in
-its environment):
+its environment). The runtime does this by default: `wired_camera_monitor =
+true` in `[wired]` (Home: `Show the tracking cameras in a window`) makes it
+pass `--monitor` whenever it starts the helper. By hand:
 
 ```bash
 ./build/runtime/headset_helper/oxrsys-headset-helper --monitor --vit-library /path/to/libbasalt.dylib
