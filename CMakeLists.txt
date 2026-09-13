@@ -247,10 +247,22 @@ set_tests_properties(oxrsys_runtime_status_tests PROPERTIES
     TIMEOUT 120
 )
 
+# Headset helper's optical/arm-model controller blend: plain C++, tested on
+# every platform even though the helper itself is macOS only.
+add_executable(oxrsys_controller_blend_tests
+    tests/TestControllerPositionBlend.cpp
+    runtime/headset_helper/ControllerPositionBlend.cpp
+)
+target_include_directories(oxrsys_controller_blend_tests PRIVATE runtime/headset_helper)
+target_link_libraries(oxrsys_controller_blend_tests PRIVATE Catch2::Catch2WithMain)
+add_test(NAME oxrsys_controller_blend_tests COMMAND oxrsys_controller_blend_tests)
+set_tests_properties(oxrsys_controller_blend_tests PROPERTIES TIMEOUT 30)
+
 set(OXRSYS_RUNTIME_TEST_TARGETS
     oxrsys_runtime
     oxrsys_runtime_tests
     oxrsys_runtime_status_tests
+    oxrsys_controller_blend_tests
 )
 
 if(APPLE)

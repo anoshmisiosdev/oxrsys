@@ -88,8 +88,10 @@ struct CameraMonitorInfo
 	ControllerCameraOverlay controllerCams[2];
 	//! Per hand: identified by the cameras in the last quarter second.
 	bool handSeen[2] = {false, false};
-	//! Per hand: the controller position sent to the runtime is optical.
+	//! Per hand: the controller position sent to the runtime is mostly optical.
 	bool opticalControllers[2] = {false, false};
+	//! Per hand: optical share of that position, 0 (arm model) to 1 (cameras).
+	float opticalWeight[2] = {0.0f, 0.0f};
 	//! e.g. "L seen cam0/cam1 (0.10, -0.30, -0.40) m 40/s, R not seen".
 	std::string controllerStatus;
 };
