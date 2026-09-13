@@ -465,7 +465,8 @@ turns it off.
   the tick counter in its IMU reports (1st-gen report layout only), and on the
   second controller frame of each cycle sends a timesync packet (report
   `0x03`: next exposure time, LED intensity 1..399, adjusted from the
-  brightness of matched blobs) plus a keepalive (`0x05`) every 125 ms. The
+  brightness of matched blobs, and 800 in the 11-bit field that follows, as
+  Windows sends) plus a keepalive (`0x05`) every 125 ms. The
   protocol and timing follow Jan Schmidt's and Beyley Cardellio's
   `dev-constellation-controller-tracking` Monado branch.
 - **Blobs and poses.** Monado's `t_rift_blobwatch` finds LED blobs in each
@@ -485,8 +486,16 @@ turns it off.
   come in under 10 degrees, mirrored ones over 60. Poses with a non-finite
   result, fewer than 4 matched LEDs, more than 1.5 m away or behind the head
   are dropped too; the tracker reports some unscored RANSAC recoveries with no
-  matched LEDs and a NaN pose. Only kept poses drive the LED brightness
-  feedback, which never dims below intensity 40.
+  matched LEDs and a NaN pose. When both hands still end up within 8 cm of
+  each other at the same moment, the one whose gravity agrees better is kept.
+  Only kept poses drive the LED brightness feedback, which never dims below
+  intensity 40.
+- **Prior.** Each controller's last kept pose (up to 120 ms old) is the
+  tracker's prior, so it re-matches from labelled blobs and the predicted pose
+  instead of searching from scratch. With a controller lying still in view of
+  camera 0 this took kept poses from 1-4 per second (about 60 per second
+  rejected, mostly with fewer than 4 matched LEDs) to 60 per second with none
+  rejected. `OXRSYS_WMR_CT_PRIOR=0` turns it off.
 - **Geometry.** Cameras are placed with the SLAM calibration's
   extrinsics in the frame the driver reports head poses in, and the tracker's
   world is the head orientation at the frame time (position ignored, so a
@@ -499,7 +508,8 @@ turns it off.
   seconds in the driver log (LED frame rate, blobs per camera, and per hand
   sync state, timesyncs sent, LED intensity, poses per second, last position,
   camera, matched LEDs, reprojection error, rejected poses and a histogram of
-  the gravity agreement), plus the camera poses it
+  the gravity agreement; rejections are split into NaN, fewer than 4 LEDs,
+  gravity and duplicate of the other hand), plus the camera poses it
   derived at start. `OXRSYS_WMR_CT_LED_SYNC=0` stops the timesync packets,
   `OXRSYS_WMR_CT_TIME_OFFSET=N` delays them by N x 0.5 ms for tuning, and
   `OXRSYS_WMR_CT_WITHOUT_CONTROLLERS=1` runs the blob detector with no
@@ -509,12 +519,15 @@ turns it off.
 - **Status.** Verified on a Dell Visor with both 1st-gen controllers over
   `wmr_btstack`: the LEDs flash in sync (blobs appear within a few seconds
   of starting), both controllers are identified in both cameras, and poses
-  come at roughly 10-50 per second per controller while held in view, at
+  come at up to 60 per second per controller while in view (10-50 per second
+  while being waved around before the prior was added), at
   plausible positions 0.2-0.6 m in front of and below the head with 4-12
   matched LEDs and 0.1-2 px reprojection error. The self-test solves synthetic
   views to about a millimetre. Accuracy against ground truth is not measured. Still missing: fusing optical and IMU rotation (the
   IMU yaw is not aligned with the head's), a grip offset from the ring centre,
-  motion prediction, and tracking source priors for faster reacquisition.
+  motion prediction, an IMU-predicted prior (the prior is the last pose, not
+  where the controller has moved since), and a gyro consistency check against
+  mirror fits that pass the gravity check.
   Reverb G2 / Odyssey controllers report a different IMU layout and get no
   LED sync.
 

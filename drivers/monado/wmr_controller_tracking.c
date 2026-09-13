@@ -70,6 +70,14 @@
 //! Headset frames are ~90 Hz; the frame timestamp is mid-way through a frame period.
 #define HALF_FRAME_NS (U_TIME_1S_IN_NS / 180)
 
+//! The 11-bit field after the timestamp; Windows sends 800 (reportedly the LED
+//! pulse period as (period_us - 1000) / 2).
+#define TIMESYNC_U2 800
+
+//! Two hands' poses this close in space and time are one controller solved twice.
+#define SAME_CONTROLLER_M 0.08f
+#define SAME_CONTROLLER_NS (25 * U_TIME_1MS_IN_NS)
+
 #define HEAD_POSE_CACHE 128
 
 //! Optical poses need at least this many LEDs matched to blobs.
@@ -90,6 +98,8 @@ DEBUG_GET_ONCE_BOOL_OPTION(ct_led_sync, "OXRSYS_WMR_CT_LED_SYNC", true)
  * controller's model, but upside down or tilted; this rejects those.
  */
 DEBUG_GET_ONCE_NUM_OPTION(ct_gravity_max_deg, "OXRSYS_WMR_CT_GRAVITY_MAX_DEG", 30)
+//! Give the tracker the last kept pose as a prior (faster, steadier re-matching).
+DEBUG_GET_ONCE_BOOL_OPTION(ct_prior, "OXRSYS_WMR_CT_PRIOR", true)
 DEBUG_GET_ONCE_BOOL_OPTION(ct_without_controllers, "OXRSYS_WMR_CT_WITHOUT_CONTROLLERS", false)
 
 struct oxrsys_wmr_controller_tracking;
@@ -102,6 +112,10 @@ struct ct_hand
 	void (*original_receive)(struct wmr_controller_base *wcb, uint64_t time_ns, uint8_t *buffer, uint32_t size);
 
 	struct t_constellation_tracker_device device;
+	//! Prior for the tracker: the last kept pose, while it is recent.
+	struct t_constellation_tracker_tracking_source prior_source;
+	struct xrt_pose prior_world_pose;
+	int64_t prior_timestamp_ns;
 	t_constellation_device_id_t id;
 	struct t_constellation_tracker_led leds[WMR_MAX_LEDS];
 	size_t led_count;
@@ -124,12 +138,17 @@ struct ct_hand
 	uint64_t timesyncs_sent;
 	uint64_t unexpected_reports;
 	uint64_t rejected_samples;
+	uint64_t rejected_nonfinite;
+	uint64_t rejected_few_leds;
 	uint64_t gravity_rejected;
 	//! Low-passed accelerometer (controller body, OpenXR axes); points up when still.
 	struct xrt_vec3 accel_lp;
 	bool have_accel;
 	//! Gravity angle histogram since the last log line: <10, <20, <30, <60, >=60 degrees.
 	uint32_t gravity_bins[5];
+	//! Gravity agreement of the pose in `state`, degrees.
+	float state_gravity_deg;
+	uint64_t duplicate_rejected;
 
 	// Output.
 	struct oxrsys_wmr_ct_hand state;
@@ -311,7 +330,7 @@ hooked_receive(struct wmr_controller_base *wcb, uint64_t time_ns, uint8_t *buffe
 			}
 			const uint64_t offset_us = (uint64_t)debug_get_num_option_ct_time_offset() * 500;
 			oxrsys_wmr_ct_fill_timesync_packet(pkt, h->cmd_counter++, ts_ctr, h->led_intensity,
-			                     h->timesync_device_time_us + offset_us, 500, 1);
+			                     h->timesync_device_time_us + offset_us, TIMESYNC_U2, 1);
 			pkt_size = sizeof(pkt);
 			h->timesync_updated = false;
 			h->timesyncs_sent++;
@@ -414,8 +433,10 @@ log_summary_locked(struct oxrsys_wmr_controller_tracking *t, int64_t now)
 			              h->state.reprojection_error);
 		}
 		if (h->rejected_samples > 0 && (size_t)n < sizeof(line)) {
-			n += snprintf(line + n, sizeof(line) - (size_t)n, " (%" PRIu64 " rejected, %" PRIu64 " by gravity)",
-			              h->rejected_samples, h->gravity_rejected);
+			n += snprintf(line + n, sizeof(line) - (size_t)n, " (%" PRIu64 " rejected: %" PRIu64 " NaN, %" PRIu64 " <4 LEDs, %" PRIu64
+			              " gravity, %" PRIu64 " other hand's)",
+			              h->rejected_samples, h->rejected_nonfinite, h->rejected_few_leds, h->gravity_rejected,
+			              h->duplicate_rejected);
 		}
 		if ((size_t)n < sizeof(line)) {
 			n += snprintf(line + n, sizeof(line) - (size_t)n,
@@ -597,6 +618,11 @@ device_push_sample(struct t_constellation_tracker_device *dev, struct t_constell
 	if (!finite || sample->metrics.matched_blob_count < MIN_MATCHED_LEDS) {
 		os_mutex_lock(&h->lock);
 		h->rejected_samples++;
+		if (!finite) {
+			h->rejected_nonfinite++;
+		} else {
+			h->rejected_few_leds++;
+		}
 		os_mutex_unlock(&h->lock);
 		return;
 	}
@@ -662,8 +688,36 @@ device_push_sample(struct t_constellation_tracker_device *dev, struct t_constell
 		return;
 	}
 
+	// Both hands solved on the same LEDs (mirror fits that pass the gravity
+	// check when both controllers are tilted alike): keep whichever agrees
+	// better with its own accelerometer.
+	struct ct_hand *other = &t->hands[1 - h->index];
+	if (other->wcb != NULL) {
+		bool drop_this = false;
+		os_mutex_lock(&other->lock);
+		if (other->state.pose_valid && llabs(other->state.pose_timestamp_ns - sample->timestamp_ns) < SAME_CONTROLLER_NS &&
+		    m_vec3_len(m_vec3_sub(other->state.head_relative.position, rel_pose.position)) < SAME_CONTROLLER_M) {
+			if (gravity_deg < other->state_gravity_deg) {
+				other->state.pose_valid = false;
+				other->duplicate_rejected++;
+			} else {
+				drop_this = true;
+			}
+		}
+		os_mutex_unlock(&other->lock);
+		if (drop_this) {
+			os_mutex_lock(&h->lock);
+			h->duplicate_rejected++;
+			os_mutex_unlock(&h->lock);
+			return;
+		}
+	}
+
 	os_mutex_lock(&h->lock);
 	if (!h->state.pose_valid || sample->timestamp_ns >= h->state.pose_timestamp_ns) {
+		h->state_gravity_deg = gravity_deg;
+		h->prior_world_pose = sample->pose;
+		h->prior_timestamp_ns = sample->timestamp_ns;
 		h->state.pose_valid = true;
 		h->state.pose_timestamp_ns = sample->timestamp_ns;
 		h->state.head_relative = rel_pose;
@@ -683,6 +737,25 @@ device_push_sample(struct t_constellation_tracker_device *dev, struct t_constell
 		h->led_intensity -= h->led_intensity > LED_INTENSITY_MIN + 3 ? 3 : h->led_intensity - LED_INTENSITY_MIN;
 	} else if (brightness < 30.0f) {
 		h->led_intensity = h->led_intensity + 10 > LED_INTENSITY_MAX ? LED_INTENSITY_MAX : h->led_intensity + 10;
+	}
+	os_mutex_unlock(&h->lock);
+}
+
+//! How long a kept pose serves as the tracker's prior.
+#define PRIOR_MAX_AGE_NS (120 * U_TIME_1MS_IN_NS)
+
+static void
+hand_prior_get_tracked_pose(struct t_constellation_tracker_tracking_source *src,
+                            int64_t when_ns,
+                            struct xrt_space_relation *out)
+{
+	struct ct_hand *h = container_of(src, struct ct_hand, prior_source);
+	*out = (struct xrt_space_relation)XRT_SPACE_RELATION_ZERO;
+	os_mutex_lock(&h->lock);
+	const int64_t age = when_ns - h->prior_timestamp_ns;
+	if (h->prior_timestamp_ns != 0 && age >= -PRIOR_MAX_AGE_NS && age <= PRIOR_MAX_AGE_NS) {
+		out->pose = h->prior_world_pose;
+		out->relation_flags = XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_POSITION_VALID_BIT;
 	}
 	os_mutex_unlock(&h->lock);
 }
@@ -888,18 +961,22 @@ add_hand(struct oxrsys_wmr_controller_tracking *t, int index, struct xrt_device 
 	}
 
 	h->led_count = (size_t)wcb->config.led_count;
+	// The lock guards the prior, which the tracker may read as soon as the
+	// device is added.
+	os_mutex_init(&h->lock);
+	h->prior_source.get_tracked_pose = hand_prior_get_tracked_pose;
 	struct t_constellation_tracker_device_params params = {
-	    .tracking_source = NULL,
+	    .tracking_source = debug_get_bool_option_ct_prior() ? &h->prior_source : NULL,
 	    .imu_sink = NULL,
 	};
 	oxrsys_wmr_ct_build_led_model(wcb->config.leds, h->led_count, h->leds, &params.led_model);
 	h->device.push_constellation_tracker_sample = device_push_sample;
 	if (t_constellation_tracker_add_device(t->tracker, &params, &h->device, &h->id) != 0) {
 		CT_E(t, "%s: the constellation tracker refused it.", xdev->str);
+		os_mutex_destroy(&h->lock);
 		return false;
 	}
 
-	os_mutex_init(&h->lock);
 	h->clock = m_clock_windowed_skew_tracker_alloc(200);
 	h->timesync_counter = 1;
 	h->led_intensity = LED_INTENSITY_DEFAULT;
