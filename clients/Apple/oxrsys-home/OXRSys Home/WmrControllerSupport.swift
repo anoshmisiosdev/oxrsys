@@ -43,9 +43,11 @@ struct UsbBluetoothAdapter: Identifiable, Equatable {
 enum UsbBluetoothAdapterScanner {
     private static let appleVendorID = 0x05ac
 
-    /// USB devices exposing a Bluetooth HCI interface (class E0, subclass 01, protocol 01).
+    /// USB Bluetooth HCI devices: class E0, subclass 01, protocol 01, either on the device itself
+    /// (single-function dongles such as the CSR8510, which get no interface entries in the
+    /// registry until something opens them) or on one of its interfaces (composite adapters).
     static func scan() -> [UsbBluetoothAdapter] {
-        guard let matching = IOServiceMatching("IOUSBHostInterface") else {
+        guard let matching = IOServiceMatching("IOUSBHostDevice") else {
             return []
         }
         var iterator: io_iterator_t = 0
@@ -54,41 +56,54 @@ enum UsbBluetoothAdapterScanner {
         }
         defer { IOObjectRelease(iterator) }
 
-        var adapters: [UInt32: UsbBluetoothAdapter] = [:]
-        var interface = IOIteratorNext(iterator)
-        while interface != 0 {
+        var adapters: [UsbBluetoothAdapter] = []
+        var device = IOIteratorNext(iterator)
+        while device != 0 {
             defer {
-                IOObjectRelease(interface)
-                interface = IOIteratorNext(iterator)
+                IOObjectRelease(device)
+                device = IOIteratorNext(iterator)
             }
-            guard intProperty(interface, "bInterfaceClass") == 0xE0,
-                  intProperty(interface, "bInterfaceSubClass") == 0x01,
-                  intProperty(interface, "bInterfaceProtocol") == 0x01 else {
-                continue
-            }
-            var device: io_registry_entry_t = 0
-            guard IORegistryEntryGetParentEntry(interface, kIOServicePlane, &device) == KERN_SUCCESS else {
-                continue
-            }
-            defer { IOObjectRelease(device) }
-
             guard let vendorID = intProperty(device, "idVendor"),
                   let productID = intProperty(device, "idProduct"),
-                  vendorID != appleVendorID else {
+                  vendorID != appleVendorID,
+                  isBluetoothHci(device, prefix: "bDevice") || hasBluetoothHciInterface(device) else {
                 continue
             }
-            let locationID = UInt32(truncatingIfNeeded: intProperty(device, "locationID") ?? 0)
-            let name = stringProperty(device, "USB Product Name")
-                ?? stringProperty(device, "kUSBProductString")
-                ?? "USB Bluetooth adapter"
-            adapters[locationID] = UsbBluetoothAdapter(
-                locationID: locationID,
+            adapters.append(UsbBluetoothAdapter(
+                locationID: UInt32(truncatingIfNeeded: intProperty(device, "locationID") ?? 0),
                 vendorID: vendorID,
                 productID: productID,
-                name: name
-            )
+                name: stringProperty(device, "USB Product Name")
+                    ?? stringProperty(device, "kUSBProductString")
+                    ?? "USB Bluetooth adapter"
+            ))
         }
-        return adapters.values.sorted { $0.locationID < $1.locationID }
+        return adapters.sorted { $0.locationID < $1.locationID }
+    }
+
+    private static func isBluetoothHci(_ entry: io_registry_entry_t, prefix: String) -> Bool {
+        intProperty(entry, prefix + "Class") == 0xE0 &&
+            intProperty(entry, prefix + "SubClass") == 0x01 &&
+            intProperty(entry, prefix + "Protocol") == 0x01
+    }
+
+    private static func hasBluetoothHciInterface(_ device: io_registry_entry_t) -> Bool {
+        var children: io_iterator_t = 0
+        guard IORegistryEntryGetChildIterator(device, kIOServicePlane, &children) == KERN_SUCCESS else {
+            return false
+        }
+        defer { IOObjectRelease(children) }
+        var child = IOIteratorNext(children)
+        while child != 0 {
+            defer {
+                IOObjectRelease(child)
+                child = IOIteratorNext(children)
+            }
+            if IOObjectConformsTo(child, "IOUSBHostInterface") != 0 && isBluetoothHci(child, prefix: "bInterface") {
+                return true
+            }
+        }
+        return false
     }
 
     private static func intProperty(_ entry: io_registry_entry_t, _ key: String) -> Int? {
