@@ -206,8 +206,9 @@ find_hooked(struct wmr_controller_base *wcb)
  *   [11] bits 0-4: U2 bits 6-10, bits 5-6: flags (1 = pulse LEDs)
  * The timestamp is the controller-clock time (us) of the next controller exposure.
  */
-static void
-fill_timesync_packet(uint8_t buf[12], uint8_t cmd_ctr, uint8_t ts_ctr, int led_intensity, uint64_t ts, int u2, uint8_t flags)
+void
+oxrsys_wmr_ct_fill_timesync_packet(
+    uint8_t buf[12], uint8_t cmd_ctr, uint8_t ts_ctr, int led_intensity, uint64_t ts, int u2, uint8_t flags)
 {
 	ts_ctr = ts_ctr & 0x3;
 	led_intensity = led_intensity < 1 ? 1 : (led_intensity > LED_INTENSITY_MAX ? LED_INTENSITY_MAX : led_intensity);
@@ -288,7 +289,7 @@ hooked_receive(struct wmr_controller_base *wcb, uint64_t time_ns, uint8_t *buffe
 				h->timesync_counter = 1;
 			}
 			const uint64_t offset_us = (uint64_t)debug_get_num_option_ct_time_offset() * 500;
-			fill_timesync_packet(pkt, h->cmd_counter++, ts_ctr, h->led_intensity,
+			oxrsys_wmr_ct_fill_timesync_packet(pkt, h->cmd_counter++, ts_ctr, h->led_intensity,
 			                     h->timesync_device_time_us + offset_us, 500, 1);
 			pkt_size = sizeof(pkt);
 			h->timesync_updated = false;
@@ -648,6 +649,36 @@ controller_led_visibility(struct t_constellation_tracker_led_model *led_model, s
 	return true;
 }
 
+void
+oxrsys_wmr_ct_build_led_model(const struct wmr_led_config *leds,
+                              size_t count,
+                              struct t_constellation_tracker_led *out_leds,
+                              struct t_constellation_tracker_led_model *out_model)
+{
+	for (size_t i = 0; i < count; i++) {
+		const struct wmr_led_config *l = &leds[i];
+		// Calibration axes are OpenCV-like (X right, Y down, Z forward); the
+		// tracker takes OpenXR axes and flips them back.
+		out_leds[i] = (struct t_constellation_tracker_led){
+		    .position = {l->pos.x, -l->pos.y, -l->pos.z},
+		    .normal = {l->norm.x, -l->norm.y, -l->norm.z},
+		    .radius_m = 0.003f,
+		    .visibility_angle = DEG_TO_RAD(82.0f),
+		    .id = (t_constellation_led_id_it)i,
+		};
+	}
+	*out_model = (struct t_constellation_tracker_led_model){
+	    .leds = out_leds,
+	    .led_count = count,
+	    .match_parameters =
+	        {
+	            .min_leds_for_correspondence_search_without_prior = 5,
+	            .min_leds_for_correspondence_search_with_prior = 4,
+	        },
+	    .compute_led_visibility = controller_led_visibility,
+	};
+}
+
 /*
  *
  * Setup.
@@ -746,34 +777,11 @@ add_hand(struct oxrsys_wmr_controller_tracking *t, int index, struct xrt_device 
 	}
 
 	h->led_count = (size_t)wcb->config.led_count;
-	for (size_t i = 0; i < h->led_count; i++) {
-		const struct wmr_led_config *l = &wcb->config.leds[i];
-		// Calibration axes are OpenCV-like (X right, Y down, Z forward); the
-		// tracker takes OpenXR axes and flips them back.
-		h->leds[i] = (struct t_constellation_tracker_led){
-		    .position = {l->pos.x, -l->pos.y, -l->pos.z},
-		    .normal = {l->norm.x, -l->norm.y, -l->norm.z},
-		    .radius_m = 0.003f,
-		    .visibility_angle = DEG_TO_RAD(82.0f),
-		    .id = (t_constellation_led_id_it)i,
-		};
-	}
-
 	struct t_constellation_tracker_device_params params = {
-	    .led_model =
-	        {
-	            .leds = h->leds,
-	            .led_count = h->led_count,
-	            .match_parameters =
-	                {
-	                    .min_leds_for_correspondence_search_without_prior = 5,
-	                    .min_leds_for_correspondence_search_with_prior = 4,
-	                },
-	            .compute_led_visibility = controller_led_visibility,
-	        },
 	    .tracking_source = NULL,
 	    .imu_sink = NULL,
 	};
+	oxrsys_wmr_ct_build_led_model(wcb->config.leds, h->led_count, h->leds, &params.led_model);
 	h->device.push_constellation_tracker_sample = device_push_sample;
 	if (t_constellation_tracker_add_device(t->tracker, &params, &h->device, &h->id) != 0) {
 		CT_E(t, "%s: the constellation tracker refused it.", xdev->str);
@@ -1112,6 +1120,31 @@ bool
 oxrsys_wmr_controller_tracking_available(void)
 {
 	return false;
+}
+
+void
+oxrsys_wmr_ct_build_led_model(const struct wmr_led_config *leds,
+                              size_t count,
+                              struct t_constellation_tracker_led *out_leds,
+                              struct t_constellation_tracker_led_model *out_model)
+{
+	(void)leds;
+	(void)count;
+	(void)out_leds;
+	(void)out_model;
+}
+
+void
+oxrsys_wmr_ct_fill_timesync_packet(
+    uint8_t buf[12], uint8_t cmd_ctr, uint8_t ts_ctr, int led_intensity, uint64_t ts_us, int u2, uint8_t flags)
+{
+	(void)cmd_ctr;
+	(void)ts_ctr;
+	(void)led_intensity;
+	(void)ts_us;
+	(void)u2;
+	(void)flags;
+	memset(buf, 0, 12);
 }
 
 #endif

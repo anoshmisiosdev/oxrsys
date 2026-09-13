@@ -31,6 +31,7 @@
 #include "xrt/xrt_tracking.h"
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -153,6 +154,34 @@ oxrsys_wmr_controller_tracking_destroy(struct oxrsys_wmr_controller_tracking **t
 //! Whether this build has controller tracking (needs OpenCV).
 bool
 oxrsys_wmr_controller_tracking_available(void);
+
+/*
+ * Pieces exposed for drivers/tools/wmr_ct_selftest.c.
+ */
+
+struct wmr_led_config;
+struct t_constellation_tracker_led;
+struct t_constellation_tracker_led_model;
+
+/*!
+ * Build the constellation tracker's LED model from a controller calibration's
+ * LEDs (@p count entries, at most WMR_MAX_LEDS). @p out_leds must hold @p count
+ * entries and stays referenced by @p out_model.
+ */
+void
+oxrsys_wmr_ct_build_led_model(const struct wmr_led_config *leds,
+                              size_t count,
+                              struct t_constellation_tracker_led *out_leds,
+                              struct t_constellation_tracker_led_model *out_model);
+
+/*!
+ * The 12-byte LED timesync packet (report 0x03): command counter, 1..3 sync
+ * counter, LED intensity (1..399), controller-clock time of the next
+ * controller exposure in microseconds, the unknown 11-bit U2 and the flags.
+ */
+void
+oxrsys_wmr_ct_fill_timesync_packet(
+    uint8_t buf[12], uint8_t cmd_ctr, uint8_t ts_ctr, int led_intensity, uint64_t ts_us, int u2, uint8_t flags);
 
 #ifdef __cplusplus
 }

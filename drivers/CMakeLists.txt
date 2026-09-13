@@ -411,6 +411,17 @@ target_compile_features(oxrsys_wmr_probe PRIVATE c_std_11)
 target_compile_options(oxrsys_wmr_probe PRIVATE -Wall -Wextra -Wno-unused-parameter)
 target_link_libraries(oxrsys_wmr_probe PRIVATE oxrsys_monado_wmr)
 
+# --- Controller tracking self-test -----------------------------------------
+# Renders a WMR motion controller's LED constellation into the headset
+# cameras and checks the constellation tracker solves it (no hardware).
+if(OXRSYS_WMR_OPENCV)
+    add_executable(oxrsys_wmr_ct_selftest tools/wmr_ct_selftest.c)
+    target_compile_features(oxrsys_wmr_ct_selftest PRIVATE c_std_11)
+    target_compile_options(oxrsys_wmr_ct_selftest PRIVATE -Wall -Wextra -Wno-unused-parameter)
+    target_link_libraries(oxrsys_wmr_ct_selftest PRIVATE oxrsys_monado_wmr)
+    add_test(NAME oxrsys_wmr_ct_selftest COMMAND oxrsys_wmr_ct_selftest)
+endif()
+
 # --- OpenXR smoke tool ------------------------------------------------------
 # Native OpenXR client (loader -> runtime -> WiredHeadset): the end-to-end
 # check that a wired headset works through the runtime.
