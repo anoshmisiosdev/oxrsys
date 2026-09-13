@@ -184,6 +184,7 @@ The structured editor covers the current runtime keys:
 - `wired.wired_display_id`
 - `wired.wired_eye_height_m`
 - `wired.wired_position_tracking`
+- `wired.wired_controller_adapter`
 - `logging.file_logging`
 - `logging.quest_logcat`
 
@@ -223,6 +224,19 @@ only takes effect when `libbasalt.dylib` is installed next to the headset helper
 the one-time EDID display override from `drivers/tools/wmr_edid_override.py` is required before
 macOS shows the panel. Home does not edit `wired_helper_path`; the runtime looks for
 `oxrsys-headset-helper` next to the runtime dylib unless the key is set by hand.
+
+With wired selected, a Motion Controllers group below handles 1st-gen Windows Mixed Reality
+controllers, which macOS's Bluetooth can't pair. `Windows Mixed Reality controllers through a USB
+Bluetooth adapter` writes `wired_controller_adapter`. Home lists USB devices with a Bluetooth HCI
+interface (IOKit, class `E0`/`01`/`01`, Apple devices excluded) every five seconds and marks Realtek
+and Intel adapters as needing firmware. While the setting is on, an adapter is present, and
+`wmr_btstack` sits next to the selected (or registered) runtime dylib, Home starts it detached with
+`-p 0` and restarts it at most every ten seconds; `Start`, `Restart` and `Stop` are also available.
+Home reads `wmr_controllers_status.json` every second for the adapter address, the Left and Right
+controller states (not paired, paired but off, connecting, connected with its report rate, in use by
+the headset) and the pairing countdown. `Pair Controller…` sends a 60 s pairing window over
+`wmr_bt.sock` and shows the pairing-button instructions; `Forget Paired Controllers` drops all
+bondings. Details: [wmr.md](wmr.md#wmr-controllers-through-a-usb-bluetooth-adapter).
 
 `client_reprojection` controls short missing-frame smoothing on the Quest client. The default
 `pose` reuses a recent decoded texture with the matched server render pose; `pose_warp` additionally

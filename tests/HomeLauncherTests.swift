@@ -22,6 +22,8 @@ struct HomeLauncherTests {
         try testApplicationLogFilterDropsAppleShortcutNoise()
         try testServerConfigTransportRoundTrip()
         try testServerConfigDefaultSerialization()
+        try testServerConfigWiredControllerAdapterRoundTrip()
+        try testWmrControllerServiceStatusParsing()
         try testRuntimeActivityParsing()
         try testMacWifiParsing()
         try testAdbStatusDisplay()
@@ -275,6 +277,52 @@ struct HomeLauncherTests {
         try expect(merged.contains("client_reprojection = \"pose_warp\""), "Expected reprojection serialization")
         try expect(merged.contains("abr_mode = \"full\""), "Expected ABR serialization")
         try expect(merged.contains("headset_audio = true"), "Expected audio serialization")
+    }
+
+    private static func testServerConfigWiredControllerAdapterRoundTrip() throws {
+        try expect(OXRSysServerConfig().wiredControllerAdapter == false, "Expected controller adapter off by default")
+        let parsed = OXRSysServerConfig.parse(from: """
+        [wired]
+        wired_headset = true
+        wired_controller_adapter = true
+        """)
+        try expect(parsed.wiredControllerAdapter, "Expected controller adapter parse")
+        let merged = parsed.merged(into: OXRSysServerConfig.defaultText)
+        try expect(merged.contains("wired_controller_adapter = true"), "Expected controller adapter serialization")
+    }
+
+    private static func testWmrControllerServiceStatusParsing() throws {
+        let data = Data("""
+        {"process_id": \(getpid()), "adapter_state": "ready", "adapter_address": "00:15:83:C3:67:EA",
+         "pairing_seconds_left": 42, "runtime_attached": ["R"],
+         "controllers": [{"hand": "R", "name": "Motion controller - Right", "address": "A8:1E:84:E7:39:2A",
+                          "state": "connected", "reports_per_second": 64},
+                         {"hand": "L", "name": "Motion controller - Left", "address": "A8:1E:84:E4:0F:D4",
+                          "state": "bogus"}],
+         "paired": [{"hand": "L", "name": "Motion controller - Left", "address": "A8:1E:84:E4:0F:D4"}]}
+        """.utf8)
+        guard let status = WmrControllerServiceStatus.parse(data) else {
+            throw HomeLauncherTestFailure(description: "Expected controller service status to parse")
+        }
+        try expect(status.isRunning, "Expected a live process to count as running")
+        try expect(status.adapterAddress == "00:15:83:C3:67:EA", "Expected adapter address")
+        try expect(status.pairingSecondsLeft == 42, "Expected pairing countdown")
+        try expect(status.runtimeAttached == ["R"], "Expected runtime attachment")
+        try expect(status.controller(hand: "R")?.state == .connected, "Expected connected right controller")
+        try expect(status.controller(hand: "R")?.reportsPerSecond == 64, "Expected report rate")
+        try expect(status.controller(hand: "L") == nil, "Expected unknown controller state to be dropped")
+        try expect(status.pairedController(hand: "L") != nil, "Expected paired left controller")
+
+        let noAdapter = WmrControllerServiceStatus.parse(Data("""
+        {"process_id": \(getpid()), "adapter_state": "no_adapter", "controllers": [], "paired": []}
+        """.utf8))
+        try expect(noAdapter?.adapterState == .noAdapter, "Expected no-adapter state")
+        try expect(noAdapter?.isRunning == false, "Expected no-adapter status not to count as running")
+
+        let gone = WmrControllerServiceStatus.parse(Data("""
+        {"process_id": 999999, "adapter_state": "ready", "controllers": [], "paired": []}
+        """.utf8))
+        try expect(gone?.isRunning == false, "Expected an exited process not to count as running")
     }
 
     private static func testServerConfigDefaultSerialization() throws {

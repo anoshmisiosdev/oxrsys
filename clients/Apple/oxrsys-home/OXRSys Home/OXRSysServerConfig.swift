@@ -26,6 +26,7 @@ struct OXRSysServerConfig: Equatable {
     var wiredDisplayId = 0
     var wiredEyeHeightM = 1.6
     var wiredPositionTracking = true
+    var wiredControllerAdapter = false
     var fileLogging = true
     var questLogcat = false
 
@@ -107,6 +108,11 @@ struct OXRSysServerConfig: Equatable {
     # installed next to the headset helper; false = orientation only.
     wired_position_tracking = true
 
+    # Windows Mixed Reality motion controllers through a separate USB Bluetooth
+    # adapter (macOS's Bluetooth can't pair 1st-gen controllers). The headset
+    # helper starts wmr_btstack from next to itself; see docs/platforms/wmr.md.
+    wired_controller_adapter = false
+
     [logging]
     # Write server logs to ~/Library/Application Support/OXRSys/oxrsys-runtime.log.
     file_logging = true
@@ -172,6 +178,9 @@ struct OXRSysServerConfig: Equatable {
         if let value = boolValue("wired_position_tracking", in: text) {
             config.wiredPositionTracking = value
         }
+        if let value = boolValue("wired_controller_adapter", in: text) {
+            config.wiredControllerAdapter = value
+        }
         if let value = boolValue("file_logging", in: text) {
             config.fileLogging = value
         }
@@ -212,6 +221,7 @@ struct OXRSysServerConfig: Equatable {
                 ("wired_display_id", "\(wiredDisplayId)"),
                 ("wired_eye_height_m", decimalString(wiredEyeHeightM)),
                 ("wired_position_tracking", boolString(wiredPositionTracking)),
+                ("wired_controller_adapter", boolString(wiredControllerAdapter)),
             ]),
             ("logging", [
                 ("file_logging", boolString(fileLogging)),

@@ -34,6 +34,7 @@ swiftc -parse-as-library \
   "clients/Apple/oxrsys-home/OXRSys Home/OXRSysServerConfig.swift" \
   "clients/Apple/oxrsys-home/OXRSys Home/HomeLauncher.swift" \
   "clients/Apple/oxrsys-home/OXRSys Home/HomePreferences.swift" \
+  "clients/Apple/oxrsys-home/OXRSys Home/WmrControllerSupport.swift" \
   tests/HomeLauncherTests.swift \
   -o /tmp/oxrsys_home_launcher_tests && /tmp/oxrsys_home_launcher_tests
 ```

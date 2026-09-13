@@ -32,6 +32,9 @@ final class HomeAppModel: ObservableObject, @unchecked Sendable {
     @Published var runtimeActivity = HomeRuntimeActivity.idle
     @Published private(set) var runtimeStatsHistory: [HomeRuntimeStreamingStats] = []
     @Published private(set) var activeLaunchedAppID: String?
+    @Published var usbBluetoothAdapters: [UsbBluetoothAdapter] = []
+    @Published var wmrControllerService: WmrControllerServiceStatus?
+    @Published var wmrControllerToolPath: String?
     @Published var statusMessage = ""
     @Published var errorMessage: String?
 
@@ -52,6 +55,8 @@ final class HomeAppModel: ObservableObject, @unchecked Sendable {
     private var pollTask: Task<Void, Never>?
     private var runtimeStatsStreamIdentity: RuntimeStatsStreamIdentity?
     private let maxRuntimeStatsSamples = 60
+    var lastUsbBluetoothAdapterScan = Date.distantPast
+    var lastWmrControllerServiceStart = Date.distantPast
 
     init() {
         runtimeManifestPath = defaults.string(forKey: runtimeManifestPathKey) ?? SourceDefaults.defaultRuntimeManifestPath()
@@ -828,6 +833,7 @@ final class HomeAppModel: ObservableObject, @unchecked Sendable {
                 self.refreshRuntimeActivity()
                 self.refreshTransportHealth()
                 self.pollConfigChangesIfNeeded()
+                self.refreshWmrControllers()
             }
         }
     }

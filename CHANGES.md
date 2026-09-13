@@ -6,6 +6,7 @@ This file tracks user-facing, integration-facing, and runtime-relevant changes f
 
 ### Added
 
+- Added `drivers/tools/wmr_btstack`, which pairs 1st-gen Windows Mixed Reality motion controllers on a separate USB Bluetooth adapter through BTstack (macOS's Bluetooth can't pair them) and relays them to the wired headset helper over a Unix socket; the `wired_controller_adapter` config key makes the helper start it, and SwiftUI Home gains a Motion Controllers group with adapter detection, controller status, pairing, and forgetting (Qt Home exposes the key).
 - Added Linux-first Qt frontends under `clients/Qt/`, including Qt Home, a standalone Qt simulator, and a reusable simulator widget.
 - Added Qt Home support for compatible app launching, selected-runtime registration on Linux, runtime TOML editing, runtime activity/status display, custom ADB selection, USB reverse mapping setup, and asynchronous transport readiness checks.
 - Added Qt simulator video preview with FFmpeg when available, tracking-only fallback when FFmpeg is unavailable, mouse-driven synthetic head tracking, frame-loss/FEC status, and keyframe recovery requests.
