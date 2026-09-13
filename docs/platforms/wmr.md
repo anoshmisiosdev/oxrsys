@@ -310,7 +310,7 @@ it with a fixed arm model around the head that follows head yaw.
 
 | Controller | Link | Inputs mapped |
 |---|---|---|
-| WMR motion controllers (original, Odyssey, Reverb G2) | Bluetooth to the Mac, or the headset's own radio on Reverb G2 / Odyssey+ | trigger, squeeze (grip), menu, thumbstick and click, trackpad click as the lower face button; G2 A/B/X/Y and analog squeeze |
+| WMR motion controllers (original, Odyssey, Reverb G2) | Bluetooth to the Mac, a USB Bluetooth adapter through `wmr_btstack` (1st-gen controllers), or the headset's own radio on Reverb G2 / Odyssey+ | trigger, squeeze (grip), menu, thumbstick and click, trackpad click as the lower face button; G2 A/B/X/Y and analog squeeze |
 | PlayStation Move (ZCM1, ZCM2) | Bluetooth to the Mac | trigger, Move button (grip), Start (menu), Cross/Circle as the face buttons |
 
 The runtime prefers the headset's controllers and falls back to PS Moves; with
@@ -321,11 +321,13 @@ profile.
 ### Pairing
 
 - **WMR controllers.** Open the battery cover; hold the small pairing button
-  inside until the LEDs flash, then connect `Motion controller - Left` /
-  `Motion controller - Right` in System Settings → Bluetooth. Both must be
-  paired to the Mac, not to a Windows PC. Check with
-  `oxrsys_wmr_probe --list` (they show as `Bluetooth motion controller`) and
-  watch them with `oxrsys_wmr_probe --controllers`.
+  inside until the LEDs flash. Controllers that macOS can pair (connect
+  `Motion controller - Left` / `Motion controller - Right` in System
+  Settings → Bluetooth) show up in `oxrsys_wmr_probe --list` as
+  `Bluetooth motion controller`; watch them with
+  `oxrsys_wmr_probe --controllers`. **1st-gen controllers (Acer, Dell, HP,
+  Lenovo, Samsung Odyssey) do not pair with macOS 13 and later**: see the
+  next section.
 - **PS Move ZCM2** (PS4 era, micro-USB): hold PS until the LED blinks and
   pair it in System Settings → Bluetooth like any gamepad.
 - **PS Move ZCM1** (PS3 era, mini-USB): it only pairs to the host whose
@@ -334,6 +336,71 @@ profile.
   controller only streams sensor data over Bluetooth, and the runtime skips
   USB-attached Moves. `oxrsys_wmr_probe --psmove --list` shows the bus each
   Move is on; `oxrsys_wmr_probe --psmove` prints their state.
+
+### WMR controllers through a USB Bluetooth adapter
+
+macOS's Bluetooth daemon reads a controller's service records before it
+starts pairing. A 1st-gen WMR controller in pairing mode stops answering
+during that exchange (the link drops after the 5 s supervision timeout and the
+LEDs go from flashing to solid), so pairing never begins; no IOBluetooth API
+changes the order (`drivers/tools/wmr_bt_pair.swift` records what was tried).
+Windows and BlueZ authenticate first, which is what the controllers expect.
+
+`drivers/tools/wmr_btstack` does the same on a separate USB Bluetooth adapter
+that it drives itself with [BTstack](https://github.com/bluekitchen/btstack)
+over libusb, bypassing macOS's stack:
+
+```
+  controller ── Bluetooth ── USB adapter ── libusb ── wmr_btstack
+                                                          │ Unix socket
+                                                          ▼  (wmr_bt_bridge_protocol.h)
+                          oxrsys-headset-helper: os_hid_wmr_bridge.c → Monado wmr_bt_controller
+```
+
+- **Adapter.** Any USB adapter with a Bluetooth HCI interface that works
+  without a firmware upload: CSR8510 A10 (`0a12:0001`, verified) and Broadcom
+  BCM20702. Realtek (`0bda:*`) and Intel (`8087:*`) adapters need vendor
+  firmware that the tool doesn't load. On Apple Silicon macOS never uses
+  external adapters, so nothing has to be detached; on Intel Macs the adapter
+  must not be the system Bluetooth controller. While the tool runs it owns the
+  adapter exclusively.
+- **Build.** `brew install libusb`, clone BTstack to `~/src/btstack`, then
+  `drivers/tools/wmr_btstack/build.sh` (`BTSTACK=` to point elsewhere). It
+  compiles a Classic-only BTstack with a patched copy of the libusb transport:
+  on macOS it skips `libusb_set_configuration` and `libusb_reset_device` when
+  opening the adapter, and SCO (isochronous) transfers are compiled out. The
+  unpatched transport panicked the macOS 27 beta kernel in IOUSBHostFamily.
+- **Deploy.** Copy `drivers/tools/wmr_btstack/build/wmr_btstack` next to
+  `oxrsys-headset-helper` and ad-hoc sign it, like the helper.
+- **Enable.** `wired_controller_adapter = true` in `[wired]` (Home: Streaming
+  → Headset → Motion Controllers). The runtime passes `--controller-adapter`
+  to the helper, which starts `wmr_btstack -p 0` from next to itself when its
+  socket doesn't answer, gives paired controllers up to five seconds to
+  reconnect, and then opens whichever are connected through the socket. The
+  Home app also keeps the tool running while the setting is on and an adapter
+  is plugged in, so controllers can be paired before any game starts.
+- **Pairing.** Pair each controller once: Home's `Pair Controller…` (or
+  `wmr_btstack -p 120` from a terminal) opens a pairing window; put the
+  controller in pairing mode and it bonds (the controllers ask for legacy PIN
+  `0000`, which the tool answers) and connects. Afterwards pressing the
+  controller's Windows button reconnects it: outside a pairing window the tool
+  only page-scans, at a high duty cycle, so those reconnects get through.
+  `Forget Paired Controllers` (or `wmr_btstack -r`) drops all bondings.
+- **Standalone.** Without the runtime attached the tool prints each
+  controller's accelerometer, gyro, stick, trigger, touchpad and buttons,
+  which is a quick way to check a controller.
+- **Files** (all in `~/Library/Application Support/OXRSys/`):
+  `wmr_bt.sock` (bridge socket), `wmr_controllers_status.json` (for Home:
+  `process_id`, `adapter_state` `ready`/`no_adapter`, `adapter_address`,
+  `pairing_seconds_left`, `runtime_attached`, `controllers[]` with `hand`,
+  `name`, `address`, `state` `pairing`/`connecting`/`connected` and
+  `reports_per_second`, and `paired[]`), `wmr_btstack_<adapter>.tlv` (link
+  keys), `wmr_btstack_names.txt`, `wmr_btstack.log`, and
+  `wmr_btstack_hci.pklg`, a PacketLogger HCI trace of the last run.
+- **Limits.** The helper opens controllers once, when it opens the headset;
+  one switched on later is used after the helper restarts. The controllers
+  send motion reports at roughly 50-65 Hz over this link. Pose is 3DoF like
+  the other controller paths.
 
 ### PS Move sphere position from the headset cameras
 
@@ -532,6 +599,5 @@ read the USB interface number; report that with the full `--list` output.
   calibration to `$XDG_CONFIG_HOME/monado/wmr/` or, failing that,
   `~/monado/wmr/`. That is Monado's choice on non-Linux platforms and may be
   redirected later.
-- **Bluetooth controllers** (the ones not paired through the headset's own
-  radio) are not enumerated yet; only Reverb G2 and Odyssey+ controllers, which
-  talk through the HMD, are returned by the open call.
+- **Controller hot-plug.** Controllers (Bluetooth, adapter or headset radio)
+  are opened with the headset; ones connected later need a helper restart.

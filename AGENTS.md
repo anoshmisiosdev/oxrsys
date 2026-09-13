@@ -122,7 +122,11 @@ As of March 17, 2026, the pinned non-interactive OpenXR-CTS baseline is green lo
 - `drivers/` compiles the Windows Mixed Reality driver out of an unmodified, commit-pinned Monado
   checkout (BSL-1.0) fetched with FetchContent. Do not patch Monado sources in place; add macOS
   pieces under `drivers/monado/` and keep the source lists in `drivers/CMakeLists.txt` in step with
-  the pinned revision. See `docs/platforms/wmr.md`.
+  the pinned revision. See `docs/platforms/wmr.md`. 1st-gen WMR motion controllers cannot pair
+  with macOS's own Bluetooth; `drivers/tools/wmr_btstack` (BTstack on a USB Bluetooth adapter,
+  built by its own `build.sh`) pairs them and relays them to the headset helper through
+  `drivers/monado/os_hid_wmr_bridge.c`. Its libusb transport must stay patched (no
+  `libusb_reset_device` / `set_configuration`, no SCO) or it can panic the macOS kernel.
 - A wired headset (`WiredHeadset`, enabled by `wired_headset = true`) replaces the streaming
   server for a session. The headset itself is owned by `oxrsys-headset-helper`
   (`runtime/headset_helper/`, native arm64: driver, captured display, tracking, idle lobby); the

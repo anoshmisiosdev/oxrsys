@@ -13,10 +13,17 @@
 //
 //   oxrsys-headset-helper [--socket PATH] [--display-id ID] [--no-capture]
 //                         [--eye-height M] [--vit-library PATH|none] [--monitor]
+//                         [--controller-adapter]
 //                         [--log-level trace|debug|info|warn|error]
 //
-// The runtime passes --display-id, --eye-height and --vit-library from its
-// wired_* config keys when it starts the helper.
+// The runtime passes --display-id, --eye-height, --vit-library and
+// --controller-adapter from its wired_* config keys when it starts the helper.
+//
+// --controller-adapter: 1st-gen WMR motion controllers can't pair with macOS's
+// Bluetooth, so they run on a separate USB Bluetooth adapter through
+// wmr_btstack (drivers/tools/wmr_btstack). The helper starts it from next to
+// this executable if it isn't running and gives paired controllers a moment to
+// reconnect before opening them through its socket.
 //
 // --monitor (or OXRSYS_HEADSET_MONITOR=1) opens a window on a desktop screen
 // showing the tracking cameras with Basalt's features and the tracked PS Move
@@ -30,6 +37,7 @@
 #include "CameraMonitor.h"
 #include "HeadsetHelperIpc.h"
 
+#include "os_hid_wmr_bridge.h"
 #include "psmv_macos.h"
 #include "vit_monitor.h"
 #include "wmr_camera_tap.h"
@@ -52,9 +60,15 @@
 #include <mach/mach.h>
 #include <servers/bootstrap.h>
 
+#include <fcntl.h>
+#include <limits.h>
+#include <spawn.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <unistd.h>
+
+extern char** environ;
 
 #include <atomic>
 #include <chrono>
@@ -379,6 +393,8 @@ struct Options
 	std::string vitLibrary;
 	//! Camera monitor window (--monitor / OXRSYS_HEADSET_MONITOR=1).
 	bool monitor = false;
+	//! WMR controllers through wmr_btstack on a USB Bluetooth adapter.
+	bool controllerAdapter = false;
 };
 
 struct ClientState
@@ -1106,6 +1122,74 @@ StartCameraTap()
 	}
 }
 
+/*!
+ * Make sure wmr_btstack is serving controllers before the headset (and its
+ * controllers) are opened. Starts it from next to this executable if its socket
+ * doesn't answer, then waits briefly for paired controllers that are switched on
+ * to reconnect. Controllers switched on later are picked up when the helper
+ * next starts.
+ */
+static void
+EnsureControllerBridge()
+{
+	char hands[3];
+	if (os_hid_wmr_bridge_list(hands) < 0) {
+		char exe[PATH_MAX];
+		uint32_t size = sizeof(exe);
+		if (_NSGetExecutablePath(exe, &size) != 0) {
+			LOGW("controller adapter: cannot locate the helper executable");
+			return;
+		}
+		std::string dir = exe;
+		dir = dir.substr(0, dir.rfind('/'));
+		std::string tool = dir + "/wmr_btstack";
+		if (access(tool.c_str(), X_OK) != 0) {
+			LOGW("controller adapter: %s not found; build drivers/tools/wmr_btstack and copy it next to the helper",
+			     tool.c_str());
+			return;
+		}
+		const char* home = getenv("HOME");
+		std::string log = std::string(home ? home : "/tmp") + "/Library/Application Support/OXRSys/wmr_btstack.log";
+
+		posix_spawn_file_actions_t fa;
+		posix_spawn_file_actions_init(&fa);
+		posix_spawn_file_actions_addopen(&fa, STDOUT_FILENO, log.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+		posix_spawn_file_actions_adddup2(&fa, STDOUT_FILENO, STDERR_FILENO);
+		posix_spawnattr_t attr;
+		posix_spawnattr_init(&attr);
+		// Own session: it keeps the adapter (and the controllers' pairing) across helper restarts.
+		posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID);
+		char* args[] = {tool.data(), (char*)"-p", (char*)"0", nullptr};
+		pid_t pid = -1;
+		const int rc = posix_spawn(&pid, tool.c_str(), &fa, &attr, args, environ);
+		posix_spawnattr_destroy(&attr);
+		posix_spawn_file_actions_destroy(&fa);
+		if (rc != 0) {
+			LOGW("controller adapter: starting %s failed: %s", tool.c_str(), strerror(rc));
+			return;
+		}
+		LOGI("controller adapter: started wmr_btstack (pid %d), log %s", pid, log.c_str());
+	}
+
+	// Paired controllers that are on reconnect within a few seconds of the adapter coming up.
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+	int count = 0;
+	while (std::chrono::steady_clock::now() < deadline) {
+		count = os_hid_wmr_bridge_list(hands);
+		if (count >= 2) break;
+		if (count < 0) {
+			int status = 0;
+			waitpid(-1, &status, WNOHANG); // reap a wmr_btstack that exited (no adapter)
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(250));
+	}
+	if (count <= 0) {
+		LOGI("controller adapter: no motion controllers connected yet (press the Windows button, or pair them from OXRSys Home)");
+	} else {
+		LOGI("controller adapter: %d controller(s) connected (%s)", count, hands);
+	}
+}
+
 static bool
 OpenHeadset()
 {
@@ -1113,6 +1197,7 @@ OpenHeadset()
 	// SLAM is started here, not by the driver, so a missing Basalt does not
 	// stop the headset from opening.
 	oxrsys_wmr_slam_prepare_environment();
+	if (g.opts.controllerAdapter) EnsureControllerBridge();
 	const enum oxrsys_wmr_open_result result = oxrsys_wmr_headset_open(g.opts.logLevel, &g.headset);
 	if (result != OXRSYS_WMR_OPEN_OK) {
 		LOGE("no usable headset: %s", oxrsys_wmr_open_result_str(result));
@@ -1300,6 +1385,8 @@ main(int argc, char** argv)
 			g.opts.vitLibrary = argv[++i];
 		} else if (strcmp(argv[i], "--monitor") == 0) {
 			g.opts.monitor = true;
+		} else if (strcmp(argv[i], "--controller-adapter") == 0) {
+			g.opts.controllerAdapter = true;
 		} else if (strcmp(argv[i], "--log-level") == 0 && hasValue) {
 			const char* l = argv[++i];
 			g.opts.logLevel = strcmp(l, "trace") == 0 ? U_LOGGING_TRACE
@@ -1310,7 +1397,7 @@ main(int argc, char** argv)
 		} else {
 			fprintf(stderr,
 			        "usage: %s [--socket PATH] [--display-id ID] [--no-capture] [--eye-height M] "
-			        "[--vit-library PATH|none] [--monitor] [--log-level LEVEL]\n",
+			        "[--vit-library PATH|none] [--monitor] [--controller-adapter] [--log-level LEVEL]\n",
 			        argv[0]);
 			return 2;
 		}

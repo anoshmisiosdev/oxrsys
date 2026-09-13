@@ -261,6 +261,7 @@ endif()
 
 set(OXRSYS_MONADO_PLATFORM_SOURCES
     monado/os_hid_hidapi.c
+    monado/os_hid_wmr_bridge.c
     monado/psmv_macos.c
     monado/t_euroc_recorder_stub.c
     monado/u_file_macos.c
@@ -330,6 +331,7 @@ if(OXRSYS_WMR_CROSS_ARCH)
 endif()
 set_source_files_properties(
     monado/os_hid_hidapi.c
+    monado/os_hid_wmr_bridge.c
     monado/psmv_macos.c
     monado/t_euroc_recorder_stub.c
     monado/u_file_macos.c
