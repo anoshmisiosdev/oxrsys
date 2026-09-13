@@ -12,6 +12,7 @@
 
 #include "wmr_controller_tracking.h"
 #include "wmr_ct_jump_gate.h"
+#include "wmr_ct_gyro_check.h"
 
 #include "xrt/xrt_config_have.h"
 
@@ -105,6 +106,12 @@ DEBUG_GET_ONCE_NUM_OPTION(ct_jump_min_mm, "OXRSYS_WMR_CT_JUMP_MIN_MM", 50)
 DEBUG_GET_ONCE_NUM_OPTION(ct_jump_speed_mmps, "OXRSYS_WMR_CT_JUMP_SPEED_MMPS", 3000)
 DEBUG_GET_ONCE_NUM_OPTION(ct_jump_fast_speed_mmps, "OXRSYS_WMR_CT_JUMP_FAST_SPEED_MMPS", 10000)
 DEBUG_GET_ONCE_NUM_OPTION(ct_jump_relock, "OXRSYS_WMR_CT_JUMP_RELOCK", 3)
+/*!
+ * Rotation check: base degrees the rotation between two kept optical poses may
+ * differ from the controller's gyro over the same interval, plus a quarter of
+ * that rotation (see wmr_ct_gyro_check.h). 0 turns the check off.
+ */
+DEBUG_GET_ONCE_NUM_OPTION(ct_gyro_max_deg, "OXRSYS_WMR_CT_GYRO_MAX_DEG", (int64_t)OXRSYS_WMR_CT_GYRO_BASE_DEG)
 //! Give the tracker the last kept pose as a prior (faster, steadier re-matching).
 DEBUG_GET_ONCE_BOOL_OPTION(ct_prior, "OXRSYS_WMR_CT_PRIOR", true)
 DEBUG_GET_ONCE_BOOL_OPTION(ct_without_controllers, "OXRSYS_WMR_CT_WITHOUT_CONTROLLERS", false)
@@ -159,6 +166,11 @@ struct ct_hand
 	struct oxrsys_wmr_ct_jump_gate jump_gate;
 	struct oxrsys_wmr_ct_jump_gate_params jump_params;
 	uint64_t jump_rejected;
+	//! Gyro history (monotonic time, body axes) for the rotation check.
+	struct oxrsys_wmr_ct_gyro_history gyro;
+	uint64_t gyro_rejected;
+	//! Rotation mismatch histogram since the last log line: <10, <20, <45, <90, >=90 degrees.
+	uint32_t gyro_bins[5];
 
 	// Output.
 	struct oxrsys_wmr_ct_hand state;
@@ -320,6 +332,7 @@ hooked_receive(struct wmr_controller_base *wcb, uint64_t time_ns, uint8_t *buffe
 					h->ticks = ticks32;
 					m_clock_windowed_skew_tracker_reset(h->clock);
 					h->clock_locked = false;
+					oxrsys_wmr_ct_gyro_reset(&h->gyro);
 				} else {
 					h->ticks += delta;
 				}
@@ -368,8 +381,20 @@ hooked_receive(struct wmr_controller_base *wcb, uint64_t time_ns, uint8_t *buffe
 	if (size == OG_STATUS_REPORT_SIZE && buffer[0] == WMR_MOTION_CONTROLLER_STATUS_MSG) {
 		os_mutex_lock(&wcb->data_lock);
 		const struct xrt_vec3 a = wcb->fusion.last.accel;
+		const struct xrt_vec3 w = wcb->fusion.last.gyro;
+		const uint64_t fusion_ns = wcb->fusion.last.timestamp_ns;
 		os_mutex_unlock(&wcb->data_lock);
 		os_mutex_lock(&h->lock);
+		// This report's gyro (the driver timestamps it with the same tick
+		// counter), placed on the monotonic clock through the controller clock
+		// estimate rather than the Bluetooth arrival time.
+		timepoint_ns gyro_mono_ns;
+		if (h->clock_locked &&
+		    (uint32_t)(fusion_ns / WMR_MOTION_CONTROLLER_NS_PER_TICK) == (uint32_t)h->ticks &&
+		    m_clock_windowed_skew_tracker_to_local(
+		        h->clock, (timepoint_ns)(h->ticks * WMR_MOTION_CONTROLLER_NS_PER_TICK), &gyro_mono_ns)) {
+			oxrsys_wmr_ct_gyro_push(&h->gyro, gyro_mono_ns, &w);
+		}
 		if (!h->have_accel) {
 			h->accel_lp = a;
 			h->have_accel = true;
@@ -423,7 +448,7 @@ notify_controller_frame(struct oxrsys_wmr_controller_tracking *t, const struct x
 static void
 log_summary_locked(struct oxrsys_wmr_controller_tracking *t, int64_t now)
 {
-	char line[1024];
+	char line[1536];
 	int n = snprintf(line, sizeof(line), "controller tracking: %.1f controller fps, blobs cam0 %u cam1 %u",
 	                 t->controller_fps, t->views[0].blob_count, t->cam_count > 1 ? t->views[1].blob_count : 0);
 	for (int i = 0; i < 2 && n > 0 && (size_t)n < sizeof(line); i++) {
@@ -444,15 +469,21 @@ log_summary_locked(struct oxrsys_wmr_controller_tracking *t, int64_t now)
 		}
 		if (h->rejected_samples > 0 && (size_t)n < sizeof(line)) {
 			n += snprintf(line + n, sizeof(line) - (size_t)n, " (%" PRIu64 " rejected: %" PRIu64 " NaN, %" PRIu64 " <4 LEDs, %" PRIu64
-			              " gravity, %" PRIu64 " jump, %" PRIu64 " other hand's)",
+			              " gravity, %" PRIu64 " gyro, %" PRIu64 " jump, %" PRIu64 " other hand's)",
 			              h->rejected_samples, h->rejected_nonfinite, h->rejected_few_leds, h->gravity_rejected,
-			              h->jump_rejected, h->duplicate_rejected);
+			              h->gyro_rejected, h->jump_rejected, h->duplicate_rejected);
 		}
 		if ((size_t)n < sizeof(line)) {
 			n += snprintf(line + n, sizeof(line) - (size_t)n,
 			              " gravity agreement <10/<20/<30/<60/more deg %u/%u/%u/%u/%u", h->gravity_bins[0],
 			              h->gravity_bins[1], h->gravity_bins[2], h->gravity_bins[3], h->gravity_bins[4]);
 			memset(h->gravity_bins, 0, sizeof(h->gravity_bins));
+		}
+		if ((size_t)n < sizeof(line)) {
+			n += snprintf(line + n, sizeof(line) - (size_t)n,
+			              " gyro mismatch <10/<20/<45/<90/more deg %u/%u/%u/%u/%u", h->gyro_bins[0],
+			              h->gyro_bins[1], h->gyro_bins[2], h->gyro_bins[3], h->gyro_bins[4]);
+			memset(h->gyro_bins, 0, sizeof(h->gyro_bins));
 		}
 		if (h->unexpected_reports > 0 && (size_t)n < sizeof(line)) {
 			n += snprintf(line + n, sizeof(line) - (size_t)n, " (%" PRIu64 " non-1st-gen reports)",
@@ -698,6 +729,33 @@ device_push_sample(struct t_constellation_tracker_device *dev, struct t_constell
 		return;
 	}
 
+	// The rotation since the last kept pose must match the controller's gyro.
+	// Frame timestamps are mid-way through the frame period; the LEDs flash
+	// at its start.
+	const int64_t gyro_base_deg = debug_get_num_option_ct_gyro_max_deg();
+	if (gyro_base_deg > 0) {
+		float mismatch_deg = 0.0f;
+		os_mutex_lock(&h->lock);
+		enum oxrsys_wmr_ct_gyro_result gyro_result = OXRSYS_WMR_CT_GYRO_UNKNOWN;
+		if (h->prior_timestamp_ns != 0) {
+			gyro_result = oxrsys_wmr_ct_gyro_check(&h->gyro, h->prior_timestamp_ns - HALF_FRAME_NS,
+			                                       &h->prior_world_pose.orientation,
+			                                       sample->timestamp_ns - HALF_FRAME_NS, &sample->pose.orientation,
+			                                       (float)gyro_base_deg, &mismatch_deg, NULL);
+		}
+		if (gyro_result != OXRSYS_WMR_CT_GYRO_UNKNOWN) {
+			h->gyro_bins[mismatch_deg < 10 ? 0 : mismatch_deg < 20 ? 1 : mismatch_deg < 45 ? 2 : mismatch_deg < 90 ? 3 : 4]++;
+		}
+		if (gyro_result == OXRSYS_WMR_CT_GYRO_DISAGREES) {
+			h->rejected_samples++;
+			h->gyro_rejected++;
+		}
+		os_mutex_unlock(&h->lock);
+		if (gyro_result == OXRSYS_WMR_CT_GYRO_DISAGREES) {
+			return;
+		}
+	}
+
 	// Jump gate: further from the last kept pose than the controller could
 	// have moved (faster while its IMU shows hard motion).
 	os_mutex_lock(&h->wcb->data_lock);
@@ -710,6 +768,7 @@ device_push_sample(struct t_constellation_tracker_device *dev, struct t_constell
 	                                                   sample->pose.position, accel_len,
 	                                                   gyro_len) != OXRSYS_WMR_CT_JUMP_REJECT;
 	if (!jump_ok) {
+		h->rejected_samples++;
 		h->jump_rejected++;
 	}
 	os_mutex_unlock(&h->lock);

@@ -283,6 +283,7 @@ set(OXRSYS_MONADO_PLATFORM_SOURCES
     monado/wmr_camera_tap.c
     monado/wmr_controller_tracking.c
     monado/wmr_ct_jump_gate.c
+    monado/wmr_ct_gyro_check.c
     monado/wmr_macos.c
     monado/wmr_psmv_tracking.c
     monado/wmr_slam.c
@@ -357,6 +358,7 @@ set_source_files_properties(
     monado/wmr_camera_tap.c
     monado/wmr_controller_tracking.c
     monado/wmr_ct_jump_gate.c
+    monado/wmr_ct_gyro_check.c
     monado/wmr_macos.c
     monado/wmr_psmv_tracking.c
     monado/wmr_slam.c
@@ -428,6 +430,13 @@ if(OXRSYS_WMR_OPENCV)
     target_compile_options(oxrsys_wmr_ct_jump_gate_test PRIVATE -Wall -Wextra -Wno-unused-parameter)
     target_link_libraries(oxrsys_wmr_ct_jump_gate_test PRIVATE oxrsys_monado_wmr)
     add_test(NAME oxrsys_wmr_ct_jump_gate_test COMMAND oxrsys_wmr_ct_jump_gate_test)
+
+    # Rotation check: optical rotation vs the controller's gyro.
+    add_executable(oxrsys_wmr_ct_gyro_check_test tools/wmr_ct_gyro_check_test.c)
+    target_compile_features(oxrsys_wmr_ct_gyro_check_test PRIVATE c_std_11)
+    target_compile_options(oxrsys_wmr_ct_gyro_check_test PRIVATE -Wall -Wextra -Wno-unused-parameter)
+    target_link_libraries(oxrsys_wmr_ct_gyro_check_test PRIVATE oxrsys_monado_wmr)
+    add_test(NAME oxrsys_wmr_ct_gyro_check_test COMMAND oxrsys_wmr_ct_gyro_check_test)
 endif()
 
 # --- OpenXR smoke tool ------------------------------------------------------
