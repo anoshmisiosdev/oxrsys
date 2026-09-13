@@ -39,6 +39,7 @@
 
 #define OXRSYS_ENC_IPC_WANT_MACH 1
 #include "CameraMonitor.h"
+#include "ControllerPositionBlend.h"
 #include "HeadsetHelperIpc.h"
 
 #include "os_hid_wmr_bridge.h"
@@ -469,8 +470,10 @@ struct Helper
 	//! A sphere-tracked controller's position in camera 0's frame, for the monitor.
 	bool controllerCamPosValid = false;
 	struct xrt_vec3 controllerCamPos = {};
-	//! Per hand: the position came from the cameras on the last tracking tick.
+	//! Per hand: the position sent is mostly optical (blend weight > 0.5).
 	bool controllerOptical[2] = {false, false};
+	//! Per hand: optical share of the position sent, 0..1.
+	float controllerOpticalWeight[2] = {0.0f, 0.0f};
 
 	// Client.
 	std::mutex clientMutex;
@@ -742,8 +745,14 @@ ServerLoop()
  *
  */
 
-//! How long an optical controller position is used after the cameras last saw the controller.
+//! How long an optical controller sample counts as current after the cameras last saw the controller.
 static constexpr int64_t kOpticalMaxAgeNs = 150000000LL;
+
+static oxrsys::BlendVec3
+ToBlend(const struct xrt_vec3& v)
+{
+	return {v.x, v.y, v.z};
+}
 
 static void
 TrackingLoop()
@@ -757,6 +766,9 @@ TrackingLoop()
 	bool slamSettled = false;
 	struct xrt_vec3 slamOrigin = {0.0f, 0.0f, 0.0f};
 	std::deque<std::pair<int64_t, struct xrt_vec3>> settle;
+
+	// Per hand: when to trust the cameras, and the arm model <-> optical blend.
+	oxrsys::ControllerPositionBlend opticalBlend[2];
 
 	while (g.running.load()) {
 		const int64_t loopStart = SteadyNowNs();
@@ -829,7 +841,7 @@ TrackingLoop()
 
 		bool camPosValid = false;
 		struct xrt_vec3 camPos = {};
-		bool opticalSeen[2] = {false, false};
+		float opticalWeight[2] = {0.0f, 0.0f};
 		for (int h = 0; h < 2; h++) {
 			struct xrt_device* ctrl = g.controllers[h];
 			if (ctrl == nullptr) continue;
@@ -841,15 +853,15 @@ TrackingLoop()
 			float* pos = left ? packet.leftControllerPos : packet.rightControllerPos;
 			float* rot = left ? packet.leftControllerRot : packet.rightControllerRot;
 			struct xrt_vec3 offset;
-			struct xrt_pose optical;
-			if (g.controllerTracking != nullptr &&
+			struct xrt_pose optical = {};
+			int64_t opticalNs = 0;
+			const bool haveOptical =
+			    g.controllerTracking != nullptr &&
 			    oxrsys_wmr_controller_tracking_get_pose(g.controllerTracking, h, monadoNow, kOpticalMaxAgeNs, &optical,
-			                                            nullptr)) {
-				// Seen by the headset cameras recently: the LED model origin, in
-				// the headset's frame, carried along with the head.
-				offset = quat_rotate(rel.pose.orientation, optical.position);
-				opticalSeen[h] = true;
-			} else if ((cr.relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT) != 0) {
+			                                            &opticalNs);
+			oxrsys::ControllerPositionBlend& blend = opticalBlend[h];
+			blend.Update(monadoNow, haveOptical, opticalNs, ToBlend(optical.position));
+			if ((cr.relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT) != 0) {
 				offset = quat_rotate(rel.pose.orientation, cr.pose.position);
 				if (!camPosValid && g.sphereTracking != nullptr) {
 					camPosValid = true;
@@ -858,6 +870,17 @@ TrackingLoop()
 			} else {
 				offset = YawRotate(rel.pose.orientation, left ? -0.18f : 0.18f, -0.35f, -0.40f);
 			}
+			// Seen by the headset cameras: the LED model origin, in the headset's
+			// frame, carried along with the head. Confirmed over a few samples and
+			// blended with the position above so it never snaps.
+			const float w = blend.Weight();
+			if (w > 0.0f) {
+				const oxrsys::BlendVec3& o = blend.OpticalHeadRelative();
+				const struct xrt_vec3 opticalOffset = quat_rotate(rel.pose.orientation, {o.x, o.y, o.z});
+				const oxrsys::BlendVec3 mixed = oxrsys::ControllerPositionBlend::Mix(ToBlend(offset), ToBlend(opticalOffset), w);
+				offset = {mixed.x, mixed.y, mixed.z};
+			}
+			opticalWeight[h] = w;
 			pos[0] = packet.headPosition[0] + offset.x;
 			pos[1] = packet.headPosition[1] + offset.y;
 			pos[2] = packet.headPosition[2] + offset.z;
@@ -876,8 +899,10 @@ TrackingLoop()
 			g.haveHead = valid;
 			g.controllerCamPosValid = camPosValid;
 			g.controllerCamPos = camPos;
-			g.controllerOptical[0] = opticalSeen[0];
-			g.controllerOptical[1] = opticalSeen[1];
+			for (int h = 0; h < 2; h++) {
+				g.controllerOptical[h] = opticalWeight[h] > 0.5f;
+				g.controllerOpticalWeight[h] = opticalWeight[h];
+			}
 		}
 		if (auto c = CurrentClient()) {
 			std::vector<uint8_t> p((const uint8_t*)&packet, (const uint8_t*)&packet + sizeof(packet));
@@ -1267,6 +1292,8 @@ MonitorInfo(oxrsys::CameraMonitorInfo& info)
 	info.showFeatures = !(MonitorShowsLedFrames() && g.controllerTracking != nullptr);
 	info.opticalControllers[0] = g.controllerOptical[0];
 	info.opticalControllers[1] = g.controllerOptical[1];
+	info.opticalWeight[0] = g.controllerOpticalWeight[0];
+	info.opticalWeight[1] = g.controllerOpticalWeight[1];
 	FillControllerOverlay(info);
 }
 

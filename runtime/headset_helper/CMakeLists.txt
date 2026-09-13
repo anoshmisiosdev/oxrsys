@@ -7,6 +7,7 @@
 add_executable(oxrsys-headset-helper
     main.mm
     CameraMonitor.mm
+    ControllerPositionBlend.cpp
 )
 target_compile_options(oxrsys-headset-helper PRIVATE -Wall -Wextra -Wno-unused-parameter -fobjc-arc)
 target_include_directories(oxrsys-headset-helper PRIVATE

@@ -427,9 +427,9 @@ CameraMonitor::Impl::DrawStatus(NSRect area)
 	NSMutableString *line3 = [NSMutableString string];
 	if (info.controllerTracking) {
 		[line3 appendFormat:@"controllers (%.0f LED frames/s): %s", info.controllerFps, info.controllerStatus.c_str()];
-		if (info.opticalControllers[0] || info.opticalControllers[1]) {
-			[line3 appendFormat:@"   optical position:%s%s", info.opticalControllers[0] ? " L" : "",
-			                    info.opticalControllers[1] ? " R" : ""];
+		if (info.opticalWeight[0] > 0.0f || info.opticalWeight[1] > 0.0f) {
+			[line3 appendFormat:@"   optical position: L %.0f%% R %.0f%%", info.opticalWeight[0] * 100.0f,
+			                    info.opticalWeight[1] * 100.0f];
 		}
 	}
 
