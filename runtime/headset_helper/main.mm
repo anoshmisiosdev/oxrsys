@@ -1264,6 +1264,7 @@ MonitorInfo(oxrsys::CameraMonitorInfo& info)
 	info.controllerPosition[0] = g.controllerCamPos.x;
 	info.controllerPosition[1] = g.controllerCamPos.y;
 	info.controllerPosition[2] = g.controllerCamPos.z;
+	info.showFeatures = !(MonitorShowsLedFrames() && g.controllerTracking != nullptr);
 	info.opticalControllers[0] = g.controllerOptical[0];
 	info.opticalControllers[1] = g.controllerOptical[1];
 	FillControllerOverlay(info);

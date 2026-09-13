@@ -64,11 +64,18 @@
 #define KEEPALIVE_INTERVAL_NS (125 * U_TIME_1MS_IN_NS)
 #define LED_INTENSITY_DEFAULT 200
 #define LED_INTENSITY_MAX 399
+//! The feedback never dims below this; very short pulses lose the LEDs.
+#define LED_INTENSITY_MIN 40
 
 //! Headset frames are ~90 Hz; the frame timestamp is mid-way through a frame period.
 #define HALF_FRAME_NS (U_TIME_1S_IN_NS / 180)
 
 #define HEAD_POSE_CACHE 128
+
+//! Optical poses need at least this many LEDs matched to blobs.
+#define MIN_MATCHED_LEDS 4
+//! Farther than this from the head is not a hand-held controller.
+#define MAX_DISTANCE_M 1.5f
 
 DEBUG_GET_ONCE_NUM_OPTION(ct_pixel_threshold, "OXRSYS_WMR_CT_PIXEL_THRESHOLD", 0x04)
 DEBUG_GET_ONCE_NUM_OPTION(ct_blob_threshold, "OXRSYS_WMR_CT_BLOB_THRESHOLD", 0x10)
@@ -76,6 +83,13 @@ DEBUG_GET_ONCE_NUM_OPTION(ct_blob_threshold, "OXRSYS_WMR_CT_BLOB_THRESHOLD", 0x1
 DEBUG_GET_ONCE_NUM_OPTION(ct_time_offset, "OXRSYS_WMR_CT_TIME_OFFSET", 0)
 DEBUG_GET_ONCE_BOOL_OPTION(ct_led_sync, "OXRSYS_WMR_CT_LED_SYNC", true)
 //! Run the blob detector even with no controller to track (camera diagnostics).
+/*!
+ * Largest angle, in degrees, between the gravity direction an optical pose
+ * implies for the controller and the one its own IMU reports. Left and right
+ * LED rings are mirror images, so one controller's blobs also fit the other
+ * controller's model, but upside down or tilted; this rejects those.
+ */
+DEBUG_GET_ONCE_NUM_OPTION(ct_gravity_max_deg, "OXRSYS_WMR_CT_GRAVITY_MAX_DEG", 30)
 DEBUG_GET_ONCE_BOOL_OPTION(ct_without_controllers, "OXRSYS_WMR_CT_WITHOUT_CONTROLLERS", false)
 
 struct oxrsys_wmr_controller_tracking;
@@ -109,6 +123,13 @@ struct ct_hand
 	int64_t next_keepalive_ns;
 	uint64_t timesyncs_sent;
 	uint64_t unexpected_reports;
+	uint64_t rejected_samples;
+	uint64_t gravity_rejected;
+	//! Low-passed accelerometer (controller body, OpenXR axes); points up when still.
+	struct xrt_vec3 accel_lp;
+	bool have_accel;
+	//! Gravity angle histogram since the last log line: <10, <20, <30, <60, >=60 degrees.
+	uint32_t gravity_bins[5];
 
 	// Output.
 	struct oxrsys_wmr_ct_hand state;
@@ -314,6 +335,21 @@ hooked_receive(struct wmr_controller_base *wcb, uint64_t time_ns, uint8_t *buffe
 	}
 
 	h->original_receive(wcb, time_ns, buffer, size);
+
+	if (size == OG_STATUS_REPORT_SIZE && buffer[0] == WMR_MOTION_CONTROLLER_STATUS_MSG) {
+		os_mutex_lock(&wcb->data_lock);
+		const struct xrt_vec3 a = wcb->fusion.last.accel;
+		os_mutex_unlock(&wcb->data_lock);
+		os_mutex_lock(&h->lock);
+		if (!h->have_accel) {
+			h->accel_lp = a;
+			h->have_accel = true;
+		} else {
+			// ~50 ms time constant at 200 reports per second.
+			h->accel_lp = m_vec3_add(m_vec3_mul_scalar(h->accel_lp, 0.9f), m_vec3_mul_scalar(a, 0.1f));
+		}
+		os_mutex_unlock(&h->lock);
+	}
 }
 
 /*!
@@ -358,7 +394,7 @@ notify_controller_frame(struct oxrsys_wmr_controller_tracking *t, const struct x
 static void
 log_summary_locked(struct oxrsys_wmr_controller_tracking *t, int64_t now)
 {
-	char line[512];
+	char line[1024];
 	int n = snprintf(line, sizeof(line), "controller tracking: %.1f controller fps, blobs cam0 %u cam1 %u",
 	                 t->controller_fps, t->views[0].blob_count, t->cam_count > 1 ? t->views[1].blob_count : 0);
 	for (int i = 0; i < 2 && n > 0 && (size_t)n < sizeof(line); i++) {
@@ -376,6 +412,16 @@ log_summary_locked(struct oxrsys_wmr_controller_tracking *t, int64_t now)
 			n += snprintf(line + n, sizeof(line) - (size_t)n, " at (%.2f, %.2f, %.2f) cam%u %u/%u LEDs err %.2fpx",
 			              p.x, p.y, p.z, h->state.pose_camera, h->state.matched_blobs, h->state.visible_leds,
 			              h->state.reprojection_error);
+		}
+		if (h->rejected_samples > 0 && (size_t)n < sizeof(line)) {
+			n += snprintf(line + n, sizeof(line) - (size_t)n, " (%" PRIu64 " rejected, %" PRIu64 " by gravity)",
+			              h->rejected_samples, h->gravity_rejected);
+		}
+		if ((size_t)n < sizeof(line)) {
+			n += snprintf(line + n, sizeof(line) - (size_t)n,
+			              " gravity agreement <10/<20/<30/<60/more deg %u/%u/%u/%u/%u", h->gravity_bins[0],
+			              h->gravity_bins[1], h->gravity_bins[2], h->gravity_bins[3], h->gravity_bins[4]);
+			memset(h->gravity_bins, 0, sizeof(h->gravity_bins));
 		}
 		if (h->unexpected_reports > 0 && (size_t)n < sizeof(line)) {
 			n += snprintf(line + n, sizeof(line) - (size_t)n, " (%" PRIu64 " non-1st-gen reports)",
@@ -540,6 +586,21 @@ device_push_sample(struct t_constellation_tracker_device *dev, struct t_constell
 	struct ct_hand *h = container_of(dev, struct ct_hand, device);
 	struct oxrsys_wmr_controller_tracking *t = h->t;
 
+	// The tracker also reports RANSAC recoveries it trusts without scoring;
+	// on hardware some of those come out with no matched LEDs and a NaN
+	// pose. Keep only scored poses with enough LEDs, in front of the cameras
+	// and within reach.
+	const struct xrt_pose *p = &sample->pose;
+	const bool finite = isfinite(p->position.x) && isfinite(p->position.y) && isfinite(p->position.z) &&
+	                    isfinite(p->orientation.x) && isfinite(p->orientation.y) && isfinite(p->orientation.z) &&
+	                    isfinite(p->orientation.w);
+	if (!finite || sample->metrics.matched_blob_count < MIN_MATCHED_LEDS) {
+		os_mutex_lock(&h->lock);
+		h->rejected_samples++;
+		os_mutex_unlock(&h->lock);
+		return;
+	}
+
 	struct xrt_pose head;
 	if (!lookup_head_pose(t, sample->timestamp_ns, &head)) {
 		struct xrt_space_relation rel;
@@ -550,6 +611,56 @@ device_push_sample(struct t_constellation_tracker_device *dev, struct t_constell
 	math_pose_invert(&head, &head_inv);
 	struct xrt_pose rel_pose;
 	math_pose_transform(&head_inv, &sample->pose, &rel_pose);
+	if (m_vec3_len(rel_pose.position) > MAX_DISTANCE_M || rel_pose.position.z > 0.1f) {
+		os_mutex_lock(&h->lock);
+		h->rejected_samples++;
+		os_mutex_unlock(&h->lock);
+		return;
+	}
+
+	// Gravity in the controller's frame, from the optical pose (the tracker's
+	// world is the head's gravity-aligned world) and from the controller's
+	// own IMU fusion (whose body axes are the LED model's, OpenXR-flipped).
+	// Prefer the low-passed accelerometer (right from the first report) while
+	// the controller is not accelerating hard; Monado's fusion levels slowly.
+	const struct xrt_vec3 down = {0.0f, -1.0f, 0.0f};
+	struct xrt_vec3 g_imu;
+	bool from_accel = false;
+	os_mutex_lock(&h->lock);
+	if (h->have_accel) {
+		const float len = m_vec3_len(h->accel_lp);
+		if (len > 8.3f && len < 11.3f) {
+			g_imu = m_vec3_mul_scalar(h->accel_lp, -1.0f / len);
+			from_accel = true;
+		}
+	}
+	os_mutex_unlock(&h->lock);
+	if (!from_accel) {
+		struct xrt_quat fusion, inv_imu;
+		os_mutex_lock(&h->wcb->data_lock);
+		fusion = h->wcb->fusion.rot;
+		os_mutex_unlock(&h->wcb->data_lock);
+		math_quat_invert(&fusion, &inv_imu);
+		math_quat_rotate_vec3(&inv_imu, &down, &g_imu);
+	}
+	struct xrt_quat inv_opt;
+	math_quat_invert(&sample->pose.orientation, &inv_opt);
+	struct xrt_vec3 g_opt;
+	math_quat_rotate_vec3(&inv_opt, &down, &g_opt);
+	float dot = m_vec3_dot(g_opt, g_imu);
+	dot = dot > 1.0f ? 1.0f : (dot < -1.0f ? -1.0f : dot);
+	const float gravity_deg = acosf(dot) * 180.0f / (float)M_PI;
+	const int bin = gravity_deg < 10 ? 0 : gravity_deg < 20 ? 1 : gravity_deg < 30 ? 2 : gravity_deg < 60 ? 3 : 4;
+	const bool gravity_ok = gravity_deg <= (float)debug_get_num_option_ct_gravity_max_deg();
+	os_mutex_lock(&h->lock);
+	h->gravity_bins[bin]++;
+	if (!gravity_ok) {
+		h->gravity_rejected++;
+	}
+	os_mutex_unlock(&h->lock);
+	if (!gravity_ok) {
+		return;
+	}
 
 	os_mutex_lock(&h->lock);
 	if (!h->state.pose_valid || sample->timestamp_ns >= h->state.pose_timestamp_ns) {
@@ -569,7 +680,7 @@ device_push_sample(struct t_constellation_tracker_device *dev, struct t_constell
 	// Brightness feedback: keep the matched LEDs visible but not saturated.
 	const float brightness = sample->average_brightness * 255.0f;
 	if (brightness > 70.0f) {
-		h->led_intensity -= h->led_intensity > 3 ? 3 : h->led_intensity - 1;
+		h->led_intensity -= h->led_intensity > LED_INTENSITY_MIN + 3 ? 3 : h->led_intensity - LED_INTENSITY_MIN;
 	} else if (brightness < 30.0f) {
 		h->led_intensity = h->led_intensity + 10 > LED_INTENSITY_MAX ? LED_INTENSITY_MAX : h->led_intensity + 10;
 	}

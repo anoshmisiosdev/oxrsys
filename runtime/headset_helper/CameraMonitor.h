@@ -78,6 +78,9 @@ struct CameraMonitorInfo
 	bool controllerPositionValid = false;
 	float controllerPosition[3] = {0.0f, 0.0f, 0.0f};
 
+	//! Draw Basalt's features; off when the images are the LED frames, which
+	//! are not the frames the features belong to.
+	bool showFeatures = true;
 	//! WMR controller LED tracking is running.
 	bool controllerTracking = false;
 	//! Controller (short exposure) frames per second from the headset.

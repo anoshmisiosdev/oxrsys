@@ -474,7 +474,20 @@ turns it off.
   constellation tracker (`src/xrt/tracking/constellation`, built from the
   pinned checkout) matches them against each controller's LED model from its
   calibration (32 LEDs on a 1st-gen controller), with the ring occlusion model
-  from the same branch. Cameras are placed with the SLAM calibration's
+  from the same branch.
+- **Left/right and bad solves.** The left and right rings are mirror images,
+  so one controller's blobs also fit the other controller's model; on hardware
+  both hands were often reported on the same controller. A pose is kept only
+  when its implied gravity direction in the controller agrees with the
+  controller's own low-passed accelerometer (Monado's fusion rotation while
+  the controller accelerates hard) within `OXRSYS_WMR_CT_GRAVITY_MAX_DEG`
+  (default 30). Measured on hardware the split is clean: right-hand matches
+  come in under 10 degrees, mirrored ones over 60. Poses with a non-finite
+  result, fewer than 4 matched LEDs, more than 1.5 m away or behind the head
+  are dropped too; the tracker reports some unscored RANSAC recoveries with no
+  matched LEDs and a NaN pose. Only kept poses drive the LED brightness
+  feedback, which never dims below intensity 40.
+- **Geometry.** Cameras are placed with the SLAM calibration's
   extrinsics in the frame the driver reports head poses in, and the tracker's
   world is the head orientation at the frame time (position ignored, so a
   wandering SLAM estimate costs nothing), which gives poses relative to the
@@ -485,18 +498,21 @@ turns it off.
 - **Diagnostics.** The helper logs a `controller tracking:` line every two
   seconds in the driver log (LED frame rate, blobs per camera, and per hand
   sync state, timesyncs sent, LED intensity, poses per second, last position,
-  camera, matched LEDs and reprojection error), plus the camera poses it
+  camera, matched LEDs, reprojection error, rejected poses and a histogram of
+  the gravity agreement), plus the camera poses it
   derived at start. `OXRSYS_WMR_CT_LED_SYNC=0` stops the timesync packets,
   `OXRSYS_WMR_CT_TIME_OFFSET=N` delays them by N x 0.5 ms for tuning, and
   `OXRSYS_WMR_CT_WITHOUT_CONTROLLERS=1` runs the blob detector with no
   controller connected. `oxrsys_wmr_ct_selftest` (a CTest) renders a
   controller's constellation into the cameras and checks the tracker solves
   it, with no hardware.
-- **Status.** Controller frames, blob detection, the tracker and the monitor
-  overlay run on a Dell Visor; the self-test solves synthetic views to about a
-  millimetre. Not yet verified with the controllers switched on: whether the
-  LEDs flash in sync over the `wmr_btstack` link, and how the solved positions
-  hold up in real use. Still missing: fusing optical and IMU rotation (the
+- **Status.** Verified on a Dell Visor with both 1st-gen controllers over
+  `wmr_btstack`: the LEDs flash in sync (blobs appear within a few seconds
+  of starting), both controllers are identified in both cameras, and poses
+  come at roughly 10-50 per second per controller while held in view, at
+  plausible positions 0.2-0.6 m in front of and below the head with 4-12
+  matched LEDs and 0.1-2 px reprojection error. The self-test solves synthetic
+  views to about a millimetre. Accuracy against ground truth is not measured. Still missing: fusing optical and IMU rotation (the
   IMU yaw is not aligned with the head's), a grip offset from the ring centre,
   motion prediction, and tracking source priors for faster reacquisition.
   Reverb G2 / Odyssey controllers report a different IMU layout and get no

@@ -289,7 +289,7 @@ CameraMonitor::Impl::DrawCamera(CGContextRef ctx, uint32_t cam, NSRect rect)
 	// Basalt's features: a square per feature, coloured by depth, filled
 	// when the feature was already in the previous pose, hollow when new.
 	uint32_t featureCount = 0;
-	if (haveSnapshot && cam < snapshot->camera_count) {
+	if (haveSnapshot && cam < snapshot->camera_count && info.showFeatures) {
 		const oxrsys_vit_monitor_camera &c = snapshot->cams[cam];
 		featureCount = c.feature_count;
 		const CGFloat half = 3.0;
