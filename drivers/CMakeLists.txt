@@ -282,6 +282,7 @@ set(OXRSYS_MONADO_PLATFORM_SOURCES
     monado/u_file_macos.c
     monado/wmr_camera_tap.c
     monado/wmr_controller_tracking.c
+    monado/wmr_ct_jump_gate.c
     monado/wmr_macos.c
     monado/wmr_psmv_tracking.c
     monado/wmr_slam.c
@@ -355,6 +356,7 @@ set_source_files_properties(
     monado/u_file_macos.c
     monado/wmr_camera_tap.c
     monado/wmr_controller_tracking.c
+    monado/wmr_ct_jump_gate.c
     monado/wmr_macos.c
     monado/wmr_psmv_tracking.c
     monado/wmr_slam.c
@@ -420,6 +422,12 @@ if(OXRSYS_WMR_OPENCV)
     target_compile_options(oxrsys_wmr_ct_selftest PRIVATE -Wall -Wextra -Wno-unused-parameter)
     target_link_libraries(oxrsys_wmr_ct_selftest PRIVATE oxrsys_monado_wmr)
     add_test(NAME oxrsys_wmr_ct_selftest COMMAND oxrsys_wmr_ct_selftest)
+
+    add_executable(oxrsys_wmr_ct_jump_gate_test tools/wmr_ct_jump_gate_test.c)
+    target_compile_features(oxrsys_wmr_ct_jump_gate_test PRIVATE c_std_11)
+    target_compile_options(oxrsys_wmr_ct_jump_gate_test PRIVATE -Wall -Wextra -Wno-unused-parameter)
+    target_link_libraries(oxrsys_wmr_ct_jump_gate_test PRIVATE oxrsys_monado_wmr)
+    add_test(NAME oxrsys_wmr_ct_jump_gate_test COMMAND oxrsys_wmr_ct_jump_gate_test)
 endif()
 
 # --- OpenXR smoke tool ------------------------------------------------------

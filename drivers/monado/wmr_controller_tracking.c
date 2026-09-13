@@ -11,6 +11,7 @@
  */
 
 #include "wmr_controller_tracking.h"
+#include "wmr_ct_jump_gate.h"
 
 #include "xrt/xrt_config_have.h"
 
@@ -98,6 +99,12 @@ DEBUG_GET_ONCE_BOOL_OPTION(ct_led_sync, "OXRSYS_WMR_CT_LED_SYNC", true)
  * controller's model, but upside down or tilted; this rejects those.
  */
 DEBUG_GET_ONCE_NUM_OPTION(ct_gravity_max_deg, "OXRSYS_WMR_CT_GRAVITY_MAX_DEG", 30)
+//! Jump gate (wmr_ct_jump_gate.h): always-allowed displacement in mm, speeds in
+//! mm/s, and matching candidates that re-lock it. Speeds 0 turn the gate off.
+DEBUG_GET_ONCE_NUM_OPTION(ct_jump_min_mm, "OXRSYS_WMR_CT_JUMP_MIN_MM", 50)
+DEBUG_GET_ONCE_NUM_OPTION(ct_jump_speed_mmps, "OXRSYS_WMR_CT_JUMP_SPEED_MMPS", 3000)
+DEBUG_GET_ONCE_NUM_OPTION(ct_jump_fast_speed_mmps, "OXRSYS_WMR_CT_JUMP_FAST_SPEED_MMPS", 10000)
+DEBUG_GET_ONCE_NUM_OPTION(ct_jump_relock, "OXRSYS_WMR_CT_JUMP_RELOCK", 3)
 //! Give the tracker the last kept pose as a prior (faster, steadier re-matching).
 DEBUG_GET_ONCE_BOOL_OPTION(ct_prior, "OXRSYS_WMR_CT_PRIOR", true)
 DEBUG_GET_ONCE_BOOL_OPTION(ct_without_controllers, "OXRSYS_WMR_CT_WITHOUT_CONTROLLERS", false)
@@ -149,6 +156,9 @@ struct ct_hand
 	//! Gravity agreement of the pose in `state`, degrees.
 	float state_gravity_deg;
 	uint64_t duplicate_rejected;
+	struct oxrsys_wmr_ct_jump_gate jump_gate;
+	struct oxrsys_wmr_ct_jump_gate_params jump_params;
+	uint64_t jump_rejected;
 
 	// Output.
 	struct oxrsys_wmr_ct_hand state;
@@ -434,9 +444,9 @@ log_summary_locked(struct oxrsys_wmr_controller_tracking *t, int64_t now)
 		}
 		if (h->rejected_samples > 0 && (size_t)n < sizeof(line)) {
 			n += snprintf(line + n, sizeof(line) - (size_t)n, " (%" PRIu64 " rejected: %" PRIu64 " NaN, %" PRIu64 " <4 LEDs, %" PRIu64
-			              " gravity, %" PRIu64 " other hand's)",
+			              " gravity, %" PRIu64 " jump, %" PRIu64 " other hand's)",
 			              h->rejected_samples, h->rejected_nonfinite, h->rejected_few_leds, h->gravity_rejected,
-			              h->duplicate_rejected);
+			              h->jump_rejected, h->duplicate_rejected);
 		}
 		if ((size_t)n < sizeof(line)) {
 			n += snprintf(line + n, sizeof(line) - (size_t)n,
@@ -688,6 +698,25 @@ device_push_sample(struct t_constellation_tracker_device *dev, struct t_constell
 		return;
 	}
 
+	// Jump gate: further from the last kept pose than the controller could
+	// have moved (faster while its IMU shows hard motion).
+	os_mutex_lock(&h->wcb->data_lock);
+	const float accel_len = m_vec3_len(h->wcb->fusion.last.accel);
+	const float gyro_len = m_vec3_len(h->wcb->fusion.last.gyro);
+	os_mutex_unlock(&h->wcb->data_lock);
+	os_mutex_lock(&h->lock);
+	const bool jump_ok = h->jump_params.max_speed_mps <= 0.0f ||
+	                     oxrsys_wmr_ct_jump_gate_check(&h->jump_gate, &h->jump_params, sample->timestamp_ns,
+	                                                   sample->pose.position, accel_len,
+	                                                   gyro_len) != OXRSYS_WMR_CT_JUMP_REJECT;
+	if (!jump_ok) {
+		h->jump_rejected++;
+	}
+	os_mutex_unlock(&h->lock);
+	if (!jump_ok) {
+		return;
+	}
+
 	// Both hands solved on the same LEDs (mirror fits that pass the gravity
 	// check when both controllers are tilted alike): keep whichever agrees
 	// better with its own accelerometer.
@@ -714,6 +743,7 @@ device_push_sample(struct t_constellation_tracker_device *dev, struct t_constell
 	}
 
 	os_mutex_lock(&h->lock);
+	oxrsys_wmr_ct_jump_gate_accept(&h->jump_gate, sample->timestamp_ns, sample->pose.position);
 	if (!h->state.pose_valid || sample->timestamp_ns >= h->state.pose_timestamp_ns) {
 		h->state_gravity_deg = gravity_deg;
 		h->prior_world_pose = sample->pose;
@@ -965,6 +995,12 @@ add_hand(struct oxrsys_wmr_controller_tracking *t, int index, struct xrt_device 
 	// device is added.
 	os_mutex_init(&h->lock);
 	h->prior_source.get_tracked_pose = hand_prior_get_tracked_pose;
+	oxrsys_wmr_ct_jump_gate_reset(&h->jump_gate);
+	oxrsys_wmr_ct_jump_gate_default_params(&h->jump_params);
+	h->jump_params.min_m = (float)debug_get_num_option_ct_jump_min_mm() / 1000.0f;
+	h->jump_params.max_speed_mps = (float)debug_get_num_option_ct_jump_speed_mmps() / 1000.0f;
+	h->jump_params.fast_speed_mps = (float)debug_get_num_option_ct_jump_fast_speed_mmps() / 1000.0f;
+	h->jump_params.relock_count = (uint32_t)debug_get_num_option_ct_jump_relock();
 	struct t_constellation_tracker_device_params params = {
 	    .tracking_source = debug_get_bool_option_ct_prior() ? &h->prior_source : NULL,
 	    .imu_sink = NULL,
