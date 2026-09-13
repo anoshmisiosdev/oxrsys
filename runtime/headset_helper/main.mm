@@ -456,6 +456,10 @@ struct Helper
 	std::mutex poseMutex;
 	oxr::protocol::TrackingPacket latestPacket = {};
 	bool haveHead = false;
+	//! Raw SLAM position and, until it settles, how far it wandered over the settle window.
+	struct xrt_vec3 slamRaw = {};
+	float slamSpread = -1.0f;
+	bool slamSettledState = false;
 	//! A sphere-tracked controller's position in camera 0's frame, for the monitor.
 	bool controllerCamPosValid = false;
 	struct xrt_vec3 controllerCamPos = {};
@@ -776,6 +780,10 @@ TrackingLoop()
 						const float dx = e.second.x - p.x, dy = e.second.y - p.y, dz = e.second.z - p.z;
 						spread = std::max(spread, sqrtf(dx * dx + dy * dy + dz * dz));
 					}
+					{
+						std::lock_guard<std::mutex> lock(g.poseMutex);
+						g.slamSpread = spread;
+					}
 					if (spread < 0.05f) {
 						slamOrigin = p;
 						slamSettled = true;
@@ -783,6 +791,11 @@ TrackingLoop()
 						LOGI("6DoF position settled; origin set at (%.2f, %.2f, %.2f)", p.x, p.y, p.z);
 					}
 				}
+			}
+			{
+				std::lock_guard<std::mutex> lock(g.poseMutex);
+				g.slamRaw = p;
+				g.slamSettledState = slamSettled;
 			}
 			if (slamSettled) {
 				packet.headPosition[0] = p.x - slamOrigin.x;
@@ -982,13 +995,24 @@ RenderLoop()
 		const int64_t now = SteadyNowNs();
 		if (now - lastStatusNs >= 10000000000LL) {
 			oxr::protocol::TrackingPacket p;
+			struct xrt_vec3 raw;
+			float spread;
+			bool settled;
 			{
 				std::lock_guard<std::mutex> lock(g.poseMutex);
 				p = g.latestPacket;
+				raw = g.slamRaw;
+				spread = g.slamSpread;
+				settled = g.slamSettledState;
 			}
 			LOGI("%llu frames presented (%llu lobby), client %s, head %s at (%.2f, %.2f, %.2f) m",
 			     (unsigned long long)g.presented, (unsigned long long)g.lobbyFrames, c ? "connected" : "none",
 			     g.trackingKind.c_str(), p.headPosition[0], p.headPosition[1], p.headPosition[2]);
+			if (g.slam != nullptr && !settled) {
+				// Why the position isn't used yet: the raw estimate must hold within 5 cm for 2.5 s.
+				LOGI("6DoF not settled: raw SLAM position (%.3f, %.3f, %.3f), wander %.3f m over the last 2.5 s",
+				     raw.x, raw.y, raw.z, spread);
+			}
 			lastStatusNs = now;
 		}
 		} // autoreleasepool
