@@ -141,9 +141,49 @@ final class Pairer: NSObject, IOBluetoothDeviceInquiryDelegate, IOBluetoothDevic
         inquiry?.stop()   // paging and inquiry share the radio; stop scanning while pairing
         if strategy == "pair" {
             startDevicePair(d)
+        } else if strategy == "race" {
+            raceAuth(d)
         } else {
             authFirst(d)
         }
+    }
+
+    // Strategy "race": let IOBluetoothDevicePair page the controller (its agent answers
+    // SSP confirmation), and the instant the ACL link appears request authentication
+    // ourselves, so LMP pairing starts while bluetoothd is still on its first SDP
+    // request instead of after the whole SDP pass the controller doesn't survive.
+    var raceTarget: IOBluetoothDevice?
+    var raceTimer: Timer?
+    var raceFired = false
+    var connectNote: IOBluetoothUserNotification?
+
+    func raceAuth(_ d: IOBluetoothDevice) {
+        raceTarget = d
+        raceFired = false
+        if connectNote == nil {
+            connectNote = IOBluetoothDevice.register(forConnectNotifications: self, selector: #selector(deviceConnected(_:device:)))
+        }
+        // Notifications are delivered via the run loop; also poll in case they lag.
+        raceTimer = Timer.scheduledTimer(withTimeInterval: 0.002, repeats: true) { [weak self] _ in
+            guard let self = self, let t = self.raceTarget, t.isConnected() else { return }
+            self.fireAuth(t, via: "poll")
+        }
+        startDevicePair(d)
+    }
+
+    @objc func deviceConnected(_ note: IOBluetoothUserNotification, device: IOBluetoothDevice) {
+        guard let t = raceTarget, device.addressString == t.addressString else { return }
+        fireAuth(device, via: "notification")
+    }
+
+    func fireAuth(_ d: IOBluetoothDevice, via: String) {
+        guard !raceFired else { return }
+        raceFired = true
+        raceTimer?.invalidate()
+        log("  link up (\(via)); requesting authentication immediately")
+        let a = d.requestAuthentication()
+        log("  requestAuthentication -> \(ioReturnString(a)); paired=\(d.isPaired()) encryption=\(d.getEncryptionMode())")
+        raceTarget = nil
     }
 
     // Strategy "auth" (default): baseband connection with authentication required, so
