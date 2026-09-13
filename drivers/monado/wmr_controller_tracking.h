@@ -76,6 +76,8 @@ struct oxrsys_wmr_ct_hand
 	bool pose_valid;
 	int64_t pose_timestamp_ns;
 	struct xrt_pose head_relative;
+	//! head_relative.position before smoothing (wmr_ct_smoothing.h).
+	struct xrt_vec3 raw_head_relative_position;
 	uint32_t pose_camera;
 	uint32_t matched_blobs;
 	uint32_t visible_leds;
