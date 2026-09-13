@@ -31,7 +31,7 @@ namespace {
 
 constexpr uint32_t kCameras = OXRSYS_VIT_MONITOR_MAX_CAMERAS;
 constexpr CGFloat kGap = 8.0;
-constexpr CGFloat kStatusHeight = 48.0;
+constexpr CGFloat kStatusHeight = 66.0;
 //! PS Move sphere radius, for the circle size.
 constexpr float kSphereRadiusM = 0.0225f;
 
@@ -336,8 +336,54 @@ CameraMonitor::Impl::DrawCamera(CGContextRef ctx, uint32_t cam, NSRect rect)
 		}
 	}
 
+	// WMR controllers: LED blobs from the controller frames, and a box per
+	// controller (or per cluster of blobs not assigned to one yet).
+	uint32_t ledBlobs = 0;
+	if (cam < 2 && info.controllerTracking) {
+		const ControllerCameraOverlay &ov = info.controllerCams[cam];
+		ledBlobs = ov.blobCount;
+		// Blob coordinates are in the controller frame, which has the SLAM frame's size.
+		auto handColor = [&](int hand, float a) {
+			if (hand == 0) {
+				SetColor(ctx, 0.2f, 0.85f, 1.0f, a); // left: cyan
+			} else if (hand == 1) {
+				SetColor(ctx, 1.0f, 0.55f, 0.1f, a); // right: orange
+			} else {
+				SetColor(ctx, 1.0f, 1.0f, 0.3f, a); // unassigned: yellow
+			}
+		};
+		for (const ControllerBlob &b : ov.blobs) {
+			handColor(b.hand, 0.9f);
+			const NSPoint p = toView(b.x, b.y);
+			CGContextFillEllipseInRect(ctx, CGRectMake(p.x - 2, p.y - 2, 4, 4));
+		}
+		for (const ControllerBox &box : ov.boxes) {
+			const NSPoint a = toView(box.x0, box.y0);
+			const NSPoint b = toView(box.x1, box.y1);
+			const CGFloat pad = 6.0;
+			CGRect r = CGRectMake(std::min(a.x, b.x) - pad, std::min(a.y, b.y) - pad, std::fabs(b.x - a.x) + 2 * pad,
+			                      std::fabs(b.y - a.y) + 2 * pad);
+			handColor(box.hand, 1.0f);
+			CGContextSetLineWidth(ctx, box.hand >= 0 ? 2.5 : 1.5);
+			if (box.hand < 0) {
+				const CGFloat dash[] = {4.0, 3.0};
+				CGContextSetLineDash(ctx, 0, dash, 2);
+			}
+			CGContextStrokeRect(ctx, r);
+			CGContextSetLineDash(ctx, 0, nullptr, 0);
+			NSColor *color = box.hand == 0   ? [NSColor colorWithCalibratedRed:0.2 green:0.85 blue:1.0 alpha:1.0]
+			                 : box.hand == 1 ? [NSColor colorWithCalibratedRed:1.0 green:0.55 blue:0.1 alpha:1.0]
+			                                 : [NSColor colorWithCalibratedRed:1.0 green:1.0 blue:0.3 alpha:1.0];
+			NSString *tag = box.hand == 0 ? @"L" : box.hand == 1 ? @"R" : [NSString stringWithFormat:@"? %u", box.blobs];
+			DrawText(tag, NSMakePoint(r.origin.x, r.origin.y + r.size.height + 1), color, box.hand >= 0 ? 15 : 11);
+		}
+	}
+
 	NSString *label = [NSString stringWithFormat:@"cam %u  %ux%u  %.1f fps  %u features", cam, buf.width, buf.height,
 	                                             cameraFps[cam], featureCount];
+	if (info.controllerTracking) {
+		label = [label stringByAppendingFormat:@"  %u LED blobs", ledBlobs];
+	}
 	DrawText(label, NSMakePoint(rect.origin.x + 6, rect.origin.y + rect.size.height - 18), NSColor.whiteColor, 11);
 }
 
@@ -378,8 +424,18 @@ CameraMonitor::Impl::DrawStatus(NSRect area)
 		                    info.controllerPosition[1], info.controllerPosition[2]];
 	}
 
-	DrawText(line1, NSMakePoint(area.origin.x + 8, area.origin.y + 26), NSColor.whiteColor, 11);
-	DrawText(line2, NSMakePoint(area.origin.x + 8, area.origin.y + 8), NSColor.lightGrayColor, 11);
+	NSMutableString *line3 = [NSMutableString string];
+	if (info.controllerTracking) {
+		[line3 appendFormat:@"controllers (%.0f LED frames/s): %s", info.controllerFps, info.controllerStatus.c_str()];
+		if (info.opticalControllers[0] || info.opticalControllers[1]) {
+			[line3 appendFormat:@"   optical position:%s%s", info.opticalControllers[0] ? " L" : "",
+			                    info.opticalControllers[1] ? " R" : ""];
+		}
+	}
+
+	DrawText(line1, NSMakePoint(area.origin.x + 8, area.origin.y + 44), NSColor.whiteColor, 11);
+	DrawText(line2, NSMakePoint(area.origin.x + 8, area.origin.y + 26), NSColor.lightGrayColor, 11);
+	DrawText(line3, NSMakePoint(area.origin.x + 8, area.origin.y + 8), NSColor.whiteColor, 11);
 }
 
 void

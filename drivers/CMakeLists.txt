@@ -254,6 +254,21 @@ if(OXRSYS_WMR_OPENCV)
         # the OpenVR ground-truth tracker compiles to stubs without OpenVR.
         auxiliary/tracking/t_openvr_tracker.cpp
         auxiliary/tracking/t_tracker_slam.cpp
+        auxiliary/util/u_frame_scribble.cpp
+
+        # Generic LED constellation tracker (Rift CV1 / PS Sense upstream),
+        # used here for WMR motion controllers (monado/wmr_controller_tracking.c).
+        # Skipped: t_led_sync_refinement.c (PS Sense only) and the Rerun
+        # visualisation sources (XRT_FEATURE_RERUN is off).
+        tracking/constellation/constellation_debug_scribble.cpp
+        tracking/constellation/correspondence_search.c
+        tracking/constellation/image_point_sort.cpp
+        tracking/constellation/led_search_model.c
+        tracking/constellation/pose_metrics.c
+        tracking/constellation/pose_optimize.cpp
+        tracking/constellation/t_constellation_tracker.cpp
+        tracking/constellation/t_constellation_tracker_dataset.cpp
+        tracking/constellation/t_rift_blobwatch.c
     )
     list(TRANSFORM OXRSYS_MONADO_OPENCV_SOURCES PREPEND "${OXRSYS_MONADO_XRT}/")
     list(APPEND OXRSYS_MONADO_WMR_SOURCES ${OXRSYS_MONADO_OPENCV_SOURCES})
@@ -266,6 +281,7 @@ set(OXRSYS_MONADO_PLATFORM_SOURCES
     monado/t_euroc_recorder_stub.c
     monado/u_file_macos.c
     monado/wmr_camera_tap.c
+    monado/wmr_controller_tracking.c
     monado/wmr_macos.c
     monado/wmr_psmv_tracking.c
     monado/wmr_slam.c
@@ -293,6 +309,8 @@ target_include_directories(oxrsys_monado_wmr
         "${OXRSYS_MONADO_XRT}/include"
         "${OXRSYS_MONADO_XRT}/auxiliary"
         "${OXRSYS_MONADO_XRT}/drivers"
+        # constellation/t_constellation_tracker.h and friends.
+        "${OXRSYS_MONADO_XRT}/tracking"
     PRIVATE
         "${OXRSYS_MONADO_EXTERNAL}/cjson"
         "${OXRSYS_MONADO_EXTERNAL}/flexkalman"
@@ -336,6 +354,7 @@ set_source_files_properties(
     monado/t_euroc_recorder_stub.c
     monado/u_file_macos.c
     monado/wmr_camera_tap.c
+    monado/wmr_controller_tracking.c
     monado/wmr_macos.c
     monado/wmr_psmv_tracking.c
     monado/wmr_slam.c

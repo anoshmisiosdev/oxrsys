@@ -16,14 +16,51 @@
 
 #import <CoreGraphics/CoreGraphics.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <vector>
 
 struct xrt_device;
 
 namespace oxrsys {
+
+//! A box around one controller's LED blobs in a camera image, in pixels.
+struct ControllerBox
+{
+	//! 0 left, 1 right, -1 a cluster of LED blobs not assigned to a controller yet.
+	int hand = -1;
+	float x0 = 0.0f, y0 = 0.0f, x1 = 0.0f, y1 = 0.0f;
+	uint32_t blobs = 0;
+
+	void Add(float ax0, float ay0, float ax1, float ay1)
+	{
+		if (blobs == 0) {
+			x0 = ax0, y0 = ay0, x1 = ax1, y1 = ay1;
+		} else {
+			x0 = std::min(x0, ax0), y0 = std::min(y0, ay0);
+			x1 = std::max(x1, ax1), y1 = std::max(y1, ay1);
+		}
+		blobs++;
+	}
+};
+
+//! A detected LED blob, in pixels; hand as in ControllerBox.
+struct ControllerBlob
+{
+	float x = 0.0f, y = 0.0f;
+	int hand = -1;
+};
+
+//! What the controller tracker saw in one camera's latest controller frame.
+struct ControllerCameraOverlay
+{
+	uint32_t blobCount = 0;
+	std::vector<ControllerBlob> blobs;
+	std::vector<ControllerBox> boxes;
+};
 
 /*!
  * What the helper knows and the monitor shows; the provider callback fills
@@ -40,6 +77,18 @@ struct CameraMonitorInfo
 	//! camera space: +X right, +Y up, -Z forward), when one is reported.
 	bool controllerPositionValid = false;
 	float controllerPosition[3] = {0.0f, 0.0f, 0.0f};
+
+	//! WMR controller LED tracking is running.
+	bool controllerTracking = false;
+	//! Controller (short exposure) frames per second from the headset.
+	float controllerFps = 0.0f;
+	ControllerCameraOverlay controllerCams[2];
+	//! Per hand: identified by the cameras in the last quarter second.
+	bool handSeen[2] = {false, false};
+	//! Per hand: the controller position sent to the runtime is optical.
+	bool opticalControllers[2] = {false, false};
+	//! e.g. "L seen cam0/cam1 (0.10, -0.30, -0.40) m 40/s, R not seen".
+	std::string controllerStatus;
 };
 
 class CameraMonitor

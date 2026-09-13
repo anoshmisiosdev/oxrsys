@@ -45,6 +45,7 @@
 #include "psmv_macos.h"
 #include "vit_monitor.h"
 #include "wmr_camera_tap.h"
+#include "wmr_controller_tracking.h"
 #include "wmr_macos.h"
 #include "wmr_panel.h"
 #include "wmr_psmv_tracking.h"
@@ -399,6 +400,9 @@ struct Options
 	bool monitor = false;
 	//! WMR controllers through wmr_btstack on a USB Bluetooth adapter.
 	bool controllerAdapter = false;
+	//! Optical (LED) positions for WMR motion controllers from the headset
+	//! cameras (--no-controller-tracking turns it off).
+	bool controllerTracking = true;
 };
 
 struct ClientState
@@ -433,6 +437,8 @@ struct Helper
 	size_t psmvCount = 0;
 	struct oxrsys_wmr_psmv_tracking* sphereTracking = nullptr;
 	struct oxrsys_wmr_slam* slam = nullptr;
+	//! LED constellation tracking of WMR motion controllers, when running.
+	struct oxrsys_wmr_controller_tracking* controllerTracking = nullptr;
 	std::string controllerKind = "none";
 	std::string trackingKind = "3DoF (IMU)";
 	//! Why there is no SLAM; empty when there is.
@@ -463,6 +469,8 @@ struct Helper
 	//! A sphere-tracked controller's position in camera 0's frame, for the monitor.
 	bool controllerCamPosValid = false;
 	struct xrt_vec3 controllerCamPos = {};
+	//! Per hand: the position came from the cameras on the last tracking tick.
+	bool controllerOptical[2] = {false, false};
 
 	// Client.
 	std::mutex clientMutex;
@@ -734,6 +742,9 @@ ServerLoop()
  *
  */
 
+//! How long an optical controller position is used after the cameras last saw the controller.
+static constexpr int64_t kOpticalMaxAgeNs = 150000000LL;
+
 static void
 TrackingLoop()
 {
@@ -818,6 +829,7 @@ TrackingLoop()
 
 		bool camPosValid = false;
 		struct xrt_vec3 camPos = {};
+		bool opticalSeen[2] = {false, false};
 		for (int h = 0; h < 2; h++) {
 			struct xrt_device* ctrl = g.controllers[h];
 			if (ctrl == nullptr) continue;
@@ -829,7 +841,15 @@ TrackingLoop()
 			float* pos = left ? packet.leftControllerPos : packet.rightControllerPos;
 			float* rot = left ? packet.leftControllerRot : packet.rightControllerRot;
 			struct xrt_vec3 offset;
-			if ((cr.relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT) != 0) {
+			struct xrt_pose optical;
+			if (g.controllerTracking != nullptr &&
+			    oxrsys_wmr_controller_tracking_get_pose(g.controllerTracking, h, monadoNow, kOpticalMaxAgeNs, &optical,
+			                                            nullptr)) {
+				// Seen by the headset cameras recently: the LED model origin, in
+				// the headset's frame, carried along with the head.
+				offset = quat_rotate(rel.pose.orientation, optical.position);
+				opticalSeen[h] = true;
+			} else if ((cr.relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT) != 0) {
 				offset = quat_rotate(rel.pose.orientation, cr.pose.position);
 				if (!camPosValid && g.sphereTracking != nullptr) {
 					camPosValid = true;
@@ -856,6 +876,8 @@ TrackingLoop()
 			g.haveHead = valid;
 			g.controllerCamPosValid = camPosValid;
 			g.controllerCamPos = camPos;
+			g.controllerOptical[0] = opticalSeen[0];
+			g.controllerOptical[1] = opticalSeen[1];
 		}
 		if (auto c = CurrentClient()) {
 			std::vector<uint8_t> p((const uint8_t*)&packet, (const uint8_t*)&packet + sizeof(packet));
@@ -1116,12 +1138,118 @@ StartHeadTracking()
  * Camera monitor: the tap copies every frame into the window's buffers on
  * the camera thread; the window asks for the rest on the main thread.
  */
+//! OXRSYS_HEADSET_MONITOR_LED_FRAMES=1: show the short-exposure controller
+//! frames (where the controllers' LEDs are) instead of the SLAM frames.
+static bool
+MonitorShowsLedFrames()
+{
+	static const bool on = [] {
+		const char* env = getenv("OXRSYS_HEADSET_MONITOR_LED_FRAMES");
+		return env != nullptr && (strcmp(env, "1") == 0 || strcmp(env, "true") == 0);
+	}();
+	return on;
+}
+
 static void
 MonitorTapCallback(void* userdata, uint32_t cam, const struct xrt_frame* frame)
 {
 	auto* monitor = static_cast<oxrsys::CameraMonitor*>(userdata);
 	if (frame == nullptr || frame->format != XRT_FORMAT_L8) return;
+	if (MonitorShowsLedFrames() && g.controllerTracking != nullptr) return;
 	monitor->PushFrame(cam, frame->data, frame->width, frame->height, frame->stride, frame->timestamp);
+}
+
+/*!
+ * Controller boxes for the monitor: per camera, the LED blobs the tracker has
+ * assigned to each controller, and clusters of unassigned blobs.
+ */
+static void
+FillControllerOverlay(oxrsys::CameraMonitorInfo& info)
+{
+	if (g.controllerTracking == nullptr) {
+		info.controllerTracking = false;
+		return;
+	}
+	info.controllerTracking = true;
+	struct oxrsys_wmr_ct_snapshot snap;
+	oxrsys_wmr_controller_tracking_snapshot(g.controllerTracking, &snap);
+	const int64_t now = os_monotonic_get_ns();
+	const int64_t recentNs = 250000000LL;
+	info.controllerFps = snap.controller_fps;
+
+	for (uint32_t cam = 0; cam < snap.camera_count && cam < 2; cam++) {
+		const oxrsys_wmr_ct_camera_view& v = snap.cams[cam];
+		auto& camInfo = info.controllerCams[cam];
+		camInfo.blobCount = v.blob_count;
+		if (v.timestamp_ns == 0 || now - v.timestamp_ns > recentNs) continue;
+		for (uint32_t i = 0; i < v.stored; i++) {
+			camInfo.blobs.push_back({v.blobs[i].x, v.blobs[i].y, (int)v.blobs[i].hand});
+		}
+		// Assigned blobs: one box per controller.
+		for (int hand = 0; hand < 2; hand++) {
+			oxrsys::ControllerBox box;
+			box.hand = hand;
+			for (uint32_t i = 0; i < v.stored; i++) {
+				const oxrsys_wmr_ct_blob& b = v.blobs[i];
+				if (b.hand != hand) continue;
+				box.Add(b.x - b.w / 2, b.y - b.h / 2, b.x + b.w / 2, b.y + b.h / 2);
+			}
+			if (box.blobs > 0) camInfo.boxes.push_back(box);
+		}
+		// Unassigned blobs: greedy clusters of nearby blobs; a controller shows several LEDs.
+		std::vector<bool> used(v.stored, false);
+		for (uint32_t i = 0; i < v.stored; i++) {
+			if (used[i] || v.blobs[i].hand >= 0) continue;
+			oxrsys::ControllerBox box;
+			box.hand = -1;
+			std::vector<uint32_t> members = {i};
+			used[i] = true;
+			for (size_t m = 0; m < members.size(); m++) {
+				const oxrsys_wmr_ct_blob& a = v.blobs[members[m]];
+				for (uint32_t j = 0; j < v.stored; j++) {
+					if (used[j] || v.blobs[j].hand >= 0) continue;
+					const float dx = v.blobs[j].x - a.x, dy = v.blobs[j].y - a.y;
+					if (dx * dx + dy * dy < 70.0f * 70.0f) {
+						used[j] = true;
+						members.push_back(j);
+					}
+				}
+			}
+			for (uint32_t m : members) {
+				const oxrsys_wmr_ct_blob& b = v.blobs[m];
+				box.Add(b.x - b.w / 2, b.y - b.h / 2, b.x + b.w / 2, b.y + b.h / 2);
+			}
+			if (box.blobs >= 3) camInfo.boxes.push_back(box);
+		}
+	}
+
+	std::string status;
+	for (int hand = 0; hand < 2; hand++) {
+		const oxrsys_wmr_ct_hand& h = snap.hands[hand];
+		if (!status.empty()) status += ", ";
+		status += hand == 0 ? "L " : "R ";
+		if (!h.present) {
+			status += "not tracked";
+			continue;
+		}
+		std::string cams;
+		for (int cam = 0; cam < 2; cam++) {
+			if (h.last_seen_ns[cam] != 0 && now - h.last_seen_ns[cam] < recentNs) {
+				if (!cams.empty()) cams += "/";
+				cams += "cam" + std::to_string(cam);
+			}
+		}
+		status += cams.empty() ? "not seen" : "seen " + cams;
+		if (!h.led_sync) status += " (LED sync waiting)";
+		char buf[96];
+		if (h.pose_valid && now - h.pose_timestamp_ns < recentNs) {
+			snprintf(buf, sizeof(buf), " (%.2f, %.2f, %.2f) m %.0f/s", h.head_relative.position.x,
+			         h.head_relative.position.y, h.head_relative.position.z, h.poses_per_second);
+			status += buf;
+		}
+		info.handSeen[hand] = !cams.empty();
+	}
+	info.controllerStatus = status;
 }
 
 static void
@@ -1136,6 +1264,9 @@ MonitorInfo(oxrsys::CameraMonitorInfo& info)
 	info.controllerPosition[0] = g.controllerCamPos.x;
 	info.controllerPosition[1] = g.controllerCamPos.y;
 	info.controllerPosition[2] = g.controllerCamPos.z;
+	info.opticalControllers[0] = g.controllerOptical[0];
+	info.opticalControllers[1] = g.controllerOptical[1];
+	FillControllerOverlay(info);
 }
 
 static void
@@ -1260,8 +1391,22 @@ OpenHeadset()
 		g.controllers[0] = g.headset->left;
 		g.controllers[1] = g.headset->right;
 		g.controllerKind = g.headset->controllers_bluetooth ? "WMR controllers (Bluetooth)" : "WMR controllers (headset radio)";
+		if (g.opts.controllerTracking && oxrsys_wmr_controller_tracking_available()) {
+			g.controllerTracking = oxrsys_wmr_controller_tracking_create(g.headset->hmd, g.headset->left, g.headset->right,
+			                                                             cameraSinks, g.opts.logLevel);
+			if (g.controllerTracking != nullptr) {
+				g.controllerKind += ", camera-tracked";
+			} else {
+				LOGW("controller tracking unavailable; controllers use the arm model");
+			}
+		}
 	} else if (oxrsys_psmv_count_usable() == 0) {
 		LOGI("no PS Move controller connected over Bluetooth; controllers none");
+		if (getenv("OXRSYS_WMR_CT_WITHOUT_CONTROLLERS") != nullptr) {
+			// Diagnostics: LED blob detection on the controller frames with nothing to track.
+			g.controllerTracking =
+			    oxrsys_wmr_controller_tracking_create(g.headset->hmd, nullptr, nullptr, cameraSinks, g.opts.logLevel);
+		}
 	} else {
 		struct xrt_tracking_factory* factory = oxrsys_wmr_psmv_tracking_create(
 		    g.headset->hmd, cameraSinks, g.opts.logLevel, &g.sphereTracking);
@@ -1274,6 +1419,17 @@ OpenHeadset()
 			oxrsys_psmv_set_tracking_factory(nullptr);
 			oxrsys_wmr_psmv_tracking_destroy(&g.sphereTracking);
 		}
+	}
+	if (g.controllerTracking != nullptr && g.monitor != nullptr && MonitorShowsLedFrames()) {
+		oxrsys_wmr_controller_tracking_set_frame_callback(
+		    g.controllerTracking,
+		    [](void* userdata, uint32_t cam, const struct xrt_frame* frame) {
+			    auto* monitor = static_cast<oxrsys::CameraMonitor*>(userdata);
+			    if (frame == nullptr || frame->format != XRT_FORMAT_L8) return;
+			    monitor->PushFrame(cam, frame->data, frame->width, frame->height, frame->stride, frame->timestamp);
+		    },
+		    g.monitor);
+		LOGI("camera monitor shows the controller LED frames");
 	}
 	LOGI("%s open: panel %ux%u @ %u Hz, eyes %ux%u, head %s, controllers %s",
 	     oxrsys_wmr_headset_type_str(g.headset->type), g.geometry.panel_w, g.geometry.panel_h, g.refreshHz,
@@ -1359,6 +1515,7 @@ Shutdown()
 	for (size_t i = 0; i < g.psmvCount; i++) oxrsys_psmv_close(&g.psmv[i]);
 	oxrsys_psmv_set_tracking_factory(nullptr);
 	oxrsys_wmr_psmv_tracking_destroy(&g.sphereTracking);
+	oxrsys_wmr_controller_tracking_destroy(&g.controllerTracking);
 	// Attached after the SLAM tracker, so detached before it.
 	oxrsys_wmr_camera_tap_destroy(&g.tap);
 	oxrsys_wmr_slam_destroy(&g.slam);
@@ -1415,6 +1572,8 @@ main(int argc, char** argv)
 			g.opts.monitor = true;
 		} else if (strcmp(argv[i], "--controller-adapter") == 0) {
 			g.opts.controllerAdapter = true;
+		} else if (strcmp(argv[i], "--no-controller-tracking") == 0) {
+			g.opts.controllerTracking = false;
 		} else if (strcmp(argv[i], "--log-level") == 0 && hasValue) {
 			const char* l = argv[++i];
 			g.opts.logLevel = strcmp(l, "trace") == 0 ? U_LOGGING_TRACE
@@ -1425,7 +1584,7 @@ main(int argc, char** argv)
 		} else {
 			fprintf(stderr,
 			        "usage: %s [--socket PATH] [--display-id ID] [--no-capture] [--eye-height M] "
-			        "[--vit-library PATH|none] [--monitor] [--controller-adapter] [--log-level LEVEL]\n",
+			        "[--vit-library PATH|none] [--monitor] [--controller-adapter] [--no-controller-tracking] [--log-level LEVEL]\n",
 			        argv[0]);
 			return 2;
 		}
