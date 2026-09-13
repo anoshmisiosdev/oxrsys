@@ -111,6 +111,7 @@ private:
     QDoubleSpinBox* wiredEyeHeightSpin_ = nullptr;
     QCheckBox* wiredPositionTrackingCheckBox_ = nullptr;
     QCheckBox* wiredControllerAdapterCheckBox_ = nullptr;
+    QCheckBox* wiredCameraMonitorCheckBox_ = nullptr;
     QSpinBox* wiredDisplayIdSpin_ = nullptr;
     QComboBox* usbDeviceCombo_ = nullptr;
     QLabel* adbStatusLabel_ = nullptr;

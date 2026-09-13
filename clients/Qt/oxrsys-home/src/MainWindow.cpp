@@ -787,6 +787,8 @@ QWidget* MainWindow::buildStreamingTab()
     wiredLayout->addLayout(wiredForm);
     wiredPositionTrackingCheckBox_ = new QCheckBox("Positional head tracking (6DoF, Basalt)", wiredHeadsetOptions_);
     wiredLayout->addWidget(wiredPositionTrackingCheckBox_);
+    wiredCameraMonitorCheckBox_ = new QCheckBox("Show the tracking cameras in a window", wiredHeadsetOptions_);
+    wiredLayout->addWidget(wiredCameraMonitorCheckBox_);
     wiredControllerAdapterCheckBox_ = new QCheckBox(
         "Windows Mixed Reality controllers through a USB Bluetooth adapter", wiredHeadsetOptions_);
     wiredLayout->addWidget(wiredControllerAdapterCheckBox_);
@@ -914,6 +916,7 @@ QWidget* MainWindow::buildStreamingTab()
     connect(wiredEyeHeightSpin_, qOverload<double>(&QDoubleSpinBox::valueChanged), this, connectConfigChanged);
     connect(wiredPositionTrackingCheckBox_, &QCheckBox::toggled, this, connectConfigChanged);
     connect(wiredControllerAdapterCheckBox_, &QCheckBox::toggled, this, connectConfigChanged);
+    connect(wiredCameraMonitorCheckBox_, &QCheckBox::toggled, this, connectConfigChanged);
     connect(wiredDisplayIdSpin_, qOverload<int>(&QSpinBox::valueChanged), this, connectConfigChanged);
 
     auto* configButtons = new QHBoxLayout();
@@ -1237,7 +1240,7 @@ void MainWindow::refreshStreaming()
         refreshRateCombo_, encoderPresetCombo_, foveatedEncodingPresetCombo_,
         clientFoveationPresetCombo_, clientReprojectionCombo_, abrModeCombo_,
         configTransportCombo_, headsetModeCombo_, wiredEyeHeightSpin_, wiredDisplayIdSpin_,
-        wiredPositionTrackingCheckBox_, wiredControllerAdapterCheckBox_, usbDeviceCombo_,
+        wiredPositionTrackingCheckBox_, wiredControllerAdapterCheckBox_, wiredCameraMonitorCheckBox_, usbDeviceCombo_,
     };
     for (QWidget* control : controls)
     {
@@ -1267,6 +1270,7 @@ void MainWindow::refreshStreaming()
     wiredDisplayIdSpin_->setValue(config.wiredDisplayId);
     wiredPositionTrackingCheckBox_->setChecked(config.wiredPositionTracking);
     wiredControllerAdapterCheckBox_->setChecked(config.wiredControllerAdapter);
+    wiredCameraMonitorCheckBox_->setChecked(config.wiredCameraMonitor);
     wiredHeadsetOptions_->setVisible(config.wiredHeadset);
 
     usbDeviceCombo_->clear();
@@ -1465,6 +1469,7 @@ void MainWindow::updateConfigFromControls()
     config.wiredDisplayId = wiredDisplayIdSpin_->value();
     config.wiredPositionTracking = wiredPositionTrackingCheckBox_->isChecked();
     config.wiredControllerAdapter = wiredControllerAdapterCheckBox_->isChecked();
+    config.wiredCameraMonitor = wiredCameraMonitorCheckBox_->isChecked();
     wiredHeadsetOptions_->setVisible(config.wiredHeadset);
 
     bitrateValueLabel_->setText(QString("%1 Mbps").arg(config.bitrateMbps));

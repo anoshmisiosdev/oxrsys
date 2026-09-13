@@ -16,8 +16,12 @@
 //                         [--controller-adapter]
 //                         [--log-level trace|debug|info|warn|error]
 //
-// The runtime passes --display-id, --eye-height, --vit-library and
+// The runtime passes --display-id, --eye-height, --vit-library, --monitor and
 // --controller-adapter from its wired_* config keys when it starts the helper.
+//
+// When stderr isn't a terminal (started by the runtime inside a game), it goes
+// to oxrsys-headset-helper-driver.log so Monado's own messages (driver, SLAM,
+// PS Move) aren't lost.
 //
 // --controller-adapter: 1st-gen WMR motion controllers can't pair with macOS's
 // Bluetooth, so they run on a separate USB Bluetooth adapter through
@@ -1412,8 +1416,16 @@ main(int argc, char** argv)
 		setenv("SLAM_LOG", levelNames[g.opts.logLevel], 0);
 	}
 	if (const char* home = getenv("HOME")) {
-		std::string path = std::string(home) + "/Library/Application Support/OXRSys/oxrsys-headset-helper.log";
-		g_logFile = fopen(path.c_str(), "a");
+		const std::string dir = std::string(home) + "/Library/Application Support/OXRSys/";
+		g_logFile = fopen((dir + "oxrsys-headset-helper.log").c_str(), "a");
+		if (!isatty(STDERR_FILENO)) {
+			int fd = open((dir + "oxrsys-headset-helper-driver.log").c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+			if (fd >= 0) {
+				dup2(fd, STDERR_FILENO);
+				close(fd);
+				setvbuf(stderr, nullptr, _IOLBF, 0);
+			}
+		}
 	}
 
 	@autoreleasepool {

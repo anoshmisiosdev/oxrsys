@@ -185,6 +185,7 @@ The structured editor covers the current runtime keys:
 - `wired.wired_eye_height_m`
 - `wired.wired_position_tracking`
 - `wired.wired_controller_adapter`
+- `wired.wired_camera_monitor`
 - `logging.file_logging`
 - `logging.quest_logcat`
 
@@ -220,7 +221,9 @@ into the Mac over USB and HDMI/DisplayPort then replaces the streaming client (s
 `2.2` m, the head height above the floor without positional tracking, and the starting height
 with it), `wired_display_id` (the panel's `CGDirectDisplayID`; `0` auto-detects) and a
 `Positional head tracking (6DoF, Basalt)` toggle (`wired_position_tracking`, on by default; it
-only takes effect when `libbasalt.dylib` is installed next to the headset helper), and reminds the user that
+only takes effect when `libbasalt.dylib` is installed next to the headset helper), a `Show the
+tracking cameras in a window` toggle (`wired_camera_monitor`, on by default; the helper's camera
+monitor window opens on a desktop screen whenever the headset is used), and reminds the user that
 the one-time EDID display override from `drivers/tools/wmr_edid_override.py` is required before
 macOS shows the panel. Home does not edit `wired_helper_path`; the runtime looks for
 `oxrsys-headset-helper` next to the runtime dylib unless the key is set by hand.

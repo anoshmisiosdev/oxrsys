@@ -64,7 +64,8 @@ real capture/playback stream is implemented.
 The Headset section at the top of the Streaming tab mirrors the SwiftUI Home headset mode: the
 streaming default writes `wired.wired_headset = false`, and `Wired Windows Mixed Reality headset
 (USB)` writes `wired_headset = true` together with `wired_eye_height_m`, `wired_display_id`
-(`0` = auto-detect), `wired_position_tracking` (the 6DoF/Basalt checkbox) and
+(`0` = auto-detect), `wired_position_tracking` (the 6DoF/Basalt checkbox), `wired_camera_monitor` (the tracking-camera
+window checkbox) and
 `wired_controller_adapter` (WMR controllers through a USB Bluetooth adapter; the macOS SwiftUI Home
 app additionally shows adapter detection, controller status and pairing, which stay macOS-only
 because the adapter path itself is). The wired backend itself is macOS only (see

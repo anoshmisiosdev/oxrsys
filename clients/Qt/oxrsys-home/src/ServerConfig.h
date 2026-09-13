@@ -31,6 +31,7 @@ struct ServerConfig
     double wiredEyeHeightM = 1.6;
     bool wiredPositionTracking = true;
     bool wiredControllerAdapter = false;
+    bool wiredCameraMonitor = true;
     bool fileLogging = true;
     bool questLogcat = false;
 

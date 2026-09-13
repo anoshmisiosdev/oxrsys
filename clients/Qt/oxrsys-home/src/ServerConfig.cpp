@@ -260,6 +260,8 @@ QString ServerConfig::defaultText()
         "wired_position_tracking = true\n"
         "# WMR motion controllers through a separate USB Bluetooth adapter (wmr_btstack).\n"
         "wired_controller_adapter = false\n"
+        "# Open the headset helper's tracking-camera window whenever the headset is used.\n"
+        "wired_camera_monitor = true\n"
         "\n"
         "[logging]\n"
         "file_logging = true\n"
@@ -381,6 +383,12 @@ ServerConfig ServerConfig::parse(const QString& text)
         config.wiredControllerAdapter = wiredControllerAdapter;
     }
 
+    const bool wiredCameraMonitor = boolValue("wired_camera_monitor", text, &ok);
+    if (ok)
+    {
+        config.wiredCameraMonitor = wiredCameraMonitor;
+    }
+
     const bool fileLogging = boolValue("file_logging", text, &ok);
     if (ok)
     {
@@ -428,6 +436,7 @@ QString ServerConfig::mergedInto(const QString& currentText) const
         {"wired_eye_height_m", decimalString(wiredEyeHeightM)},
         {"wired_position_tracking", boolString(wiredPositionTracking)},
         {"wired_controller_adapter", boolString(wiredControllerAdapter)},
+        {"wired_camera_monitor", boolString(wiredCameraMonitor)},
     });
     text = upsertSection(text, "logging", {
         {"file_logging", boolString(fileLogging)},

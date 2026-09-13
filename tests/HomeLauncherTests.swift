@@ -281,14 +281,18 @@ struct HomeLauncherTests {
 
     private static func testServerConfigWiredControllerAdapterRoundTrip() throws {
         try expect(OXRSysServerConfig().wiredControllerAdapter == false, "Expected controller adapter off by default")
+        try expect(OXRSysServerConfig().wiredCameraMonitor == true, "Expected camera monitor on by default")
         let parsed = OXRSysServerConfig.parse(from: """
         [wired]
         wired_headset = true
         wired_controller_adapter = true
+        wired_camera_monitor = false
         """)
         try expect(parsed.wiredControllerAdapter, "Expected controller adapter parse")
+        try expect(!parsed.wiredCameraMonitor, "Expected camera monitor parse")
         let merged = parsed.merged(into: OXRSysServerConfig.defaultText)
         try expect(merged.contains("wired_controller_adapter = true"), "Expected controller adapter serialization")
+        try expect(merged.contains("wired_camera_monitor = false"), "Expected camera monitor serialization")
     }
 
     private static func testWmrControllerServiceStatusParsing() throws {

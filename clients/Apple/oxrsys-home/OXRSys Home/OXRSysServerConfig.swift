@@ -27,6 +27,7 @@ struct OXRSysServerConfig: Equatable {
     var wiredEyeHeightM = 1.6
     var wiredPositionTracking = true
     var wiredControllerAdapter = false
+    var wiredCameraMonitor = true
     var fileLogging = true
     var questLogcat = false
 
@@ -113,6 +114,10 @@ struct OXRSysServerConfig: Equatable {
     # helper starts wmr_btstack from next to itself; see docs/platforms/wmr.md.
     wired_controller_adapter = false
 
+    # Open the headset helper's tracking-camera window (both cameras with the
+    # features Basalt tracks) on a desktop screen whenever the headset is used.
+    wired_camera_monitor = true
+
     [logging]
     # Write server logs to ~/Library/Application Support/OXRSys/oxrsys-runtime.log.
     file_logging = true
@@ -181,6 +186,9 @@ struct OXRSysServerConfig: Equatable {
         if let value = boolValue("wired_controller_adapter", in: text) {
             config.wiredControllerAdapter = value
         }
+        if let value = boolValue("wired_camera_monitor", in: text) {
+            config.wiredCameraMonitor = value
+        }
         if let value = boolValue("file_logging", in: text) {
             config.fileLogging = value
         }
@@ -222,6 +230,7 @@ struct OXRSysServerConfig: Equatable {
                 ("wired_eye_height_m", decimalString(wiredEyeHeightM)),
                 ("wired_position_tracking", boolString(wiredPositionTracking)),
                 ("wired_controller_adapter", boolString(wiredControllerAdapter)),
+                ("wired_camera_monitor", boolString(wiredCameraMonitor)),
             ]),
             ("logging", [
                 ("file_logging", boolString(fileLogging)),

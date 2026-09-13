@@ -626,6 +626,8 @@ struct ContentView: View {
 
                     Toggle("Positional head tracking (6DoF, Basalt)", isOn: streamingBinding(\.wiredPositionTracking))
 
+                    Toggle("Show the tracking cameras in a window", isOn: streamingBinding(\.wiredCameraMonitor))
+
                     VStack(alignment: .leading, spacing: 6) {
                         Text("The headset replaces the streaming client while it is plugged in over USB and HDMI/DisplayPort. Positional tracking needs libbasalt.dylib next to the headset helper (drivers/tools/build_basalt.sh); without it, or with the toggle off, the head is tracked in orientation only at the eye height above.")
                         Text("macOS hides Windows Mixed Reality panels until the one-time EDID display override is installed (`sudo python3 drivers/tools/wmr_edid_override.py --install`, then replug the video cable). Without it the panel stays black. See docs/platforms/wmr.md.")
