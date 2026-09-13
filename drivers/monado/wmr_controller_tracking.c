@@ -13,6 +13,7 @@
 #include "wmr_controller_tracking.h"
 #include "wmr_ct_jump_gate.h"
 #include "wmr_ct_gyro_check.h"
+#include "wmr_ct_smoothing.h"
 
 #include "xrt/xrt_config_have.h"
 
@@ -130,6 +131,8 @@ struct ct_hand
 	struct t_constellation_tracker_tracking_source prior_source;
 	struct xrt_pose prior_world_pose;
 	int64_t prior_timestamp_ns;
+	//! Jitter smoothing of the world position; under `lock`.
+	struct oxrsys_wmr_ct_smoothing smoothing;
 	t_constellation_device_id_t id;
 	struct t_constellation_tracker_led leds[WMR_MAX_LEDS];
 	size_t led_count;
@@ -809,7 +812,13 @@ device_push_sample(struct t_constellation_tracker_device *dev, struct t_constell
 		h->prior_timestamp_ns = sample->timestamp_ns;
 		h->state.pose_valid = true;
 		h->state.pose_timestamp_ns = sample->timestamp_ns;
+		// Smooth in the tracker's world (does not turn with the head), then
+		// take the result into the head frame with this sample's head pose.
+		const struct xrt_vec3 smoothed =
+		    oxrsys_wmr_ct_smoothing_run(&h->smoothing, sample->timestamp_ns, sample->pose.position);
 		h->state.head_relative = rel_pose;
+		h->state.raw_head_relative_position = rel_pose.position;
+		math_pose_transform_point(&head_inv, &smoothed, &h->state.head_relative.position);
 		h->state.pose_camera = (uint32_t)sample->camera_index;
 		h->state.matched_blobs = sample->metrics.matched_blob_count;
 		h->state.visible_leds = sample->metrics.visible_led_count;
@@ -1053,6 +1062,7 @@ add_hand(struct oxrsys_wmr_controller_tracking *t, int index, struct xrt_device 
 	// The lock guards the prior, which the tracker may read as soon as the
 	// device is added.
 	os_mutex_init(&h->lock);
+	oxrsys_wmr_ct_smoothing_init(&h->smoothing);
 	h->prior_source.get_tracked_pose = hand_prior_get_tracked_pose;
 	oxrsys_wmr_ct_jump_gate_reset(&h->jump_gate);
 	oxrsys_wmr_ct_jump_gate_default_params(&h->jump_params);
