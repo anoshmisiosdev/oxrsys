@@ -387,6 +387,10 @@ ConfigValues ParseConfigToml(std::istream& input, const ConfigValues& defaults)
             {
                 values.wiredPositionTracking = ParseBool(value);
             }
+            else if (key == "wired_controller_adapter")
+            {
+                values.wiredControllerAdapter = ParseBool(value);
+            }
             else if (key == "wired_vit_library")
             {
                 std::string path = value;

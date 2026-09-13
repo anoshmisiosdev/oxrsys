@@ -62,6 +62,7 @@ struct ConfigValues
     std::string wiredHelperPath = ""; // oxrsys-headset-helper binary; empty = sibling of the runtime dylib
     bool wiredPositionTracking = true; // 6DoF through Basalt when a VIT library is found; false = IMU only
     std::string wiredVitLibrary = "";  // Basalt (VIT plugin) dylib; empty = helper searches the usual places
+    bool wiredControllerAdapter = false; // WMR motion controllers through a USB Bluetooth adapter (wmr_btstack)
 
     bool fileLogging = true;        // Write logs to oxrsys-runtime.log
     bool questLogcat = false;       // Capture Quest logcat to oxrsys-headset.log

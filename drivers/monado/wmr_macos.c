@@ -7,6 +7,7 @@
 #include "wmr_macos.h"
 
 #include "os_hid_hidapi.h"
+#include "os_hid_wmr_bridge.h"
 #include "psmv_macos.h"
 
 #include "util/u_misc.h"
@@ -331,6 +332,50 @@ open_bt_controller(const struct bt_candidate *candidate,
 	return xdev;
 }
 
+static struct xrt_device *
+open_bridge_controller(char hand, enum u_logging_level log_level)
+{
+	struct os_hid_device *hid = NULL;
+	int ret = os_hid_wmr_bridge_open(hand, &hid);
+	if (ret != 0) {
+		U_LOG_IFL_E(log_level, "wmr_btstack bridge: failed to open %s controller: %d",
+		            hand == 'L' ? "left" : "right", ret);
+		return NULL;
+	}
+	enum xrt_device_type type =
+	    hand == 'L' ? XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER : XRT_DEVICE_TYPE_RIGHT_HAND_CONTROLLER;
+	// The driver owns the device from here on and reads the calibration over the relay.
+	struct xrt_device *xdev = wmr_bt_controller_create(hid, type, MICROSOFT_VID, WMR_CONTROLLER_PID, log_level);
+	if (xdev == NULL) {
+		U_LOG_IFL_E(log_level, "Monado WMR driver failed to create the %s controller relayed by wmr_btstack.",
+		            hand == 'L' ? "left" : "right");
+	}
+	return xdev;
+}
+
+static int
+open_bridge_controllers(enum u_logging_level log_level, struct xrt_device **out_left, struct xrt_device **out_right)
+{
+	char hands[3];
+	int count = os_hid_wmr_bridge_list(hands);
+	if (count < 0) {
+		U_LOG_IFL_D(log_level, "wmr_btstack bridge not running.");
+		return 0;
+	}
+	U_LOG_IFL_I(log_level, "wmr_btstack bridge: %d controller(s) connected (%s)", count, hands);
+
+	int opened = 0;
+	for (int i = 0; i < count; i++) {
+		struct xrt_device **slot = hands[i] == 'L' ? out_left : out_right;
+		if (*slot != NULL) {
+			continue;
+		}
+		*slot = open_bridge_controller(hands[i], log_level);
+		opened += *slot != NULL;
+	}
+	return opened;
+}
+
 int
 oxrsys_wmr_open_bt_controllers(enum u_logging_level log_level,
                                struct xrt_device **out_left,
@@ -374,12 +419,6 @@ oxrsys_wmr_open_bt_controllers(enum u_logging_level log_level,
 		chosen.right = g2.right.info != NULL ? g2.right : odyssey.right.info != NULL ? odyssey.right : wmr.right;
 	}
 
-	if (chosen.left.info == NULL && chosen.right.info == NULL) {
-		U_LOG_IFL_I(log_level, "No WMR motion controllers connected over Bluetooth.");
-		hid_free_enumeration(list);
-		return 0;
-	}
-
 	// Paths are only valid while the list lives.
 	int opened = 0;
 	*out_left = open_bt_controller(&chosen.left, XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER, log_level);
@@ -388,6 +427,15 @@ oxrsys_wmr_open_bt_controllers(enum u_logging_level log_level,
 	opened += *out_right != NULL;
 	hid_free_enumeration(list);
 
+	// 1st-gen controllers can't pair with macOS's Bluetooth; wmr_btstack pairs them on an
+	// external USB adapter and relays them. Fill whichever hands are still missing.
+	if (*out_left == NULL || *out_right == NULL) {
+		opened += open_bridge_controllers(log_level, out_left, out_right);
+	}
+
+	if (opened == 0) {
+		U_LOG_IFL_I(log_level, "No WMR motion controllers connected over Bluetooth.");
+	}
 	return opened;
 }
 

@@ -8,7 +8,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include "btstack_config.h"
@@ -27,7 +29,10 @@
 #include "hci_transport.h"
 #include "hci_transport_usb.h"
 
+#include "wmr_bt_bridge_protocol.h"
+
 int btstack_main(int argc, const char *argv[]);
+extern int wmr_pairing_seconds_at_start;
 
 static char tlv_db_path[512];
 static const btstack_tlv_t *tlv_impl;
@@ -48,7 +53,7 @@ packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t 
 		bd_addr_t local_addr;
 		gap_local_bd_addr(local_addr);
 		const char *home = getenv("HOME");
-		snprintf(tlv_db_path, sizeof(tlv_db_path), "%s/Library/Application Support/oxrsys/wmr_btstack_%s.tlv",
+		snprintf(tlv_db_path, sizeof(tlv_db_path), "%s/Library/Application Support/OXRSys/wmr_btstack_%s.tlv",
 		         home ? home : "/tmp", bd_addr_to_str_with_delimiter(local_addr, '-'));
 		if (tlv_reset) unlink(tlv_db_path);
 		tlv_impl = btstack_tlv_posix_init_instance(&tlv_context, tlv_db_path);
@@ -66,10 +71,20 @@ packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t 
 }
 
 static void
+force_exit(int sig)
+{
+	(void)sig;
+	_exit(0); // atexit handlers (socket unlink) were already run by the first exit attempt or don't matter
+}
+
+static void
 trigger_shutdown(void)
 {
 	printf("\nShutting down adapter...\n");
 	shutdown_triggered = true;
+	// Powering the adapter off can stall on some dongles; don't hang Ctrl-C on it.
+	signal(SIGALRM, force_exit);
+	alarm(2);
 	hci_power_control(HCI_POWER_OFF);
 }
 
@@ -78,19 +93,37 @@ main(int argc, const char *argv[])
 {
 	const char *log_path = NULL;
 	int opt;
-	while ((opt = getopt(argc, (char *const *)argv, "rl:h")) != -1) {
+	while ((opt = getopt(argc, (char *const *)argv, "p:rl:h")) != -1) {
 		switch (opt) {
+		case 'p': wmr_pairing_seconds_at_start = atoi(optarg); break;
 		case 'r': tlv_reset = true; break;
 		case 'l': log_path = optarg; break;
 		default:
-			printf("usage: %s [-r] [-l hci_log.pklg]\n  -r  forget paired controllers\n", argv[0]);
+			printf("usage: %s [-p SECONDS] [-r] [-l hci_log.pklg]\n"
+			       "  -p  look for controllers in pairing mode for SECONDS at start (default 120, 0 = off)\n"
+			       "  -r  forget paired controllers\n",
+			       argv[0]);
 			return opt == 'h' ? 0 : 2;
 		}
 	}
 
+	// Home and the headset helper both start the tool on demand; a second copy would only fail to
+	// open the adapter (and briefly report it missing), so leave the running one alone.
+	{
+		struct sockaddr_un sa = {.sun_family = AF_UNIX};
+		wmr_bridge_socket_path(sa.sun_path, sizeof(sa.sun_path));
+		int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+		if (fd >= 0 && connect(fd, (struct sockaddr *)&sa, sizeof(sa)) == 0) {
+			printf("wmr_btstack is already running (%s)\n", sa.sun_path);
+			close(fd);
+			return 0;
+		}
+		if (fd >= 0) close(fd);
+	}
+
 	const char *home = getenv("HOME");
 	char dir[512];
-	snprintf(dir, sizeof(dir), "%s/Library/Application Support/oxrsys", home ? home : "/tmp");
+	snprintf(dir, sizeof(dir), "%s/Library/Application Support/OXRSys", home ? home : "/tmp");
 	mkdir(dir, 0755);
 
 	char default_log[600];
@@ -112,6 +145,8 @@ main(int argc, const char *argv[])
 	hci_event_callback_registration.callback = &packet_handler;
 	hci_add_event_handler(&hci_event_callback_registration);
 	btstack_signal_register_callback(SIGINT, &trigger_shutdown);
+	btstack_signal_register_callback(SIGTERM, &trigger_shutdown);
+	signal(SIGPIPE, SIG_IGN);
 
 	btstack_main(argc, argv);
 	btstack_run_loop_execute();

@@ -115,7 +115,7 @@ Avoid duplicating the same guidance in multiple files. If commands, platform sta
   Linux `${XDG_CONFIG_HOME:-~/.config}/oxrsys/oxrsys-runtime.toml`,
   Windows `%APPDATA%/OXRSys/oxrsys-runtime.toml`.
 - Qt Home transport readiness and USB ADB reverse configuration run asynchronously on a worker; keep slow process calls off the UI thread and ignore stale worker results after path, serial, or transport changes.
-- `drivers/` compiles the Windows Mixed Reality driver out of an unmodified, commit-pinned Monado checkout (BSL-1.0) fetched with FetchContent. Do not patch Monado sources in place; add macOS pieces under `drivers/monado/` and keep the source lists in `drivers/CMakeLists.txt` in step with the pinned revision. See `docs/platforms/wmr.md`.
+- `drivers/` compiles the Windows Mixed Reality driver out of an unmodified, commit-pinned Monado checkout (BSL-1.0) fetched with FetchContent. Do not patch Monado sources in place; add macOS pieces under `drivers/monado/` and keep the source lists in `drivers/CMakeLists.txt` in step with the pinned revision. See `docs/platforms/wmr.md`. 1st-gen WMR motion controllers can't pair with macOS's Bluetooth; `drivers/tools/wmr_btstack` (BTstack on a USB Bluetooth adapter, built by its own `build.sh`) pairs them and relays them to the headset helper through `drivers/monado/os_hid_wmr_bridge.c`. Its libusb transport must stay patched (no `libusb_reset_device`/`set_configuration`, no SCO) or it can panic the macOS kernel.
 - A wired headset (`WiredHeadset`, enabled by `wired_headset = true`) replaces the streaming server for a session. The headset itself is owned by `oxrsys-headset-helper` (`runtime/headset_helper/`, native arm64: driver, captured display, tracking, idle lobby); the runtime is only a socket client that must connect in `Instance::GetSystem` so the recommended eye size matches the panel, injects the helper's tracking through the normal `TrackingReceiver`, and composes `FrameSource` snapshots into shared IOSurface slots on its own thread, waiting on the snapshot's shared event on the GPU. Keep the runtime side free of USB, Monado and AppKit so it works inside a Wine process. `Session::EndFrame` must stay non-blocking on that path too. Only one process can hold the headset's camera interface, so hardware tests must not run concurrently and the helper must be stopped before running the probe or display tools.
 
 ## Project Layout
@@ -179,6 +179,7 @@ swiftc -parse-as-library \
   "clients/Apple/oxrsys-home/OXRSys Home/OXRSysServerConfig.swift" \
   "clients/Apple/oxrsys-home/OXRSys Home/HomeLauncher.swift" \
   "clients/Apple/oxrsys-home/OXRSys Home/HomePreferences.swift" \
+  "clients/Apple/oxrsys-home/OXRSys Home/WmrControllerSupport.swift" \
   tests/HomeLauncherTests.swift \
   -o /tmp/oxrsys_home_launcher_tests && /tmp/oxrsys_home_launcher_tests
 xcodebuild -project "clients/Apple/oxrsys-home/OXRSys Home.xcodeproj" \

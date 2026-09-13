@@ -53,7 +53,7 @@ SRC="
 
 # shellcheck disable=SC2086
 cc -O2 -std=gnu11 -Wall -Wno-unused-parameter \
-	-I"$HERE" -I"$BTSTACK/src" -I"$BTSTACK/platform/posix" -I"$BTSTACK/platform/libusb" \
+	-I"$HERE" -I"$HERE/../../monado" -I"$BTSTACK/src" -I"$BTSTACK/platform/posix" -I"$BTSTACK/platform/libusb" \
 	-I"$BTSTACK/3rd-party/rijndael" -I"$BTSTACK/3rd-party/micro-ecc" \
 	-I"$BTSTACK/3rd-party/bluedroid/encoder/include" -I"$BTSTACK/3rd-party/bluedroid/decoder/include" -I"$BTSTACK/3rd-party/yxml" -I"$BTSTACK/3rd-party/md5" -I"$BTSTACK/3rd-party/lc3-google/include" \
 	$(pkg-config --cflags libusb-1.0) \

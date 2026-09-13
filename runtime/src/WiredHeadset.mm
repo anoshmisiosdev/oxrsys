@@ -263,6 +263,10 @@ bool SpawnHelper(const std::string& path, const std::string& socketPath, const C
         args.push_back("--vit-library");
         args.push_back(config.wiredVitLibrary);
     }
+    if (config.wiredControllerAdapter)
+    {
+        args.push_back("--controller-adapter");
+    }
     std::vector<char*> argv;
     for (std::string& a : args) argv.push_back(a.data());
     argv.push_back(nullptr);

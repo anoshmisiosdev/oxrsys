@@ -121,6 +121,22 @@ quest_logcat = true
     CHECK(values.questLogcat == true);
 }
 
+TEST_CASE("Config parser reads the wired controller adapter switch", "[config][wired]")
+{
+    CHECK(ConfigValues{}.wiredControllerAdapter == false);
+
+    std::istringstream input(R"TOML(
+[wired]
+wired_headset = true
+wired_controller_adapter = true
+)TOML");
+
+    const ConfigValues values = ParseConfigToml(input);
+
+    CHECK(values.wiredHeadset == true);
+    CHECK(values.wiredControllerAdapter == true);
+}
+
 TEST_CASE("Config singleton initializes with bounded Quest logcat clear", "[config][logcat]")
 {
     const auto start = std::chrono::steady_clock::now();
