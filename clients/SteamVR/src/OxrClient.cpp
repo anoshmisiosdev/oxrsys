@@ -4,9 +4,12 @@
 
 #include "DriverLog.h"
 
+#include <openvr_driver.h>
+
 #include <openxr/openxr_loader_negotiation.h>
 
 #include <algorithm>
+#include <utility>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -366,6 +369,21 @@ bool OxrClient::Start(ID3D11Device* device, ID3D11DeviceContext* context)
         return false;
     }
 
+    if (vr::VRSettings() != nullptr)
+    {
+        vr::EVRSettingsError settingsError = vr::VRSettingsError_None;
+        const bool flip = vr::VRSettings()->GetBool("driver_oxrsys", "flipVertical", &settingsError);
+        if (settingsError == vr::VRSettingsError_None)
+        {
+            flipVertical_ = flip;
+        }
+    }
+
+    if (!blitter_.Initialize(device, context))
+    {
+        OXRSYS_LOG("[oxrsys] no shader blitter; frames will be delivered without orientation correction");
+    }
+
     LoadFrameFunctions();
     if (waitFrame_ == nullptr || beginFrame_ == nullptr || endFrame_ == nullptr)
     {
@@ -438,7 +456,7 @@ void OxrClient::Stop()
     instance_ = XR_NULL_HANDLE;
 }
 
-bool OxrClient::CopyEye(size_t eye, ID3D11Texture2D* source)
+bool OxrClient::CopyEye(size_t eye, ID3D11Texture2D* source, const UvRect& sourceBounds)
 {
     Eye& target = eyes_[eye];
 
@@ -455,32 +473,55 @@ bool OxrClient::CopyEye(size_t eye, ID3D11Texture2D* source)
 
     if (source != nullptr && imageIndex < target.images.size())
     {
-        D3D11_TEXTURE2D_DESC sourceDesc = {};
-        source->GetDesc(&sourceDesc);
+        UvRect rect = sourceBounds;
+        if (flipVertical_)
+        {
+            // SteamVR renders with a top-left origin; the frame reaches the
+            // headset upside down without this, and the client samples what it
+            // is given without correcting anything. Swapping the two V
+            // coordinates rather than forcing 1 and 0 keeps an application that
+            // already submitted a flipped rectangle the right way up.
+            std::swap(rect.vMin, rect.vMax);
+        }
 
-        // SteamVR's render target is a few pixels smaller than the runtime's
-        // recommended size, so copy the overlapping region rather than
-        // requiring the two to agree.
-        D3D11_BOX box = {};
-        box.left = 0;
-        box.top = 0;
-        box.front = 0;
-        box.right = std::min(sourceDesc.Width, target.width);
-        box.bottom = std::min(sourceDesc.Height, target.height);
-        box.back = 1;
+        const bool blitted = blitter_.Blit(source,
+                                           swapchainFormat_,
+                                           rect,
+                                           target.images[imageIndex],
+                                           swapchainFormat_,
+                                           target.width,
+                                           target.height);
 
-        context_->CopySubresourceRegion(target.images[imageIndex], 0, 0, 0, 0, source, 0, &box);
+        if (!blitted)
+        {
+            // Without the shader the frame can still be delivered, just with
+            // the wrong orientation, which is better than a black headset.
+            D3D11_TEXTURE2D_DESC sourceDesc = {};
+            source->GetDesc(&sourceDesc);
+
+            D3D11_BOX box = {};
+            box.right = std::min(sourceDesc.Width, target.width);
+            box.bottom = std::min(sourceDesc.Height, target.height);
+            box.back = 1;
+
+            context_->CopySubresourceRegion(target.images[imageIndex], 0, 0, 0, 0, source, 0, &box);
+        }
     }
 
     XrSwapchainImageReleaseInfo releaseInfo = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
     return releaseSwapchainImage_(target.swapchain, &releaseInfo) == XR_SUCCESS;
 }
 
-void OxrClient::SetPendingEyes(ID3D11Texture2D* leftEye, ID3D11Texture2D* rightEye)
+void OxrClient::SetPendingEyes(ID3D11Texture2D* leftEye,
+                               const UvRect& leftBounds,
+                               ID3D11Texture2D* rightEye,
+                               const UvRect& rightBounds)
 {
     std::lock_guard<std::mutex> lock(pendingMutex_);
     pendingEyes_[0] = leftEye;
     pendingEyes_[1] = rightEye;
+    pendingBounds_[0] = leftBounds;
+    pendingBounds_[1] = rightBounds;
 }
 
 void OxrClient::PumpEvents()
@@ -612,16 +653,19 @@ void OxrClient::FrameLoop()
         }
 
         ID3D11Texture2D* sources[2] = {nullptr, nullptr};
+        UvRect bounds[2];
         {
             std::lock_guard<std::mutex> lock(pendingMutex_);
             sources[0] = pendingEyes_[0];
             sources[1] = pendingEyes_[1];
+            bounds[0] = pendingBounds_[0];
+            bounds[1] = pendingBounds_[1];
         }
 
         XrCompositionLayerProjectionView projectionViews[2] = {};
         for (size_t eye = 0; eye < eyes_.size(); ++eye)
         {
-            CopyEye(eye, sources[eye]);
+            CopyEye(eye, sources[eye], bounds[eye]);
 
             projectionViews[eye] = {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
             projectionViews[eye].pose = views[eye].pose;
@@ -638,7 +682,8 @@ void OxrClient::FrameLoop()
 
         const XrCompositionLayerBaseHeader* layers[] = {reinterpret_cast<const XrCompositionLayerBaseHeader*>(&layer)};
 
-        XrFrameEndInfo frameEndInfo = {XR_TYPE_FRAME_END_INFO};
+        XrFrameEndInfo frameEndInfo = {};
+        frameEndInfo.type = XR_TYPE_FRAME_END_INFO;
         frameEndInfo.displayTime = frameState.predictedDisplayTime;
         frameEndInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
         // Always submit the layer, even when the runtime says shouldRender is

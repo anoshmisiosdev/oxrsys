@@ -59,9 +59,11 @@ mkdir -p "${bin_dir}"
     "${script_dir}/src/DirectModeComponent.cpp" \
     "${script_dir}/src/DriverLog.cpp" \
     "${script_dir}/src/OxrClient.cpp" \
+    "${script_dir}/src/TextureBlitter.cpp" \
     -o "${bin_dir}/driver_oxrsys.dll" \
     -static \
     -ld3d11 \
+    -ld3dcompiler_47 \
     -ldxgi \
     -Wl,--enable-stdcall-fixup
 

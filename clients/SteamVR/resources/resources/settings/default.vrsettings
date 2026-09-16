@@ -12,6 +12,7 @@
         "secondsFromVsyncToPhotons": 0.011,
         "ipdMeters": 0.063,
         "tanHalfFovHorizontal": 1.19,
-        "tanHalfFovVertical": 1.19
+        "tanHalfFovVertical": 1.19,
+        "flipVertical": false
     }
 }

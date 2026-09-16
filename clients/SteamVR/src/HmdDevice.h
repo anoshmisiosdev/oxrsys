@@ -119,6 +119,7 @@ private:
     std::string modelNumber_;
     std::atomic<uint32_t> objectId_{vr::k_unTrackedDeviceIndexInvalid};
     vr::PropertyContainerHandle_t propertyContainer_ = vr::k_ulInvalidPropertyContainer;
+    vr::VRInputComponentHandle_t proximityComponent_ = vr::k_ulInvalidInputComponentHandle;
     std::thread vsyncThread_;
     std::atomic<bool> vsyncRunning_{false};
 };

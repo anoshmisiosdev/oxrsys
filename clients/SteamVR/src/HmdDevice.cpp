@@ -174,7 +174,7 @@ vr::EVRInitError HmdDevice::Activate(uint32_t unObjectId)
 
     properties->SetBoolProperty(propertyContainer_, vr::Prop_IsOnDesktop_Bool, false);
     properties->SetBoolProperty(propertyContainer_, vr::Prop_DeviceIsWireless_Bool, true);
-    properties->SetBoolProperty(propertyContainer_, vr::Prop_ContainsProximitySensor_Bool, false);
+    properties->SetBoolProperty(propertyContainer_, vr::Prop_ContainsProximitySensor_Bool, true);
     properties->SetBoolProperty(propertyContainer_, vr::Prop_DeviceProvidesBatteryStatus_Bool, false);
     properties->SetBoolProperty(propertyContainer_, vr::Prop_HasDriverDirectModeComponent_Bool, true);
     properties->SetBoolProperty(propertyContainer_, vr::Prop_DriverDirectModeSendsVsyncEvents_Bool, true);
@@ -182,6 +182,26 @@ vr::EVRInitError HmdDevice::Activate(uint32_t unObjectId)
     // SteamVR uses this to decide whether an HMD is present at all; without it
     // some of the start-up paths keep waiting for a display.
     properties->SetBoolProperty(propertyContainer_, vr::Prop_DisplayDebugMode_Bool, false);
+
+    // Tell SteamVR the headset is being worn.
+    //
+    // Without a proximity input it probes /user/head/proximity, rejects it as
+    // the wrong type, decides nobody is wearing the headset and parks the
+    // compositor in standby -- which stops it scheduling renders, so the image
+    // only updates when something else forces one.
+    if (vr::VRDriverInput() != nullptr)
+    {
+        const vr::EVRInputError inputError =
+            vr::VRDriverInput()->CreateBooleanComponent(propertyContainer_, "/proximity", &proximityComponent_);
+        if (inputError == vr::VRInputError_None)
+        {
+            vr::VRDriverInput()->UpdateBooleanComponent(proximityComponent_, true, 0.0);
+        }
+        else
+        {
+            OXRSYS_LOG("[oxrsys] could not create the proximity input: %d", static_cast<int>(inputError));
+        }
+    }
 
     vsyncRunning_.store(true, std::memory_order_release);
     vsyncThread_ = std::thread([this] { VsyncLoop(); });
@@ -217,6 +237,13 @@ void HmdDevice::VsyncLoop()
 
         vr::VRServerDriverHost()->VsyncEvent(0.0);
         RunFrame();
+
+        // Re-assert presence periodically; SteamVR otherwise drifts back into
+        // standby after a while.
+        if (proximityComponent_ != vr::k_ulInvalidInputComponentHandle && vr::VRDriverInput() != nullptr)
+        {
+            vr::VRDriverInput()->UpdateBooleanComponent(proximityComponent_, true, 0.0);
+        }
     }
 }
 

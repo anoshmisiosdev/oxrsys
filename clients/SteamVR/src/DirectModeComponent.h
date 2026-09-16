@@ -97,6 +97,7 @@ private:
     // Only the scene is forwarded for now, so this records the first and
     // ignores the rest rather than keeping whatever happened to arrive last.
     std::array<vr::SharedTextureHandle_t, 2> submittedEyes_ = {};
+    std::array<UvRect, 2> submittedBounds_ = {};
     uint32_t layersThisFrame_ = 0;
     std::vector<std::pair<vr::SharedTextureHandle_t, ID3D11Texture2D*>> openedTextures_;
     bool loggedSyncTextureState_ = false;

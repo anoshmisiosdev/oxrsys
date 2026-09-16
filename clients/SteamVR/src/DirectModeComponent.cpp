@@ -362,8 +362,27 @@ void DirectModeComponent::SubmitLayer(const SubmitLayerPerEye_t (&perEye)[2])
 
     if (layersThisFrame_ == 0)
     {
-        submittedEyes_[0] = perEye[0].hTexture;
-        submittedEyes_[1] = perEye[1].hTexture;
+        for (size_t eye = 0; eye < 2; ++eye)
+        {
+            submittedEyes_[eye] = perEye[eye].hTexture;
+            submittedBounds_[eye].uMin = perEye[eye].bounds.uMin;
+            submittedBounds_[eye].vMin = perEye[eye].bounds.vMin;
+            submittedBounds_[eye].uMax = perEye[eye].bounds.uMax;
+            submittedBounds_[eye].vMax = perEye[eye].bounds.vMax;
+        }
+
+        if (!loggedFirstSubmit_)
+        {
+            OXRSYS_LOG("[oxrsys] submitted bounds: left u=[%.3f, %.3f] v=[%.3f, %.3f], right u=[%.3f, %.3f] v=[%.3f, %.3f]",
+                       static_cast<double>(perEye[0].bounds.uMin),
+                       static_cast<double>(perEye[0].bounds.uMax),
+                       static_cast<double>(perEye[0].bounds.vMin),
+                       static_cast<double>(perEye[0].bounds.vMax),
+                       static_cast<double>(perEye[1].bounds.uMin),
+                       static_cast<double>(perEye[1].bounds.uMax),
+                       static_cast<double>(perEye[1].bounds.vMin),
+                       static_cast<double>(perEye[1].bounds.vMax));
+        }
     }
     ++layersThisFrame_;
 
@@ -380,6 +399,8 @@ void DirectModeComponent::Present(vr::SharedTextureHandle_t syncTexture)
 {
     ID3D11Texture2D* leftEye = nullptr;
     ID3D11Texture2D* rightEye = nullptr;
+    UvRect leftBounds;
+    UvRect rightBounds;
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -417,6 +438,8 @@ void DirectModeComponent::Present(vr::SharedTextureHandle_t syncTexture)
 
         leftEye = TextureForHandleLocked(submittedEyes_[0]);
         rightEye = TextureForHandleLocked(submittedEyes_[1]);
+        leftBounds = submittedBounds_[0];
+        rightBounds = submittedBounds_[1];
 
         if (leftEye == nullptr && submittedEyes_[0] != 0 && framesPresented_ <= 5)
         {
@@ -428,7 +451,7 @@ void DirectModeComponent::Present(vr::SharedTextureHandle_t syncTexture)
 
     // Hand the textures over and return. The runtime's frame loop runs on its
     // own thread, so SteamVR's compositor is never made to wait on it.
-    oxrClient_.SetPendingEyes(leftEye, rightEye);
+    oxrClient_.SetPendingEyes(leftEye, leftBounds, rightEye, rightBounds);
 
 }
 

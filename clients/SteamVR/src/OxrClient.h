@@ -4,6 +4,8 @@
 
 #include <windows.h>
 
+#include "TextureBlitter.h"
+
 #include <d3d11.h>
 
 #define XR_USE_PLATFORM_WIN32 1
@@ -76,7 +78,10 @@ public:
     // next frame, and the caller here is SteamVR's compositor render thread:
     // letting it block there makes the whole compositor run at the runtime's
     // mercy, and a runtime that stops pacing stops SteamVR dead.
-    void SetPendingEyes(ID3D11Texture2D* leftEye, ID3D11Texture2D* rightEye);
+    void SetPendingEyes(ID3D11Texture2D* leftEye,
+                        const UvRect& leftBounds,
+                        ID3D11Texture2D* rightEye,
+                        const UvRect& rightBounds);
 
     HeadPose GetHeadPose() const;
 
@@ -106,7 +111,7 @@ private:
     // collects them.
     void PumpEvents();
 
-    bool CopyEye(size_t eye, ID3D11Texture2D* source);
+    bool CopyEye(size_t eye, ID3D11Texture2D* source, const UvRect& sourceBounds);
 
     struct Eye
     {
@@ -147,6 +152,17 @@ private:
     std::thread frameThread_;
     std::mutex pendingMutex_;
     ID3D11Texture2D* pendingEyes_[2] = {nullptr, nullptr};
+    UvRect pendingBounds_[2];
+
+    TextureBlitter blitter_;
+    // Whether to invert V on the way to the runtime.
+    //
+    // Off by default, and that default is measured rather than reasoned about:
+    // a capture of the headset's own composited view shows SteamVR's frames
+    // already arriving the right way up, with the UI text upright. Inverting V
+    // "to convert between texture origins" turned a correct image upside down.
+    // The setting stays so the behaviour can be changed without a rebuild.
+    bool flipVertical_ = false;
 
     mutable std::mutex poseMutex_;
     HeadPose headPose_;
