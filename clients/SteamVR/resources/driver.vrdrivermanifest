@@ -1,0 +1,11 @@
+{
+	"alwaysActivate": true,
+	"name": "oxrsys",
+	"directory": "",
+	"resourceOnly": false,
+
+	"hmd_presence":
+	[
+		"*.*"
+	]
+}

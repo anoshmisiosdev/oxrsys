@@ -72,6 +72,7 @@ This project uses AI-generated code and documentation. We appreciate professiona
 - [iOS Viewer](docs/platforms/ios-viewer.md)
 - [Vision OS](docs/platforms/visionos.md)
 - [Windows Mixed Reality headsets](docs/platforms/wmr.md)
+- [SteamVR driver](docs/steamvr-driver.md)
 - [Testing And Conformance](docs/testing-and-conformance.md)
 - [Licensing](docs/licensing.md)
 - [Scripts](scripts/README.md)

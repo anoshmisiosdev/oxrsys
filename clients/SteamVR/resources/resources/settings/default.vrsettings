@@ -1,0 +1,17 @@
+{
+    "driver_oxrsys": {
+        "enable": true,
+        "loadPriority": 100,
+        "windowX": 0,
+        "windowY": 0,
+        "windowWidth": 3024,
+        "windowHeight": 1680,
+        "renderWidth": 1512,
+        "renderHeight": 1680,
+        "displayFrequency": 72.0,
+        "secondsFromVsyncToPhotons": 0.011,
+        "ipdMeters": 0.063,
+        "tanHalfFovHorizontal": 1.19,
+        "tanHalfFovVertical": 1.19
+    }
+}

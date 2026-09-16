@@ -64,6 +64,7 @@ As of March 17, 2026, the pinned non-interactive OpenXR-CTS baseline is fully gr
 - Core C++ dependencies are fetched via CMake FetchContent; Qt, FFmpeg, Vulkan SDKs, and platform SDKs are system/toolchain dependencies.
 - Product versions are centralized in `config/OXRSysVersion.xcconfig`; do not hardcode
   marketing versions or build numbers in CMake, Xcode, Gradle, or native client code.
+- `clients/SteamVR/` must be cross-compiled with mingw-w64 GCC. It is loaded by Valve's MSVC-built `vrserver.exe`, and `clients/SteamVR/src/OpenVRMsAbi.h` restates the affected OpenVR interfaces with GCC-specific signatures so the two compilers agree on the vtable; see [docs/steamvr-driver.md](docs/steamvr-driver.md).
 - Commit messages must read naturally and must not mention Codex or include `[codex]`.
 - All source code and documentation must be in English
 - Project-owned source code is licensed under MPL-2.0; preserve SPDX headers and keep third-party code under its upstream license.
@@ -142,9 +143,13 @@ oxrsys_runtime/
 │   │   ├── oxrsys-home/
 │   │   ├── oxrsys-simulator/
 │   │   └── oxrsys-visionos/
-│   └── Qt/
-│       ├── apps/
-│       └── libs/
+│   ├── Qt/
+│   │   ├── apps/
+│   │   └── libs/
+│   └── SteamVR/
+│       ├── openvr/
+│       ├── resources/
+│       └── src/
 ├── common/
 │   └── protocol/include/oxrsys/protocol/
 ├── scripts/
