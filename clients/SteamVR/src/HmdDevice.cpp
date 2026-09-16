@@ -5,6 +5,7 @@
 #include "DirectModeComponent.h"
 #include "DriverLog.h"
 
+#include <chrono>
 #include <cstring>
 
 namespace oxrsys
@@ -176,18 +177,59 @@ vr::EVRInitError HmdDevice::Activate(uint32_t unObjectId)
     properties->SetBoolProperty(propertyContainer_, vr::Prop_ContainsProximitySensor_Bool, false);
     properties->SetBoolProperty(propertyContainer_, vr::Prop_DeviceProvidesBatteryStatus_Bool, false);
     properties->SetBoolProperty(propertyContainer_, vr::Prop_HasDriverDirectModeComponent_Bool, true);
-    properties->SetBoolProperty(propertyContainer_, vr::Prop_DriverDirectModeSendsVsyncEvents_Bool, false);
+    properties->SetBoolProperty(propertyContainer_, vr::Prop_DriverDirectModeSendsVsyncEvents_Bool, true);
 
     // SteamVR uses this to decide whether an HMD is present at all; without it
     // some of the start-up paths keep waiting for a display.
     properties->SetBoolProperty(propertyContainer_, vr::Prop_DisplayDebugMode_Bool, false);
 
+    vsyncRunning_.store(true, std::memory_order_release);
+    vsyncThread_ = std::thread([this] { VsyncLoop(); });
+
     return vr::VRInitError_None;
+}
+
+void HmdDevice::VsyncLoop()
+{
+    const float frequency = config_.displayFrequency > 1.0f ? config_.displayFrequency : 72.0f;
+    const auto framePeriod = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>(1.0 / static_cast<double>(frequency)));
+
+    auto nextFrame = std::chrono::steady_clock::now() + framePeriod;
+
+    while (vsyncRunning_.load(std::memory_order_acquire))
+    {
+        std::this_thread::sleep_until(nextFrame);
+        nextFrame += framePeriod;
+
+        // A long stall (start-up, standby) would otherwise leave the schedule
+        // chasing a deadline already in the past for thousands of frames.
+        const auto now = std::chrono::steady_clock::now();
+        if (nextFrame < now)
+        {
+            nextFrame = now + framePeriod;
+        }
+
+        if (vr::VRServerDriverHost() == nullptr)
+        {
+            continue;
+        }
+
+        vr::VRServerDriverHost()->VsyncEvent(0.0);
+        RunFrame();
+    }
 }
 
 void HmdDevice::Deactivate()
 {
     OXRSYS_LOG("[oxrsys] Deactivate");
+
+    vsyncRunning_.store(false, std::memory_order_release);
+    if (vsyncThread_.joinable())
+    {
+        vsyncThread_.join();
+    }
+
     objectId_.store(vr::k_unTrackedDeviceIndexInvalid, std::memory_order_relaxed);
 }
 
@@ -244,6 +286,22 @@ vr::DriverPose_t HmdDevice::BuildPose() const
     pose.deviceIsConnected = true;
     pose.willDriftInYaw = false;
     pose.shouldApplyHeadModel = false;
+
+    // OpenXR and OpenVR agree on handedness and axes, so the runtime's pose in
+    // its LOCAL space maps straight across. Until the runtime has located the
+    // head the identity pose above stands, which keeps the HMD tracked rather
+    // than making SteamVR treat it as lost.
+    const HeadPose head = directModeComponent_->GetHeadPose();
+    if (head.valid)
+    {
+        pose.qRotation.x = head.orientation[0];
+        pose.qRotation.y = head.orientation[1];
+        pose.qRotation.z = head.orientation[2];
+        pose.qRotation.w = head.orientation[3];
+        pose.vecPosition[0] = head.position[0];
+        pose.vecPosition[1] = head.position[1];
+        pose.vecPosition[2] = head.position[2];
+    }
 
     return pose;
 }

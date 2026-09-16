@@ -18,6 +18,22 @@ driver_dir="${out_dir}/oxrsys"
 bin_dir="${driver_dir}/bin/win64"
 
 cxx="${OXRSYS_MINGW_CXX:-x86_64-w64-mingw32-g++}"
+
+# OpenXR headers. The runtime build fetches the SDK with CMake FetchContent, so
+# reuse that checkout when one is present; OXRSYS_OPENXR_INCLUDE overrides it.
+openxr_include="${OXRSYS_OPENXR_INCLUDE:-}"
+if [ -z "${openxr_include}" ]; then
+    for candidate in "${script_dir}"/../../build/*/_deps/openxr-src/include; do
+        if [ -d "${candidate}" ]; then
+            openxr_include="${candidate}"
+            break
+        fi
+    done
+fi
+if [ ! -d "${openxr_include}" ]; then
+    echo "error: OpenXR headers not found; configure the runtime once or set OXRSYS_OPENXR_INCLUDE" >&2
+    exit 1
+fi
 if ! command -v "${cxx}" >/dev/null 2>&1; then
     echo "error: ${cxx} not found; install mingw-w64" >&2
     exit 1
@@ -36,11 +52,13 @@ mkdir -p "${bin_dir}"
     -Wno-unknown-pragmas \
     -fno-rtti \
     -isystem "${script_dir}/openvr" \
+    -isystem "${openxr_include}" \
     -I"${script_dir}/src" \
     "${script_dir}/src/ServerDriver.cpp" \
     "${script_dir}/src/HmdDevice.cpp" \
     "${script_dir}/src/DirectModeComponent.cpp" \
     "${script_dir}/src/DriverLog.cpp" \
+    "${script_dir}/src/OxrClient.cpp" \
     -o "${bin_dir}/driver_oxrsys.dll" \
     -static \
     -ld3d11 \

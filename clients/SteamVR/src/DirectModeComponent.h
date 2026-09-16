@@ -2,6 +2,8 @@
 
 #pragma once
 
+#include "OxrClient.h"
+
 #include <openvr_driver.h>
 
 #include <d3d11.h>
@@ -9,6 +11,7 @@
 #include <array>
 #include <cstdint>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 namespace oxrsys
@@ -40,6 +43,12 @@ public:
     void PostPresent(const Throttling_t* pThrottling) override;
     void GetFrameTiming(vr::DriverDirectMode_FrameTiming* pFrameTiming) override;
 
+    // Head pose from the runtime, for the tracked device to report to SteamVR.
+    HeadPose GetHeadPose() const
+    {
+        return oxrClient_.GetHeadPose();
+    }
+
 private:
     // One set of three textures the compositor rotates through, plus the
     // process it was allocated for so DestroyAllSwapTextureSets can find it.
@@ -58,6 +67,22 @@ private:
 
     void DestroySetLocked(size_t index);
 
+    // Maps a handle SteamVR hands back to the texture this driver created for
+    // it. The driver allocated every direct-mode texture itself, so no
+    // cross-process import is needed to read one.
+    ID3D11Texture2D* TextureForHandleLocked(vr::SharedTextureHandle_t handle) const;
+
+    // Brings the OpenXR session up off the render thread, once. Session
+    // start-up polls for the runtime to become ready, which is not something to
+    // do inside a call SteamVR is timing.
+    void StartOxrClientAsync();
+
+    // Reads one pixel back from a submitted texture. Whether the compositor's
+    // render actually reaches this process is not something the API reports, so
+    // the driver checks rather than assumes: a sample that never changes means
+    // the content path is broken however healthy the frame counters look.
+    void SampleSubmittedPixel(ID3D11Texture2D* source);
+
     std::mutex mutex_;
     ID3D11Device* device_ = nullptr;
     ID3D11DeviceContext* context_ = nullptr;
@@ -65,6 +90,18 @@ private:
     std::vector<SwapTextureSet> textureSets_;
     uint64_t framesPresented_ = 0;
     bool loggedFirstSubmit_ = false;
+
+    OxrClient oxrClient_;
+    std::thread oxrStartThread_;
+    bool oxrStartRequested_ = false;
+    // The first layer of each frame is the scene; later layers are overlays.
+    // Only the scene is forwarded for now, so this records the first and
+    // ignores the rest rather than keeping whatever happened to arrive last.
+    std::array<vr::SharedTextureHandle_t, 2> submittedEyes_ = {};
+    uint32_t layersThisFrame_ = 0;
+    ID3D11Texture2D* pixelSampleStaging_ = nullptr;
+    uint32_t lastSampledPixel_ = 0;
+    bool pixelSampleChanged_ = false;
 };
 
 } // namespace oxrsys

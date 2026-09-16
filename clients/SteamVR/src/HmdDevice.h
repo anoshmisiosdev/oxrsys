@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <thread>
 
 namespace oxrsys
 {
@@ -101,6 +102,16 @@ public:
 private:
     vr::DriverPose_t BuildPose() const;
 
+    // Drives SteamVR's frame scheduler.
+    //
+    // The compositor will not schedule a frame until it knows when the display
+    // refreshes. Under Wine its own GPU timing queries come back disjoint, so
+    // it never works that out for itself; the driver therefore declares
+    // Prop_DriverDirectModeSendsVsyncEvents_Bool and supplies the cadence from
+    // here, which is what every headset that is not a real attached display
+    // has to do anyway.
+    void VsyncLoop();
+
     HmdDisplayConfig config_;
     HmdDisplayComponent displayComponent_;
     std::unique_ptr<DirectModeComponent> directModeComponent_;
@@ -108,6 +119,8 @@ private:
     std::string modelNumber_;
     std::atomic<uint32_t> objectId_{vr::k_unTrackedDeviceIndexInvalid};
     vr::PropertyContainerHandle_t propertyContainer_ = vr::k_ulInvalidPropertyContainer;
+    std::thread vsyncThread_;
+    std::atomic<bool> vsyncRunning_{false};
 };
 
 } // namespace oxrsys

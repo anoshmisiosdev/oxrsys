@@ -6,6 +6,8 @@
 
 #include <dxgi.h>
 
+#include <cstring>
+
 namespace oxrsys
 {
 
@@ -44,11 +46,23 @@ DirectModeComponent::DirectModeComponent() = default;
 
 DirectModeComponent::~DirectModeComponent()
 {
+    if (oxrStartThread_.joinable())
+    {
+        oxrStartThread_.join();
+    }
+    oxrClient_.Stop();
+
     std::lock_guard<std::mutex> lock(mutex_);
 
     for (size_t i = textureSets_.size(); i > 0; --i)
     {
         DestroySetLocked(i - 1);
+    }
+
+    if (pixelSampleStaging_ != nullptr)
+    {
+        pixelSampleStaging_->Release();
+        pixelSampleStaging_ = nullptr;
     }
 
     if (context_ != nullptr)
@@ -273,9 +287,115 @@ void DirectModeComponent::GetNextSwapTextureSetIndex(vr::SharedTextureHandle_t s
     }
 }
 
+ID3D11Texture2D* DirectModeComponent::TextureForHandleLocked(vr::SharedTextureHandle_t handle) const
+{
+    if (handle == 0)
+    {
+        return nullptr;
+    }
+
+    for (const SwapTextureSet& set : textureSets_)
+    {
+        for (size_t i = 0; i < set.handles.size(); ++i)
+        {
+            if (set.handles[i] == handle)
+            {
+                return set.textures[i];
+            }
+        }
+    }
+
+    return nullptr;
+}
+
+void DirectModeComponent::SampleSubmittedPixel(ID3D11Texture2D* source)
+{
+    if (source == nullptr || context_ == nullptr || device_ == nullptr)
+    {
+        return;
+    }
+
+    D3D11_TEXTURE2D_DESC sourceDesc = {};
+    source->GetDesc(&sourceDesc);
+
+    if (pixelSampleStaging_ == nullptr)
+    {
+        D3D11_TEXTURE2D_DESC stagingDesc = {};
+        stagingDesc.Width = 1;
+        stagingDesc.Height = 1;
+        stagingDesc.MipLevels = 1;
+        stagingDesc.ArraySize = 1;
+        stagingDesc.Format = sourceDesc.Format;
+        stagingDesc.SampleDesc.Count = 1;
+        stagingDesc.Usage = D3D11_USAGE_STAGING;
+        stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+
+        const HRESULT hr = device_->CreateTexture2D(&stagingDesc, nullptr, &pixelSampleStaging_);
+        if (FAILED(hr) || pixelSampleStaging_ == nullptr)
+        {
+            OXRSYS_LOG("[oxrsys] content check: staging texture failed: 0x%08lx", static_cast<unsigned long>(hr));
+            return;
+        }
+    }
+
+    D3D11_BOX box = {};
+    box.left = sourceDesc.Width / 2;
+    box.top = sourceDesc.Height / 2;
+    box.front = 0;
+    box.right = box.left + 1;
+    box.bottom = box.top + 1;
+    box.back = 1;
+
+    context_->CopySubresourceRegion(pixelSampleStaging_, 0, 0, 0, 0, source, 0, &box);
+
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    const HRESULT hr = context_->Map(pixelSampleStaging_, 0, D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(hr) || mapped.pData == nullptr)
+    {
+        OXRSYS_LOG("[oxrsys] content check: Map failed: 0x%08lx", static_cast<unsigned long>(hr));
+        return;
+    }
+
+    uint32_t pixel = 0;
+    std::memcpy(&pixel, mapped.pData, sizeof(pixel));
+    context_->Unmap(pixelSampleStaging_, 0);
+
+    if (framesPresented_ > 1 && pixel != lastSampledPixel_)
+    {
+        pixelSampleChanged_ = true;
+    }
+    lastSampledPixel_ = pixel;
+
+    OXRSYS_LOG("[oxrsys] content check: frame %llu centre pixel 0x%08x, changed since start: %s",
+               static_cast<unsigned long long>(framesPresented_),
+               pixel,
+               pixelSampleChanged_ ? "yes" : "no");
+}
+
+void DirectModeComponent::StartOxrClientAsync()
+{
+    if (oxrStartRequested_ || device_ == nullptr)
+    {
+        return;
+    }
+
+    oxrStartRequested_ = true;
+    ID3D11Device* device = device_;
+    ID3D11DeviceContext* context = context_;
+    oxrStartThread_ = std::thread([this, device, context] { oxrClient_.Start(device, context); });
+}
+
 void DirectModeComponent::SubmitLayer(const SubmitLayerPerEye_t (&perEye)[2])
 {
     std::lock_guard<std::mutex> lock(mutex_);
+
+    if (layersThisFrame_ == 0)
+    {
+        submittedEyes_[0] = perEye[0].hTexture;
+        submittedEyes_[1] = perEye[1].hTexture;
+    }
+    ++layersThisFrame_;
+
     if (!loggedFirstSubmit_)
     {
         loggedFirstSubmit_ = true;
@@ -289,11 +409,48 @@ void DirectModeComponent::Present(vr::SharedTextureHandle_t syncTexture)
 {
     (void)syncTexture;
 
-    std::lock_guard<std::mutex> lock(mutex_);
-    ++framesPresented_;
-    if (framesPresented_ == 1 || (framesPresented_ % 600) == 0)
+    ID3D11Texture2D* leftEye = nullptr;
+    ID3D11Texture2D* rightEye = nullptr;
+
     {
-        OXRSYS_LOG("[oxrsys] Present frame %llu", static_cast<unsigned long long>(framesPresented_));
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        ++framesPresented_;
+        if (framesPresented_ <= 5 || (framesPresented_ % 600) == 0)
+        {
+            OXRSYS_LOG("[oxrsys] Present frame %llu, %u layer(s), scene left=0x%llx right=0x%llx",
+                       static_cast<unsigned long long>(framesPresented_),
+                       layersThisFrame_,
+                       static_cast<unsigned long long>(submittedEyes_[0]),
+                       static_cast<unsigned long long>(submittedEyes_[1]));
+        }
+        layersThisFrame_ = 0;
+
+        StartOxrClientAsync();
+
+        leftEye = TextureForHandleLocked(submittedEyes_[0]);
+        rightEye = TextureForHandleLocked(submittedEyes_[1]);
+
+        if (leftEye == nullptr && submittedEyes_[0] != 0 && framesPresented_ <= 5)
+        {
+            OXRSYS_LOG("[oxrsys] submitted handle 0x%llx is not one this driver allocated",
+                       static_cast<unsigned long long>(submittedEyes_[0]));
+        }
+
+        if (framesPresented_ <= 3 || (framesPresented_ % 600) == 0)
+        {
+            SampleSubmittedPixel(leftEye);
+        }
+    }
+
+    // Outside the lock: SubmitFrame blocks on the runtime's frame cadence, and
+    // holding the lock across it would stall SubmitLayer and the texture set
+    // calls that run on other threads.
+    const bool submitted = oxrClient_.SubmitFrame(leftEye, rightEye);
+    if (!submitted && oxrClient_.IsRunning() && framesPresented_ <= 5)
+    {
+        OXRSYS_LOG("[oxrsys] frame %llu was not submitted to the runtime",
+                   static_cast<unsigned long long>(framesPresented_));
     }
 }
 
