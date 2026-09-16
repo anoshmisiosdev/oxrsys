@@ -78,12 +78,6 @@ private:
     // do inside a call SteamVR is timing.
     void StartOxrClientAsync();
 
-    // Reads one pixel back from a submitted texture. Whether the compositor's
-    // render actually reaches this process is not something the API reports, so
-    // the driver checks rather than assumes: a sample that never changes means
-    // the content path is broken however healthy the frame counters look.
-    void SampleSubmittedPixel(ID3D11Texture2D* source);
-
     // Opens a texture belonging to another process's device, caching the
     // result. Used for the sync texture, which the compositor allocates.
     ID3D11Texture2D* OpenSharedTextureLocked(vr::SharedTextureHandle_t handle);
@@ -106,9 +100,6 @@ private:
     uint32_t layersThisFrame_ = 0;
     std::vector<std::pair<vr::SharedTextureHandle_t, ID3D11Texture2D*>> openedTextures_;
     bool loggedSyncTextureState_ = false;
-    ID3D11Texture2D* pixelSampleStaging_ = nullptr;
-    uint32_t lastSampledPixel_ = 0;
-    bool pixelSampleChanged_ = false;
 };
 
 } // namespace oxrsys

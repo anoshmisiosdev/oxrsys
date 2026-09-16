@@ -68,12 +68,6 @@ DirectModeComponent::~DirectModeComponent()
     }
     openedTextures_.clear();
 
-    if (pixelSampleStaging_ != nullptr)
-    {
-        pixelSampleStaging_->Release();
-        pixelSampleStaging_ = nullptr;
-    }
-
     if (context_ != nullptr)
     {
         context_->Release();
@@ -347,81 +341,6 @@ ID3D11Texture2D* DirectModeComponent::OpenSharedTextureLocked(vr::SharedTextureH
 
     openedTextures_.emplace_back(handle, texture);
     return texture;
-}
-
-void DirectModeComponent::SampleSubmittedPixel(ID3D11Texture2D* source)
-{
-    if (source == nullptr || context_ == nullptr || device_ == nullptr)
-    {
-        return;
-    }
-
-    D3D11_TEXTURE2D_DESC sourceDesc = {};
-    source->GetDesc(&sourceDesc);
-
-    if (pixelSampleStaging_ == nullptr)
-    {
-        D3D11_TEXTURE2D_DESC stagingDesc = {};
-        stagingDesc.Width = 64;
-        stagingDesc.Height = 1;
-        stagingDesc.MipLevels = 1;
-        stagingDesc.ArraySize = 1;
-        stagingDesc.Format = sourceDesc.Format;
-        stagingDesc.SampleDesc.Count = 1;
-        stagingDesc.Usage = D3D11_USAGE_STAGING;
-        stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-
-        const HRESULT hr = device_->CreateTexture2D(&stagingDesc, nullptr, &pixelSampleStaging_);
-        if (FAILED(hr) || pixelSampleStaging_ == nullptr)
-        {
-            OXRSYS_LOG("[oxrsys] content check: staging texture failed: 0x%08lx", static_cast<unsigned long>(hr));
-            return;
-        }
-    }
-
-    D3D11_BOX box = {};
-    box.left = sourceDesc.Width / 2 - 32;
-    box.top = sourceDesc.Height / 2;
-    box.front = 0;
-    box.right = box.left + 64;
-    box.bottom = box.top + 1;
-    box.back = 1;
-
-    context_->CopySubresourceRegion(pixelSampleStaging_, 0, 0, 0, 0, source, 0, &box);
-
-    D3D11_MAPPED_SUBRESOURCE mapped = {};
-    const HRESULT hr = context_->Map(pixelSampleStaging_, 0, D3D11_MAP_READ, 0, &mapped);
-    if (FAILED(hr) || mapped.pData == nullptr)
-    {
-        OXRSYS_LOG("[oxrsys] content check: Map failed: 0x%08lx", static_cast<unsigned long>(hr));
-        return;
-    }
-
-    uint32_t texels[64] = {};
-    std::memcpy(texels, mapped.pData, sizeof(texels));
-    context_->Unmap(pixelSampleStaging_, 0);
-
-    uint32_t checksum = 0;
-    bool uniform = true;
-    for (uint32_t texel : texels)
-    {
-        checksum = checksum * 31u + texel;
-        uniform = uniform && texel == texels[0];
-    }
-
-    if (framesPresented_ > 1 && checksum != lastSampledPixel_)
-    {
-        pixelSampleChanged_ = true;
-    }
-    lastSampledPixel_ = checksum;
-
-    OXRSYS_LOG("[oxrsys] content check: frame %llu source handle 0x%llx: centre texel 0x%08x, 64-texel checksum 0x%08x, scanline %s, varied since start: %s",
-               static_cast<unsigned long long>(framesPresented_),
-               static_cast<unsigned long long>(submittedEyes_[0]),
-               texels[32],
-               checksum,
-               uniform ? "uniform" : "VARIED",
-               pixelSampleChanged_ ? "yes" : "no");
 }
 
 void DirectModeComponent::StartOxrClientAsync()
