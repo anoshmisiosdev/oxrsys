@@ -6,6 +6,7 @@
 #include <glm/glm.hpp>
 #include <glm/gtc/quaternion.hpp>
 #include <array>
+#include <atomic>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -139,8 +140,10 @@ private:
     float GetTrackedGraspValue(Hand hand) const;
 
     TrackingReceiver* trackingReceiver_ = nullptr;
-    // Sticky: a streaming client has been attached at least once this session.
-    bool streamingEverAttached_ = false;
+    // Sticky: a streaming client has been attached at least once this session. Written on the
+    // session thread (CheckStreamingConnection) and read wherever pose flags are computed,
+    // which a driver may call from its own pose thread — so keep the access atomic.
+    std::atomic<bool> streamingEverAttached_{false};
 
     // Head state (quaternion from streaming client)
     // LOCAL reference space anchor, captured from the first streamed head pose
