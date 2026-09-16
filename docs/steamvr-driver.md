@@ -117,14 +117,39 @@ Then point SteamVR at it in `Steam/config/steamvr.vrsettings`:
 
 Back up both files first; SteamVR rewrites them.
 
-### The runtime manifest has to be in the environment
+### The runtime manifest, and where it has to be set
 
-The OpenXR loader inside the bridge cannot find the active runtime from a Wine
-process unless `XR_RUNTIME_JSON` is set in the environment SteamVR was started
-with. Without it `xrCreateInstance` returns `XR_ERROR_RUNTIME_UNAVAILABLE`
-(`-51`) and the driver falls back to a tracked HMD with a static pose, saying so
-in the log. `launchctl setenv XR_RUNTIME_JSON ...` only reaches processes
-started afterwards, so CrossOver (and Steam) must be started after it is set.
+The OpenXR loader that resolves the runtime lives on the macOS side of the
+bridge, so it reads the host process environment and needs `XR_RUNTIME_JSON`.
+Without it `xrCreateInstance` returns `XR_ERROR_RUNTIME_UNAVAILABLE` (`-51`) and
+the driver falls back to a tracked HMD with a static pose, logging the resolved
+path (or `<unset>`) next to the error.
+
+Set it for the whole bottle, in `cxbottle.conf`:
+
+```ini
+[EnvironmentVariables]
+"XR_RUNTIME_JSON" = "/path/to/oxrsys-runtime.json"
+```
+
+CrossOver applies that to the host environment of every process in the bottle,
+so `vrserver.exe` inherits it however it was started -- including when Steam
+spawns it for a game launch. Steam has to be restarted once after the change,
+because it passes its own environment to its children.
+
+Two things that look like they should work and do not, both measured:
+
+- **The driver cannot set it itself.** `SetEnvironmentVariableA` writes to Wine's
+  copy of the environment, not the host one the loader reads. A probe that set
+  the variable and then called `xrCreateInstance` still got `-51`.
+- **The loader's file fallbacks do not apply on macOS.**
+  `/etc/xdg/openxr/1/active_runtime.json` and
+  `~/.config/openxr/1/active_runtime.json` can both exist and point at the
+  runtime, and the loader still fails with "failed to determine active runtime
+  file path for this environment". Those search paths are Linux-only.
+
+Exporting the variable before starting Steam works too, but only for that
+launch; the bottle setting is the one that survives.
 
 ## Configuration
 

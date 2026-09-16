@@ -15,6 +15,7 @@
 #include <atomic>
 #include <cstdint>
 #include <mutex>
+#include <string>
 #include <vector>
 
 namespace oxrsys
@@ -127,6 +128,7 @@ private:
     PFN_xrReleaseSwapchainImage releaseSwapchainImage_ = nullptr;
     PFN_xrPollEvent pollEvent_ = nullptr;
 
+    std::string runtimeManifestPath_;
     ID3D11Texture2D* pixelSampleStaging_ = nullptr;
 
     std::atomic<bool> running_{false};

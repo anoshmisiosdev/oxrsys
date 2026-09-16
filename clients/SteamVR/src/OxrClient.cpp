@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <string>
 
 namespace oxrsys
 {
@@ -18,6 +19,32 @@ namespace
 
 constexpr const char* kBridgeModule = "wineopenxr.dll";
 constexpr uint32_t kMaxSwapchainImages = 8;
+
+// Reports the runtime manifest the OpenXR loader will use, or an empty string.
+//
+// The loader that resolves this runs on the macOS side of the bridge, so it
+// reads the host process environment. Wine copies that environment into the
+// Windows one at process start, which is why reading it here is meaningful --
+// but only for reading. SetEnvironmentVariableA writes to Wine's copy alone and
+// does not reach the host loader: a probe that set the variable and then called
+// xrCreateInstance still got XR_ERROR_RUNTIME_UNAVAILABLE. The driver therefore
+// reports the situation rather than pretending it can fix it from in here.
+//
+// On macOS the loader has no working fallback either. Both
+// /etc/xdg/openxr/1/active_runtime.json and ~/.config/openxr/1/active_runtime.json
+// can exist and point at the runtime and the loader still fails with "failed to
+// determine active runtime file path for this environment"; those search paths
+// are Linux-only. XR_RUNTIME_JSON is the only mechanism.
+std::string RuntimeManifestPath()
+{
+    char buffer[1024] = {};
+    const DWORD length = GetEnvironmentVariableA("XR_RUNTIME_JSON", buffer, sizeof(buffer));
+    if (length == 0 || length >= sizeof(buffer))
+    {
+        return {};
+    }
+    return std::string(buffer, length);
+}
 
 } // namespace
 
@@ -30,6 +57,19 @@ OxrClient::~OxrClient()
 
 bool OxrClient::NegotiateBridge()
 {
+    runtimeManifestPath_ = RuntimeManifestPath();
+    if (runtimeManifestPath_.empty())
+    {
+        OXRSYS_LOG("[oxrsys] XR_RUNTIME_JSON is not set in this process; the OpenXR loader on the macOS "
+                   "side has no other way to find the runtime. Set it for the whole bottle by adding "
+                   "\"XR_RUNTIME_JSON\" = \"/path/to/oxrsys-runtime.json\" to [EnvironmentVariables] in "
+                   "the bottle's cxbottle.conf, then restart Steam so vrserver inherits it.");
+    }
+    else
+    {
+        OXRSYS_LOG("[oxrsys] runtime manifest: %s", runtimeManifestPath_.c_str());
+    }
+
     HMODULE bridge = LoadLibraryA(kBridgeModule);
     if (bridge == nullptr)
     {
@@ -90,7 +130,9 @@ bool OxrClient::CreateInstanceAndSystem()
     XrResult result = createInstance(&createInfo, &instance_);
     if (result != XR_SUCCESS)
     {
-        OXRSYS_LOG("[oxrsys] xrCreateInstance failed: %d", static_cast<int>(result));
+        OXRSYS_LOG("[oxrsys] xrCreateInstance failed: %d (XR_RUNTIME_JSON=%s)",
+                   static_cast<int>(result),
+                   runtimeManifestPath_.empty() ? "<unset>" : runtimeManifestPath_.c_str());
         instance_ = XR_NULL_HANDLE;
         return false;
     }
