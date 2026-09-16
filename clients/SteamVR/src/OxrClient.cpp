@@ -641,13 +641,18 @@ void OxrClient::FrameLoop()
         if (locateSpace_ != nullptr)
         {
             XrSpaceLocation location = {XR_TYPE_SPACE_LOCATION};
-            if (locateSpace_(viewSpace_, localSpace_, frameState.predictedDisplayTime, &location) == XR_SUCCESS)
+            const XrResult located = locateSpace_(viewSpace_, localSpace_, frameState.predictedDisplayTime, &location);
+            if (located == XR_SUCCESS)
             {
-                const XrSpaceLocationFlags required =
-                    XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT;
+                // Take orientation and position independently. Requiring both
+                // bits together means one missing flag silently downgrades the
+                // whole pose to identity, which reads as a headset that renders
+                // but never moves.
+                const bool hasOrientation = (location.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) != 0;
+                const bool hasPosition = (location.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) != 0;
 
                 HeadPose pose;
-                pose.valid = (location.locationFlags & required) == required;
+                pose.valid = hasOrientation || hasPosition;
                 pose.orientation[0] = location.pose.orientation.x;
                 pose.orientation[1] = location.pose.orientation.y;
                 pose.orientation[2] = location.pose.orientation.z;
@@ -656,9 +661,41 @@ void OxrClient::FrameLoop()
                 pose.position[1] = location.pose.position.y;
                 pose.position[2] = location.pose.position.z;
 
+                if ((framesSubmitted_ % 180) == 0)
+                {
+                    OXRSYS_LOG("[oxrsys] view[0] pose: flags=0x%x pos=(%.3f, %.3f, %.3f) rot=(%.3f, %.3f, %.3f, %.3f)",
+                               static_cast<unsigned>(viewState.viewStateFlags),
+                               static_cast<double>(views[0].pose.position.x),
+                               static_cast<double>(views[0].pose.position.y),
+                               static_cast<double>(views[0].pose.position.z),
+                               static_cast<double>(views[0].pose.orientation.x),
+                               static_cast<double>(views[0].pose.orientation.y),
+                               static_cast<double>(views[0].pose.orientation.z),
+                               static_cast<double>(views[0].pose.orientation.w));
+
+                    OXRSYS_LOG("[oxrsys] head pose: flags=0x%llx pos=(%.3f, %.3f, %.3f) rot=(%.3f, %.3f, %.3f, %.3f)%s",
+                               static_cast<unsigned long long>(location.locationFlags),
+                               static_cast<double>(pose.position[0]),
+                               static_cast<double>(pose.position[1]),
+                               static_cast<double>(pose.position[2]),
+                               static_cast<double>(pose.orientation[0]),
+                               static_cast<double>(pose.orientation[1]),
+                               static_cast<double>(pose.orientation[2]),
+                               static_cast<double>(pose.orientation[3]),
+                               pose.valid ? "" : "  [REJECTED: no valid bits]");
+                }
+
                 std::lock_guard<std::mutex> lock(poseMutex_);
                 headPose_ = pose;
             }
+            else if ((framesSubmitted_ % 720) == 0)
+            {
+                OXRSYS_LOG("[oxrsys] xrLocateSpace failed: %d", static_cast<int>(located));
+            }
+        }
+        else if (framesSubmitted_ == 0)
+        {
+            OXRSYS_LOG("[oxrsys] no xrLocateSpace entry point; the HMD cannot report head movement");
         }
 
         ID3D11Texture2D* sources[2] = {nullptr, nullptr};
