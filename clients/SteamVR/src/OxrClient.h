@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace oxrsys
@@ -68,10 +69,14 @@ public:
         return swapchainFormat_;
     }
 
-    // Waits for the runtime's frame cadence, locates the head, copies the two
-    // submitted eye textures into the runtime's swapchains and ends the frame.
-    // Returns false if the frame could not be submitted.
-    bool SubmitFrame(ID3D11Texture2D* leftEye, ID3D11Texture2D* rightEye);
+    // Hands over the latest pair of eye textures and returns immediately.
+    //
+    // The frame loop runs on a thread of its own rather than on whichever
+    // thread calls this. xrWaitFrame blocks until the runtime is ready for the
+    // next frame, and the caller here is SteamVR's compositor render thread:
+    // letting it block there makes the whole compositor run at the runtime's
+    // mercy, and a runtime that stops pacing stops SteamVR dead.
+    void SetPendingEyes(ID3D11Texture2D* leftEye, ID3D11Texture2D* rightEye);
 
     HeadPose GetHeadPose() const;
 
@@ -92,6 +97,15 @@ private:
     bool CreateSessionAndSwapchains(ID3D11Device* device);
     bool WaitForSessionReady();
     void LoadFrameFunctions();
+    void FrameLoop();
+
+    // Drains the runtime's event queue. An OpenXR application has to do this
+    // every frame, not just while waiting to reach READY: the session advances
+    // through SYNCHRONIZED, VISIBLE and FOCUSED by way of these events, and a
+    // runtime is entitled to stop pacing frames for an application that never
+    // collects them.
+    void PumpEvents();
+
     bool CopyEye(size_t eye, ID3D11Texture2D* source);
 
     // Reads a scanline back out of the runtime's swapchain image after the
@@ -134,6 +148,11 @@ private:
     std::atomic<bool> running_{false};
     bool startFailed_ = false;
     uint64_t framesSubmitted_ = 0;
+    XrSessionState sessionState_ = XR_SESSION_STATE_UNKNOWN;
+
+    std::thread frameThread_;
+    std::mutex pendingMutex_;
+    ID3D11Texture2D* pendingEyes_[2] = {nullptr, nullptr};
 
     mutable std::mutex poseMutex_;
     HeadPose headPose_;

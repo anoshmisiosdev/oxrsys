@@ -100,7 +100,12 @@ void ServerDriver::RunFrame()
 
 bool ServerDriver::ShouldBlockStandbyMode()
 {
-    return false;
+    // SteamVR decides the headset is not being worn from a proximity sensor.
+    // This one has none, so it probes /user/head/proximity, gets nothing, and
+    // parks the compositor in standby a few seconds after start-up -- which
+    // stops Present and strands whatever application is running. Blocking
+    // standby is what this entry point is for.
+    return true;
 }
 
 void ServerDriver::EnterStandby()

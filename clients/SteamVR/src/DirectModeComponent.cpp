@@ -461,58 +461,27 @@ void DirectModeComponent::Present(vr::SharedTextureHandle_t syncTexture)
 {
     ID3D11Texture2D* leftEye = nullptr;
     ID3D11Texture2D* rightEye = nullptr;
-    IDXGIKeyedMutex* syncMutex = nullptr;
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
 
-        // The compositor signals that a frame is finished by handing over a
-        // sync texture and waiting for the driver to take its keyed mutex.
-        // Skipping that leaves it logging "WaitForAcquire timed out; rendering
-        // the next frame before the driver took the sync texture" and running
-        // its pipeline unsynchronised.
         if (!loggedSyncTextureState_ && framesPresented_ == 0)
         {
             OXRSYS_LOG("[oxrsys] Present sync texture handle: 0x%llx",
                        static_cast<unsigned long long>(syncTexture));
         }
 
-        ID3D11Texture2D* sync = OpenSharedTextureLocked(syncTexture);
-        if (sync != nullptr)
-        {
-            if (SUCCEEDED(sync->QueryInterface(__uuidof(IDXGIKeyedMutex), reinterpret_cast<void**>(&syncMutex))) &&
-                syncMutex != nullptr)
-            {
-                const HRESULT hr = syncMutex->AcquireSync(0, 10);
-                if (FAILED(hr))
-                {
-                    if (!loggedSyncTextureState_)
-                    {
-                        loggedSyncTextureState_ = true;
-                        OXRSYS_LOG("[oxrsys] sync texture AcquireSync failed: 0x%08lx", static_cast<unsigned long>(hr));
-                    }
-                    syncMutex->Release();
-                    syncMutex = nullptr;
-                }
-                else if (!loggedSyncTextureState_)
-                {
-                    loggedSyncTextureState_ = true;
-                    OXRSYS_LOG("[oxrsys] sync texture acquired via keyed mutex");
-                }
-            }
-            else if (!loggedSyncTextureState_)
-            {
-                loggedSyncTextureState_ = true;
-                OXRSYS_LOG("[oxrsys] sync texture 0x%llx has no keyed mutex",
-                           static_cast<unsigned long long>(syncTexture));
-            }
-        }
-        else if (!loggedSyncTextureState_ && syncTexture != 0)
-        {
-            loggedSyncTextureState_ = true;
-            OXRSYS_LOG("[oxrsys] sync texture 0x%llx could not be opened",
-                       static_cast<unsigned long long>(syncTexture));
-        }
+        // The sync texture is deliberately not taken.
+        //
+        // Holding its keyed mutex across the handover is the documented
+        // contract, but doing so stopped the compositor dead after five
+        // presents: before this driver took the mutex it sustained thousands,
+        // after it took the mutex it stopped every time. Releasing on key 0
+        // evidently does not hand it back in a state the compositor can
+        // re-acquire under DXMT. Frames matter more than the handshake, so the
+        // driver leaves the mutex alone; the cost is that a frame can be read
+        // while the compositor is still writing it.
+        (void)syncTexture;
 
         ++framesPresented_;
         if (framesPresented_ <= 5 || (framesPresented_ % 600) == 0)
@@ -536,28 +505,12 @@ void DirectModeComponent::Present(vr::SharedTextureHandle_t syncTexture)
                        static_cast<unsigned long long>(submittedEyes_[0]));
         }
 
-        if (framesPresented_ <= 3 || (framesPresented_ % 72) == 0)
-        {
-            SampleSubmittedPixel(leftEye);
-        }
     }
 
-    // Outside the lock: SubmitFrame blocks on the runtime's frame cadence, and
-    // holding the lock across it would stall SubmitLayer and the texture set
-    // calls that run on other threads.
-    const bool submitted = oxrClient_.SubmitFrame(leftEye, rightEye);
+    // Hand the textures over and return. The runtime's frame loop runs on its
+    // own thread, so SteamVR's compositor is never made to wait on it.
+    oxrClient_.SetPendingEyes(leftEye, rightEye);
 
-    if (syncMutex != nullptr)
-    {
-        syncMutex->ReleaseSync(0);
-        syncMutex->Release();
-    }
-
-    if (!submitted && oxrClient_.IsRunning() && framesPresented_ <= 5)
-    {
-        OXRSYS_LOG("[oxrsys] frame %llu was not submitted to the runtime",
-                   static_cast<unsigned long long>(framesPresented_));
-    }
 }
 
 void DirectModeComponent::PostPresent(const Throttling_t* pThrottling)

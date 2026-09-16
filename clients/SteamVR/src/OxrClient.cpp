@@ -376,6 +376,8 @@ bool OxrClient::Start(ID3D11Device* device, ID3D11DeviceContext* context)
     }
 
     running_.store(true, std::memory_order_release);
+    frameThread_ = std::thread([this] { FrameLoop(); });
+
     OXRSYS_LOG("[oxrsys] OpenXR client running; frames now go to the runtime");
     return true;
 }
@@ -383,6 +385,11 @@ bool OxrClient::Start(ID3D11Device* device, ID3D11DeviceContext* context)
 void OxrClient::Stop()
 {
     running_.store(false, std::memory_order_release);
+
+    if (frameThread_.joinable())
+    {
+        frameThread_.join();
+    }
 
     if (instance_ == XR_NULL_HANDLE)
     {
@@ -556,98 +563,157 @@ bool OxrClient::CopyEye(size_t eye, ID3D11Texture2D* source)
     return releaseSwapchainImage_(target.swapchain, &releaseInfo) == XR_SUCCESS;
 }
 
-bool OxrClient::SubmitFrame(ID3D11Texture2D* leftEye, ID3D11Texture2D* rightEye)
+void OxrClient::SetPendingEyes(ID3D11Texture2D* leftEye, ID3D11Texture2D* rightEye)
 {
-    if (!running_.load(std::memory_order_acquire))
+    std::lock_guard<std::mutex> lock(pendingMutex_);
+    pendingEyes_[0] = leftEye;
+    pendingEyes_[1] = rightEye;
+}
+
+void OxrClient::PumpEvents()
+{
+    if (pollEvent_ == nullptr)
     {
-        return false;
+        return;
     }
 
-    XrFrameState frameState = {XR_TYPE_FRAME_STATE};
-    XrFrameWaitInfo frameWaitInfo = {XR_TYPE_FRAME_WAIT_INFO};
-    if (waitFrame_(session_, &frameWaitInfo, &frameState) != XR_SUCCESS)
+    XrEventDataBuffer event = {XR_TYPE_EVENT_DATA_BUFFER};
+    while (pollEvent_(instance_, &event) == XR_SUCCESS)
     {
-        return false;
-    }
-
-    XrFrameBeginInfo frameBeginInfo = {XR_TYPE_FRAME_BEGIN_INFO};
-    beginFrame_(session_, &frameBeginInfo);
-
-    XrViewLocateInfo viewLocateInfo = {XR_TYPE_VIEW_LOCATE_INFO};
-    viewLocateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
-    viewLocateInfo.displayTime = frameState.predictedDisplayTime;
-    viewLocateInfo.space = localSpace_;
-
-    XrViewState viewState = {XR_TYPE_VIEW_STATE};
-    XrView views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
-    uint32_t viewCount = 0;
-    locateViews_(session_, &viewLocateInfo, &viewState, 2, &viewCount, views);
-
-    if (locateSpace_ != nullptr)
-    {
-        XrSpaceLocation location = {XR_TYPE_SPACE_LOCATION};
-        if (locateSpace_(viewSpace_, localSpace_, frameState.predictedDisplayTime, &location) == XR_SUCCESS)
+        if (event.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED)
         {
-            const XrSpaceLocationFlags required =
-                XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT;
+            const XrSessionState state = reinterpret_cast<XrEventDataSessionStateChanged*>(&event)->state;
+            if (state != sessionState_)
+            {
+                sessionState_ = state;
+                OXRSYS_LOG("[oxrsys] session state -> %d", static_cast<int>(state));
+            }
 
-            HeadPose pose;
-            pose.valid = (location.locationFlags & required) == required;
-            pose.orientation[0] = location.pose.orientation.x;
-            pose.orientation[1] = location.pose.orientation.y;
-            pose.orientation[2] = location.pose.orientation.z;
-            pose.orientation[3] = location.pose.orientation.w;
-            pose.position[0] = location.pose.position.x;
-            pose.position[1] = location.pose.position.y;
-            pose.position[2] = location.pose.position.z;
+            if (state == XR_SESSION_STATE_STOPPING || state == XR_SESSION_STATE_EXITING ||
+                state == XR_SESSION_STATE_LOSS_PENDING)
+            {
+                running_.store(false, std::memory_order_release);
+            }
+        }
+        else if (event.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING)
+        {
+            OXRSYS_LOG("[oxrsys] runtime is going away");
+            running_.store(false, std::memory_order_release);
+        }
 
-            std::lock_guard<std::mutex> lock(poseMutex_);
-            headPose_ = pose;
+        event = {XR_TYPE_EVENT_DATA_BUFFER};
+    }
+}
+
+void OxrClient::FrameLoop()
+{
+    while (running_.load(std::memory_order_acquire))
+    {
+        PumpEvents();
+
+        if (!running_.load(std::memory_order_acquire))
+        {
+            break;
+        }
+
+        XrFrameState frameState = {XR_TYPE_FRAME_STATE};
+        XrFrameWaitInfo frameWaitInfo = {XR_TYPE_FRAME_WAIT_INFO};
+        if (waitFrame_(session_, &frameWaitInfo, &frameState) != XR_SUCCESS)
+        {
+            OXRSYS_LOG("[oxrsys] xrWaitFrame failed; stopping the frame loop");
+            running_.store(false, std::memory_order_release);
+            break;
+        }
+
+        XrFrameBeginInfo frameBeginInfo = {XR_TYPE_FRAME_BEGIN_INFO};
+        beginFrame_(session_, &frameBeginInfo);
+
+        XrViewLocateInfo viewLocateInfo = {XR_TYPE_VIEW_LOCATE_INFO};
+        viewLocateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+        viewLocateInfo.displayTime = frameState.predictedDisplayTime;
+        viewLocateInfo.space = localSpace_;
+
+        XrViewState viewState = {XR_TYPE_VIEW_STATE};
+        XrView views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+        uint32_t viewCount = 0;
+        locateViews_(session_, &viewLocateInfo, &viewState, 2, &viewCount, views);
+
+        if (locateSpace_ != nullptr)
+        {
+            XrSpaceLocation location = {XR_TYPE_SPACE_LOCATION};
+            if (locateSpace_(viewSpace_, localSpace_, frameState.predictedDisplayTime, &location) == XR_SUCCESS)
+            {
+                const XrSpaceLocationFlags required =
+                    XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT;
+
+                HeadPose pose;
+                pose.valid = (location.locationFlags & required) == required;
+                pose.orientation[0] = location.pose.orientation.x;
+                pose.orientation[1] = location.pose.orientation.y;
+                pose.orientation[2] = location.pose.orientation.z;
+                pose.orientation[3] = location.pose.orientation.w;
+                pose.position[0] = location.pose.position.x;
+                pose.position[1] = location.pose.position.y;
+                pose.position[2] = location.pose.position.z;
+
+                std::lock_guard<std::mutex> lock(poseMutex_);
+                headPose_ = pose;
+            }
+        }
+
+        ID3D11Texture2D* sources[2] = {nullptr, nullptr};
+        {
+            std::lock_guard<std::mutex> lock(pendingMutex_);
+            sources[0] = pendingEyes_[0];
+            sources[1] = pendingEyes_[1];
+        }
+
+        XrCompositionLayerProjectionView projectionViews[2] = {};
+        for (size_t eye = 0; eye < eyes_.size(); ++eye)
+        {
+            CopyEye(eye, sources[eye]);
+
+            projectionViews[eye] = {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
+            projectionViews[eye].pose = views[eye].pose;
+            projectionViews[eye].fov = views[eye].fov;
+            projectionViews[eye].subImage.swapchain = eyes_[eye].swapchain;
+            projectionViews[eye].subImage.imageRect.extent.width = static_cast<int32_t>(eyes_[eye].width);
+            projectionViews[eye].subImage.imageRect.extent.height = static_cast<int32_t>(eyes_[eye].height);
+        }
+
+        XrCompositionLayerProjection layer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+        layer.space = localSpace_;
+        layer.viewCount = 2;
+        layer.views = projectionViews;
+
+        const XrCompositionLayerBaseHeader* layers[] = {reinterpret_cast<const XrCompositionLayerBaseHeader*>(&layer)};
+
+        XrFrameEndInfo frameEndInfo = {XR_TYPE_FRAME_END_INFO};
+        frameEndInfo.displayTime = frameState.predictedDisplayTime;
+        frameEndInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+        // Always submit the layer, even when the runtime says shouldRender is
+        // false. Honouring it looked correct and stopped the encoder: with no
+        // layer there is nothing to encode, the video channel stays silent and
+        // the headset sits on "waiting for video" while every other channel
+        // looks healthy. A frame that is merely stale is better than no frame.
+        frameEndInfo.layerCount = 1;
+        frameEndInfo.layers = layers;
+
+        const XrResult result = endFrame_(session_, &frameEndInfo);
+        if (result != XR_SUCCESS)
+        {
+            OXRSYS_LOG("[oxrsys] xrEndFrame failed: %d", static_cast<int>(result));
+        }
+
+        ++framesSubmitted_;
+        if (framesSubmitted_ <= 5 || (framesSubmitted_ % 720) == 0)
+        {
+            OXRSYS_LOG("[oxrsys] %llu frames submitted to the runtime",
+                       static_cast<unsigned long long>(framesSubmitted_));
         }
     }
 
-    XrCompositionLayerProjectionView projectionViews[2] = {};
-    ID3D11Texture2D* sources[2] = {leftEye, rightEye};
-
-    for (size_t eye = 0; eye < eyes_.size(); ++eye)
-    {
-        CopyEye(eye, sources[eye]);
-
-        projectionViews[eye] = {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
-        projectionViews[eye].pose = views[eye].pose;
-        projectionViews[eye].fov = views[eye].fov;
-        projectionViews[eye].subImage.swapchain = eyes_[eye].swapchain;
-        projectionViews[eye].subImage.imageRect.extent.width = static_cast<int32_t>(eyes_[eye].width);
-        projectionViews[eye].subImage.imageRect.extent.height = static_cast<int32_t>(eyes_[eye].height);
-    }
-
-    XrCompositionLayerProjection layer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
-    layer.space = localSpace_;
-    layer.viewCount = 2;
-    layer.views = projectionViews;
-
-    const XrCompositionLayerBaseHeader* layers[] = {reinterpret_cast<const XrCompositionLayerBaseHeader*>(&layer)};
-
-    XrFrameEndInfo frameEndInfo = {XR_TYPE_FRAME_END_INFO};
-    frameEndInfo.displayTime = frameState.predictedDisplayTime;
-    frameEndInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-    frameEndInfo.layerCount = 1;
-    frameEndInfo.layers = layers;
-
-    const XrResult result = endFrame_(session_, &frameEndInfo);
-    if (result != XR_SUCCESS)
-    {
-        OXRSYS_LOG("[oxrsys] xrEndFrame failed: %d", static_cast<int>(result));
-        return false;
-    }
-
-    ++framesSubmitted_;
-    if (framesSubmitted_ <= 5 || (framesSubmitted_ % 720) == 0)
-    {
-        OXRSYS_LOG("[oxrsys] %llu frames submitted to the runtime", static_cast<unsigned long long>(framesSubmitted_));
-    }
-
-    return true;
+    OXRSYS_LOG("[oxrsys] frame loop ended after %llu frames", static_cast<unsigned long long>(framesSubmitted_));
 }
 
 HeadPose OxrClient::GetHeadPose() const
