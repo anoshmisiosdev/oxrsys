@@ -4,8 +4,12 @@
 
 #include <openvr_driver.h>
 
+#include <d3d11.h>
+
+#include <array>
 #include <cstdint>
 #include <mutex>
+#include <vector>
 
 namespace oxrsys
 {
@@ -13,11 +17,11 @@ namespace oxrsys
 // Direct-mode presentation.
 //
 // With this component present the SteamVR compositor stops owning a swapchain
-// of its own: it asks the driver to allocate the shared textures applications
-// render into, then hands those textures back once per frame through
-// SubmitLayer/Present. That is what lets frames reach OXRSys without going
-// through a desktop DXGI present, which is the step that stalls when the
-// compositor runs under Wine.
+// of its own: it asks the driver to allocate the shared textures it and the
+// running application render into, then hands those textures back once per
+// frame through SubmitLayer/Present. That is what lets frames reach OXRSys
+// without going through a desktop DXGI present, which is the step that stalls
+// when the compositor runs under Wine.
 //
 // None of the methods return a class in memory, so this interface can be
 // derived from the upstream declaration directly.
@@ -37,9 +41,29 @@ public:
     void GetFrameTiming(vr::DriverDirectMode_FrameTiming* pFrameTiming) override;
 
 private:
+    // One set of three textures the compositor rotates through, plus the
+    // process it was allocated for so DestroyAllSwapTextureSets can find it.
+    struct SwapTextureSet
+    {
+        uint32_t pid = 0;
+        uint32_t nextIndex = 0;
+        std::array<ID3D11Texture2D*, 3> textures = {};
+        std::array<vr::SharedTextureHandle_t, 3> handles = {};
+    };
+
+    // Creates the D3D11 device the shared textures are allocated on, once.
+    // Returns false and logs if the device cannot be created; callers then hand
+    // SteamVR an empty set, which fails start-up cleanly instead of crashing.
+    bool EnsureDeviceLocked();
+
+    void DestroySetLocked(size_t index);
+
     std::mutex mutex_;
+    ID3D11Device* device_ = nullptr;
+    ID3D11DeviceContext* context_ = nullptr;
+    bool deviceInitFailed_ = false;
+    std::vector<SwapTextureSet> textureSets_;
     uint64_t framesPresented_ = 0;
-    uint32_t swapTextureSetsRequested_ = 0;
     bool loggedFirstSubmit_ = false;
 };
 

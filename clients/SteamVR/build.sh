@@ -43,6 +43,8 @@ mkdir -p "${bin_dir}"
     "${script_dir}/src/DriverLog.cpp" \
     -o "${bin_dir}/driver_oxrsys.dll" \
     -static \
+    -ld3d11 \
+    -ldxgi \
     -Wl,--enable-stdcall-fixup
 
 cp -R "${script_dir}/resources/." "${driver_dir}/"
