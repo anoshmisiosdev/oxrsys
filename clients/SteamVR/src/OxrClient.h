@@ -93,6 +93,11 @@ private:
     void LoadFrameFunctions();
     bool CopyEye(size_t eye, ID3D11Texture2D* source);
 
+    // Reads a scanline back out of the runtime's swapchain image after the
+    // copy, so the texels actually handed to OXRSys can be compared with the
+    // ones SteamVR rendered rather than assumed equal to them.
+    void SampleRuntimeImage(ID3D11Texture2D* image);
+
     struct Eye
     {
         XrSwapchain swapchain = XR_NULL_HANDLE;
@@ -121,6 +126,8 @@ private:
     PFN_xrWaitSwapchainImage waitSwapchainImage_ = nullptr;
     PFN_xrReleaseSwapchainImage releaseSwapchainImage_ = nullptr;
     PFN_xrPollEvent pollEvent_ = nullptr;
+
+    ID3D11Texture2D* pixelSampleStaging_ = nullptr;
 
     std::atomic<bool> running_{false};
     bool startFailed_ = false;

@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <mutex>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace oxrsys
@@ -83,6 +84,10 @@ private:
     // the content path is broken however healthy the frame counters look.
     void SampleSubmittedPixel(ID3D11Texture2D* source);
 
+    // Opens a texture belonging to another process's device, caching the
+    // result. Used for the sync texture, which the compositor allocates.
+    ID3D11Texture2D* OpenSharedTextureLocked(vr::SharedTextureHandle_t handle);
+
     std::mutex mutex_;
     ID3D11Device* device_ = nullptr;
     ID3D11DeviceContext* context_ = nullptr;
@@ -99,6 +104,8 @@ private:
     // ignores the rest rather than keeping whatever happened to arrive last.
     std::array<vr::SharedTextureHandle_t, 2> submittedEyes_ = {};
     uint32_t layersThisFrame_ = 0;
+    std::vector<std::pair<vr::SharedTextureHandle_t, ID3D11Texture2D*>> openedTextures_;
+    bool loggedSyncTextureState_ = false;
     ID3D11Texture2D* pixelSampleStaging_ = nullptr;
     uint32_t lastSampledPixel_ = 0;
     bool pixelSampleChanged_ = false;

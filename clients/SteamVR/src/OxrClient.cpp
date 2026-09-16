@@ -347,6 +347,12 @@ void OxrClient::Stop()
         return;
     }
 
+    if (pixelSampleStaging_ != nullptr)
+    {
+        pixelSampleStaging_->Release();
+        pixelSampleStaging_ = nullptr;
+    }
+
     for (Eye& eye : eyes_)
     {
         if (eye.swapchain != XR_NULL_HANDLE)
@@ -389,6 +395,82 @@ void OxrClient::Stop()
     instance_ = XR_NULL_HANDLE;
 }
 
+void OxrClient::SampleRuntimeImage(ID3D11Texture2D* image)
+{
+    if (image == nullptr || context_ == nullptr)
+    {
+        return;
+    }
+
+    D3D11_TEXTURE2D_DESC imageDesc = {};
+    image->GetDesc(&imageDesc);
+
+    if (pixelSampleStaging_ == nullptr)
+    {
+        ID3D11Device* device = nullptr;
+        image->GetDevice(&device);
+        if (device == nullptr)
+        {
+            return;
+        }
+
+        D3D11_TEXTURE2D_DESC stagingDesc = {};
+        stagingDesc.Width = 64;
+        stagingDesc.Height = 1;
+        stagingDesc.MipLevels = 1;
+        stagingDesc.ArraySize = 1;
+        stagingDesc.Format = imageDesc.Format;
+        stagingDesc.SampleDesc.Count = 1;
+        stagingDesc.Usage = D3D11_USAGE_STAGING;
+        stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+
+        const HRESULT hr = device->CreateTexture2D(&stagingDesc, nullptr, &pixelSampleStaging_);
+        device->Release();
+
+        if (FAILED(hr) || pixelSampleStaging_ == nullptr)
+        {
+            OXRSYS_LOG("[oxrsys] runtime image check: staging texture failed: 0x%08lx", static_cast<unsigned long>(hr));
+            return;
+        }
+    }
+
+    D3D11_BOX box = {};
+    box.left = imageDesc.Width / 2 - 32;
+    box.top = imageDesc.Height / 2;
+    box.front = 0;
+    box.right = box.left + 64;
+    box.bottom = box.top + 1;
+    box.back = 1;
+
+    context_->CopySubresourceRegion(pixelSampleStaging_, 0, 0, 0, 0, image, 0, &box);
+
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    const HRESULT hr = context_->Map(pixelSampleStaging_, 0, D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(hr) || mapped.pData == nullptr)
+    {
+        OXRSYS_LOG("[oxrsys] runtime image check: Map failed: 0x%08lx", static_cast<unsigned long>(hr));
+        return;
+    }
+
+    uint32_t texels[64] = {};
+    std::memcpy(texels, mapped.pData, sizeof(texels));
+    context_->Unmap(pixelSampleStaging_, 0);
+
+    uint32_t checksum = 0;
+    bool uniform = true;
+    for (uint32_t texel : texels)
+    {
+        checksum = checksum * 31u + texel;
+        uniform = uniform && texel == texels[0];
+    }
+
+    OXRSYS_LOG("[oxrsys] runtime image check: frame %llu handed to OXRSys: centre texel 0x%08x, 64-texel checksum 0x%08x, scanline %s",
+               static_cast<unsigned long long>(framesSubmitted_),
+               texels[32],
+               checksum,
+               uniform ? "uniform" : "VARIED");
+}
+
 bool OxrClient::CopyEye(size_t eye, ID3D11Texture2D* source)
 {
     Eye& target = eyes_[eye];
@@ -421,6 +503,11 @@ bool OxrClient::CopyEye(size_t eye, ID3D11Texture2D* source)
         box.back = 1;
 
         context_->CopySubresourceRegion(target.images[imageIndex], 0, 0, 0, 0, source, 0, &box);
+
+        if (eye == 0 && (framesSubmitted_ % 72) == 0)
+        {
+            SampleRuntimeImage(target.images[imageIndex]);
+        }
     }
 
     XrSwapchainImageReleaseInfo releaseInfo = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};

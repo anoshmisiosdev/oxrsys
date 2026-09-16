@@ -57,6 +57,31 @@ MSVC expects. Everything else derives from `<openvr_driver.h>` unchanged.
 This is why `build.sh` insists on mingw-w64: building the driver with a different compiler
 means revisiting that header.
 
+## Frames and poses
+
+The driver is itself an OpenXR application. Rather than reimplementing encode,
+streaming and tracking on the driver side, it opens a session on OXRSys through
+the wineopenxr bridge from inside `vrserver.exe` and lets the runtime do what it
+already does for any other application.
+
+It negotiates `wineopenxr.dll` directly instead of going through an OpenXR
+loader: the driver knows which runtime it wants, and that avoids depending on
+the bottle's `ActiveRuntime` registry key. The session binds the same D3D11
+device the direct-mode swap textures are allocated on, so handing a frame over
+is a `CopySubresourceRegion` between two textures on one device, with no
+cross-process import. The head pose the HMD reports to SteamVR comes from
+`xrLocateSpace` on the runtime's VIEW space.
+
+### Vsync
+
+The compositor will not schedule a frame until it knows when the display
+refreshes. Under Wine its own GPU timing queries come back disjoint
+(`Aborting GetDeltas(CompositorPresent) disjoint!`), so it never works that out
+for itself and presents a handful of frames and stops. The driver therefore
+declares `Prop_DriverDirectModeSendsVsyncEvents_Bool` and drives the cadence
+from a thread of its own, which is what any headset that is not a real attached
+display has to do anyway.
+
 ## Build
 
 ```bash
@@ -92,6 +117,15 @@ Then point SteamVR at it in `Steam/config/steamvr.vrsettings`:
 
 Back up both files first; SteamVR rewrites them.
 
+### The runtime manifest has to be in the environment
+
+The OpenXR loader inside the bridge cannot find the active runtime from a Wine
+process unless `XR_RUNTIME_JSON` is set in the environment SteamVR was started
+with. Without it `xrCreateInstance` returns `XR_ERROR_RUNTIME_UNAVAILABLE`
+(`-51`) and the driver falls back to a tracked HMD with a static pose, saying so
+in the log. `launchctl setenv XR_RUNTIME_JSON ...` only reaches processes
+started afterwards, so CrossOver (and Steam) must be started after it is set.
+
 ## Configuration
 
 Display geometry and timing come from the `driver_oxrsys` section of
@@ -112,18 +146,68 @@ initialisation are still visible.
 
 ## Status
 
+Verified with SteamVR 2.17.9 in a CrossOver bottle, this driver supplying the
+HMD and the null driver disabled.
+
 - **Loads and owns the HMD.** `vrserver.txt` reports
   `Loaded server driver oxrsys (IServerTrackedDeviceProvider_004)`,
   `Active HMD set to oxrsys.OXRSYS-HMD-0001` and `Using existing HMD
   oxrsys.OXRSYS-HMD-0001`; `vrmonitor.txt` reports
-  `CQVRController::CheckHmdDriverName: ActualTrackingSystemName: oxrsys`.
-- **Direct mode is accepted.** The compositor takes the direct-mode path, reads the
-  driver's recommended 1512x1680 at 72 Hz, builds its distortion meshes and initialises
-  its system layer without going near a DXGI present.
-- **Poses are static.** `GetPose` reports a valid, connected, identity pose. Head tracking
-  from OXRSys is not wired up yet.
-- **Swap texture sets are not allocated yet.** `CreateSwapTextureSet` returns null
-  handles, so the compositor stops at
-  `VRInitError_Compositor_CreateDriverDirectModeResolveTextures`. Allocating real shared
-  D3D11 textures on a DXMT device is the next step, followed by forwarding submitted
-  layers into an OpenXR session on OXRSys.
+  `CQVRController::CheckHmdDriverName: ActualTrackingSystemName: oxrsys` and
+  reaches `SteamVRSystemState_Ready`. SteamVR records the HMD in its own
+  settings as `"ActualHMDDriver": "oxrsys"`.
+- **Direct mode runs.** The compositor takes the direct-mode path, allocates its
+  swap texture sets from the driver, and sustains `Present` without going near a
+  DXGI present.
+- **Frames reach the runtime and the headset.** The OpenXR session comes up at
+  1512x1680 per eye and the runtime reports `state=streaming` to a connected
+  Quest 2 with the application named `OXRSys SteamVR driver`.
+- **Poses come from the runtime**, though they have not yet been checked against
+  real head movement.
+- **Only the first layer of each frame is forwarded.** Overlays and the
+  dashboard are dropped rather than composited.
+- **Room setup.** SteamVR stays at `NotReady` until a chaperone universe exists
+  for the driver's universe id; `Steam/config/chaperone_info.vrchap` with
+  `"universeID": "2"` satisfies it without running the wizard.
+
+### Synchronisation
+
+`Present` receives a sync texture the compositor owns. The driver opens it with
+`OpenSharedResource` and takes its keyed mutex for the duration of the handover;
+without that the compositor logs `WaitForAcquire timed out (FAILED); rendering
+the next frame before the driver took the sync texture` and runs its pipeline
+unsynchronised. Both the open and the acquire are confirmed working
+(`sync texture acquired via keyed mutex`), which also demonstrates that DXMT's
+cross-process texture sharing carries handles in both directions.
+
+### Checking the content path
+
+`CreateSwapTextureSet` hands SteamVR shared handles for textures the driver
+allocated, and the compositor renders into them from its own process. Whether
+that work actually lands in this process is not something the API reports, so
+the driver reads one texel back from the texture it is about to forward and logs
+it. A sample that never changes means no content is arriving, whatever the frame
+counters say.
+
+A flat colour is not by itself a bug: with no application submitting, the
+compositor renders its own loading background, and `vrcompositor.txt` says so
+(`Loading...  0 total....  0 presents.`). Read that line before suspecting the
+copy.
+
+### Known issue: the compositor's own output is a flat colour
+
+As measured, SteamVR's compositor renders a uniform colour and the driver
+forwards it faithfully. The source scanline read out of the texture SteamVR
+rendered into and the destination scanline read out of the runtime swapchain
+image after the copy are bit-identical (both uniform, 64-texel checksum
+`0x04d40000`), so nothing is lost between the compositor and OXRSys. The same
+flat colour appeared on SteamVR's desktop window when it ran on the built-in
+null driver, before this driver existed, which places the defect upstream of the
+driver in the game-to-compositor hop rather than in anything here.
+
+This is where the setup differs from Proton, which is worth knowing before
+digging further: under Proton, SteamVR's compositor is a native Linux process
+and a thin Wine-side shim forwards the game's calls out to it, so the texture
+handover happens once, host-native. Here `vrserver.exe` and `vrcompositor.exe`
+both run as Windows binaries under CrossOver, so the game-to-compositor share
+also has to work inside Wine.
