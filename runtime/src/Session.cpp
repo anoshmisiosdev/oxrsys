@@ -786,9 +786,16 @@ XrResult Session::LocateViews(const XrViewLocateInfo* viewLocateInfo, XrViewStat
 
     *viewCountOutput = 2;
 
+    // Views follow the head pose, so they are only TRACKED while head tracking is live.
+    // The pose stays VALID either way (apps rely on a usable pose existing), matching
+    // xrLocateSpace on the VIEW reference space.
     viewState->type = XR_TYPE_VIEW_STATE;
-    viewState->viewStateFlags = XR_VIEW_STATE_ORIENTATION_VALID_BIT | XR_VIEW_STATE_POSITION_VALID_BIT |
-                                XR_VIEW_STATE_ORIENTATION_TRACKED_BIT | XR_VIEW_STATE_POSITION_TRACKED_BIT;
+    viewState->viewStateFlags = XR_VIEW_STATE_ORIENTATION_VALID_BIT | XR_VIEW_STATE_POSITION_VALID_BIT;
+    if (inputManager_->IsHeadPoseTracked())
+    {
+        viewState->viewStateFlags |=
+            XR_VIEW_STATE_ORIENTATION_TRACKED_BIT | XR_VIEW_STATE_POSITION_TRACKED_BIT;
+    }
 
     if (viewCapacityInput == 0)
     {

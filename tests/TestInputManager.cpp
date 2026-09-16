@@ -7,6 +7,7 @@
 #include "TrackingReceiver.h"
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <glm/gtc/quaternion.hpp>
 #include <vector>
 
@@ -521,4 +522,126 @@ TEST_CASE("TrackingReceiver — angular velocity uses the full prediction horizo
 
     CHECK_THAT(predicted.headOrientation[1], WithinAbs(std::sin(0.010f), 0.001f));
     CHECK_THAT(predicted.headOrientation[3], WithinAbs(std::cos(0.010f), 0.001f));
+}
+
+// Regression: a Quest client built before the aim-pose fields were appended to
+// TrackingPacket sends a 1008-byte prefix of the 1064-byte struct. The USB/TCP read loop
+// in StreamingServer gated on `payload.size() >= sizeof(TrackingPacket)` and so dropped
+// every one of those records: the connection looked healthy ("tracking client connected")
+// but no packet was ever stored, IsReceiving() stayed false, InputManager::Update() never
+// called UpdateFromStreaming(), and xrLocateSpace(VIEW) returned the default pose forever.
+// All transports now share IsAcceptableTrackingPayloadSize().
+TEST_CASE("TrackingReceiver — accepts short packets from pre-aim-pose clients", "[input][protocol]")
+{
+    // What an older client actually puts on the wire.
+    constexpr size_t kOldClientPacketSize = oxr::protocol::TRACKING_PACKET_MIN_WIRE_SIZE;
+    STATIC_REQUIRE(kOldClientPacketSize < sizeof(oxr::protocol::TrackingPacket));
+
+    oxr::protocol::TrackingPacket source = {};
+    source.timestampNs = 1'000'000'000;
+    source.headPosition[0] = -0.296f;
+    source.headPosition[1] = 0.737f;
+    source.headPosition[2] = -0.079f;
+    source.headOrientation[3] = 1.0f;
+    source.trackingFlags = oxr::protocol::TRACKING_FLAG_LEFT_CONTROLLER_ACTIVE;
+    // Aim fields the old client never sends; they must not survive into the stored packet.
+    source.leftControllerAimPos[0] = 99.0f;
+    source.rightControllerAimRot[3] = 99.0f;
+
+    std::vector<uint8_t> wire(kOldClientPacketSize);
+    std::memcpy(wire.data(), &source, kOldClientPacketSize);
+
+    SECTION("a truncated packet is stored, not dropped")
+    {
+        TrackingReceiver receiver;
+        REQUIRE_FALSE(receiver.IsReceiving());
+
+        receiver.InjectPacket(wire.data(), wire.size());
+
+        REQUIRE(receiver.IsReceiving());
+        CHECK(receiver.GetPacketCount() == 1);
+
+        oxr::protocol::TrackingPacket stored = {};
+        REQUIRE(receiver.GetLatestPose(stored));
+        CHECK_THAT(stored.headPosition[0], WithinAbs(-0.296, 0.0001));
+        CHECK_THAT(stored.headPosition[1], WithinAbs(0.737, 0.0001));
+        CHECK_THAT(stored.headPosition[2], WithinAbs(-0.079, 0.0001));
+        CHECK(stored.trackingFlags == oxr::protocol::TRACKING_FLAG_LEFT_CONTROLLER_ACTIVE);
+
+        // Fields past the truncation point are zero-filled, never read from the short buffer.
+        CHECK_THAT(stored.leftControllerAimPos[0], WithinAbs(0.0, 0.0001));
+        CHECK_THAT(stored.rightControllerAimRot[3], WithinAbs(0.0, 0.0001));
+    }
+
+    SECTION("a packet shorter than the minimum wire size is still rejected")
+    {
+        TrackingReceiver receiver;
+        receiver.InjectPacket(wire.data(), kOldClientPacketSize - 1);
+        CHECK_FALSE(receiver.IsReceiving());
+        CHECK(receiver.GetPacketCount() == 0);
+    }
+
+    SECTION("InputManager picks up the head pose from a short packet")
+    {
+        TrackingReceiver receiver;
+        InputManager im;
+        im.SetTrackingReceiver(&receiver);
+
+        // No data yet: the default pose, and NOT reported as tracked.
+        im.Update(0.011f);
+        XrPosef before = im.GetHeadPose();
+        CHECK_THAT(before.position.y, WithinAbs(1.6, 0.001));
+        CHECK_FALSE(im.IsHeadPoseTracked());
+
+        receiver.InjectPacket(wire.data(), wire.size());
+        im.Update(0.011f);
+
+        XrPosef after = im.GetHeadPose();
+        CHECK_THAT(after.position.x, WithinAbs(-0.296, 0.001));
+        CHECK_THAT(after.position.y, WithinAbs(0.737, 0.001));
+        CHECK_THAT(after.position.z, WithinAbs(-0.079, 0.001));
+        CHECK(im.IsHeadPoseTracked());
+
+        im.SetTrackingReceiver(nullptr);
+    }
+}
+
+TEST_CASE("InputManager — head pose is only reported tracked with live data", "[input]")
+{
+    SECTION("simulator mode (no receiver) reports its synthesised pose as tracked")
+    {
+        InputManager im;
+        CHECK(im.IsHeadPoseTracked());
+    }
+
+    SECTION("streaming with no packet yet is valid but untracked")
+    {
+        TrackingReceiver receiver;
+        InputManager im;
+        im.SetTrackingReceiver(&receiver);
+        CHECK(im.IsStreaming());
+        CHECK_FALSE(im.IsHeadPoseTracked());
+        im.SetTrackingReceiver(nullptr);
+    }
+
+    SECTION("after a client disconnects the stale pose is no longer tracked")
+    {
+        oxr::protocol::TrackingPacket packet = {};
+        packet.timestampNs = 1'000'000'000;
+        packet.headPosition[1] = 1.2f;
+        packet.headOrientation[3] = 1.0f;
+
+        TrackingReceiver receiver;
+        InputManager im;
+        im.SetTrackingReceiver(&receiver);
+        receiver.InjectPacket(reinterpret_cast<const uint8_t*>(&packet), sizeof(packet));
+        im.Update(0.011f);
+        REQUIRE(im.IsHeadPoseTracked());
+
+        // Client goes away: the last pose is still served (valid) but is not live.
+        im.SetTrackingReceiver(nullptr);
+        CHECK_FALSE(im.IsStreaming());
+        CHECK_FALSE(im.IsHeadPoseTracked());
+        CHECK_THAT(im.GetHeadPose().position.y, WithinAbs(1.2, 0.001));
+    }
 }

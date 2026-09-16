@@ -210,8 +210,8 @@ void TrackingReceiver::Stop()
 // exactly this many bytes. We zero-init the packet so any fields the client didn't send (e.g. the
 // aim pose) stay zero, and the runtime falls back to the grip pose for aim/pose. This keeps the
 // protocol backward-compatible instead of dropping every shorter packet as "no tracking".
-static constexpr size_t kMinTrackingPacketSize =
-    offsetof(oxr::protocol::TrackingPacket, leftControllerAimPos);
+// Shared with the TCP/USB and wired transports, which do their own size check before injecting.
+static constexpr size_t kMinTrackingPacketSize = oxr::protocol::TRACKING_PACKET_MIN_WIRE_SIZE;
 
 void TrackingReceiver::ReceiveThread()
 {
@@ -236,7 +236,7 @@ void TrackingReceiver::ReceiveThread()
 
 void TrackingReceiver::InjectPacket(const uint8_t* data, size_t size)
 {
-    if (size < kMinTrackingPacketSize)
+    if (!oxr::protocol::IsAcceptableTrackingPayloadSize(size))
     {
         return;
     }

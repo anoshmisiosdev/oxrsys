@@ -46,6 +46,12 @@ public:
 
     // Head pose
     XrPosef GetHeadPose() const;
+
+    // Whether GetHeadPose() reflects live tracking rather than the static default pose.
+    // In streaming mode this is false until the client's first tracking packet arrives;
+    // callers must not assert XR_SPACE_LOCATION_*_TRACKED_BIT while it is false, or every
+    // app believes the default pose is a real, tracked head pose.
+    bool IsHeadPoseTracked() const;
     void GetEyeViews(XrView* views, uint32_t viewCount) const;
 
     // World-origin pose for a reference space type (STAGE/LOCAL/LOCAL_FLOOR).
@@ -133,6 +139,8 @@ private:
     float GetTrackedGraspValue(Hand hand) const;
 
     TrackingReceiver* trackingReceiver_ = nullptr;
+    // Sticky: a streaming client has been attached at least once this session.
+    bool streamingEverAttached_ = false;
 
     // Head state (quaternion from streaming client)
     // LOCAL reference space anchor, captured from the first streamed head pose

@@ -1011,6 +1011,8 @@ void StreamingServer::TcpTrackingThread()
 
         spdlog::info("StreamingServer: USB ADB tracking client connected");
         std::string trackingCloseReason = "server shutting down";
+        bool loggedAcceptedTracking = false;
+        size_t droppedTrackingRecords = 0;
         while (running_.load())
         {
             oxr::protocol::TcpRecordHeader header = {};
@@ -1021,12 +1023,38 @@ void StreamingServer::TcpTrackingThread()
                              trackingCloseReason);
                 break;
             }
-            if (header.type == oxr::protocol::TcpRecordType::Tracking &&
-                payload.size() >= sizeof(oxr::protocol::TrackingPacket) &&
-                trackingReceiver_ != nullptr)
+            if (header.type != oxr::protocol::TcpRecordType::Tracking ||
+                trackingReceiver_ == nullptr)
             {
-                trackingReceiver_->InjectPacket(payload.data(), payload.size());
+                continue;
             }
+            // Accept short packets from clients built against an older TrackingPacket
+            // layout. Gating on sizeof(TrackingPacket) here dropped every packet from a
+            // client that predates an appended field, which looks exactly like "connected
+            // but no tracking". See TRACKING_PACKET_MIN_WIRE_SIZE.
+            if (!oxr::protocol::IsAcceptableTrackingPayloadSize(payload.size()))
+            {
+                if ((droppedTrackingRecords++ % 600) == 0)
+                {
+                    spdlog::warn("StreamingServer: dropping undersized tracking record "
+                                 "({} bytes, need >= {}; current layout is {})",
+                                 payload.size(),
+                                 oxr::protocol::TRACKING_PACKET_MIN_WIRE_SIZE,
+                                 sizeof(oxr::protocol::TrackingPacket));
+                }
+                continue;
+            }
+            if (!loggedAcceptedTracking)
+            {
+                loggedAcceptedTracking = true;
+                spdlog::info("StreamingServer: tracking records accepted ({} bytes/packet, "
+                             "runtime layout {} bytes{})",
+                             payload.size(), sizeof(oxr::protocol::TrackingPacket),
+                             payload.size() < sizeof(oxr::protocol::TrackingPacket)
+                                 ? ", older client — newer fields zero-filled"
+                                 : "");
+            }
+            trackingReceiver_->InjectPacket(payload.data(), payload.size());
         }
 
         bool shouldClose = true;

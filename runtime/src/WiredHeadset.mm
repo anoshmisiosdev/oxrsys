@@ -393,7 +393,9 @@ void WiredHeadset::Impl::ReaderLoop()
         switch (type)
         {
             case MsgType::Tracking:
-                if (payload.size() >= sizeof(oxr::protocol::TrackingPacket) && tracking)
+                // Must be the min wire size, not sizeof(): an older client sends a prefix
+                // of the current struct. See TRACKING_PACKET_MIN_WIRE_SIZE.
+                if (oxr::protocol::IsAcceptableTrackingPayloadSize(payload.size()) && tracking)
                 {
                     tracking->InjectPacket(payload.data(), payload.size());
                 }

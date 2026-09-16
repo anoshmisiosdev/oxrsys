@@ -91,7 +91,12 @@ static std::string ComponentFromBindingPath(const std::string& bindingPath)
 struct LocatedWorldPose
 {
     XrPosef pose{};
+    // The pose exists and may be reported (XR_SPACE_LOCATION_*_VALID_BIT).
     bool active = true;
+    // The pose comes from live tracking (XR_SPACE_LOCATION_*_TRACKED_BIT). A valid but
+    // untracked pose is the OpenXR way to say "this is the last known / default pose" —
+    // which is exactly the VIEW space before any tracking packet has arrived.
+    bool tracked = true;
 };
 
 // Compute world pose of a space.
@@ -107,6 +112,9 @@ static LocatedWorldPose GetWorldPose(Space* space, const InputManager& inputMana
         {
             case XR_REFERENCE_SPACE_TYPE_VIEW:
                 result.pose = inputManager.GetHeadPose();
+                // LOCAL/STAGE below are static runtime-defined frames and stay tracked;
+                // only VIEW follows the headset, so only VIEW can be untracked.
+                result.tracked = inputManager.IsHeadPoseTracked();
                 break;
             case XR_REFERENCE_SPACE_TYPE_LOCAL:
             case XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR:
@@ -240,10 +248,18 @@ XrResult Space::LocateSpace(Space* baseSpace, XrTime time, XrSpaceLocation* loca
     glm::quat relRot = baseRotInv * thisRot;
     glm::vec3 relPos = baseRotInv * (thisPos - basePos);
 
+    // A pose that exists is VALID; it is only TRACKED when it came from live tracking.
+    // Reporting the default head pose as tracked told every client the headset was being
+    // tracked at a constant pose, which is indistinguishable from a real frozen headset.
+    const bool poseValid = thisPose.active && basePose.active;
+    const bool poseTracked = poseValid && thisPose.tracked && basePose.tracked;
+
     location->type = XR_TYPE_SPACE_LOCATION;
-    location->locationFlags = (thisPose.active && basePose.active)
-        ? XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT |
-              XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT | XR_SPACE_LOCATION_POSITION_TRACKED_BIT
+    location->locationFlags = poseValid
+        ? (XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT |
+           (poseTracked ? (XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT |
+                           XR_SPACE_LOCATION_POSITION_TRACKED_BIT)
+                        : 0))
         : 0;
     location->pose.orientation = ToXr(relRot);
     location->pose.position = ToXr(relPos);
@@ -254,7 +270,7 @@ XrResult Space::LocateSpace(Space* baseSpace, XrTime time, XrSpaceLocation* loca
         const bool haveThis = GetWorldVelocity(this, inputManager, thisLin, thisAng);
         GetWorldVelocity(baseSpace, inputManager, baseLin, baseAng); // static base stays 0
 
-        if (haveThis && thisPose.active && basePose.active)
+        if (haveThis && poseTracked)
         {
             // Change the controller's world velocity into the base space's frame. For a
             // static base (LOCAL/STAGE - the usual case for input) this is an exact change

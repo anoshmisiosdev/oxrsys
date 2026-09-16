@@ -171,6 +171,12 @@ InputManager::InputManager() = default;
 void InputManager::SetTrackingReceiver(TrackingReceiver* receiver)
 {
     trackingReceiver_ = receiver;
+    if (receiver != nullptr)
+    {
+        // Once a streaming client has driven this session, a later nullptr means the client
+        // went away — not that we reverted to a simulator whose synthetic pose is "tracked".
+        streamingEverAttached_ = true;
+    }
     if (receiver == nullptr)
     {
         streamingControllerActive_.fill(false);
@@ -203,6 +209,20 @@ void InputManager::Update(float deltaTime)
     {
         UpdateFromStreaming();
     }
+}
+
+bool InputManager::IsHeadPoseTracked() const
+{
+    if (trackingReceiver_ != nullptr)
+    {
+        // Streaming: the pose is only real once the client has delivered a tracking packet.
+        return trackingReceiver_->IsReceiving();
+    }
+    // No receiver. If a client was attached earlier it has since disconnected, and
+    // GetHeadPose() is now a stale last-known pose — valid, but not tracked. If no client
+    // was ever attached we are in simulator/automation mode, which synthesises a head pose
+    // on purpose; reporting that as tracked is that mode's contract.
+    return !streamingEverAttached_;
 }
 
 void InputManager::UpdateFromStreaming()

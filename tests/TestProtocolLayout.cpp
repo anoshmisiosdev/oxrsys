@@ -49,6 +49,17 @@ TEST_CASE("C++ protocol layouts match the documented wire format", "[protocol]")
     STATIC_REQUIRE(offsetof(TrackingPacket, rightControllerAimRot) == 1048);
     STATIC_REQUIRE(TRACKING_FLAG_LEFT_CONTROLLER_ACTIVE == 0x0004);
     STATIC_REQUIRE(TRACKING_FLAG_RIGHT_CONTROLLER_ACTIVE == 0x0008);
+
+    // Backward compatibility with clients built before the aim-pose fields were appended.
+    // This is the size such a client puts on the wire and MUST stay pinned at the pre-aim
+    // layout — raising it to sizeof(TrackingPacket) drops every packet those clients send.
+    STATIC_REQUIRE(TRACKING_PACKET_MIN_WIRE_SIZE == 1008);
+    STATIC_REQUIRE(TRACKING_PACKET_MIN_WIRE_SIZE < sizeof(TrackingPacket));
+    // The shared acceptance rule used by every tracking transport.
+    STATIC_REQUIRE(IsAcceptableTrackingPayloadSize(sizeof(TrackingPacket)));
+    STATIC_REQUIRE(IsAcceptableTrackingPayloadSize(TRACKING_PACKET_MIN_WIRE_SIZE));
+    STATIC_REQUIRE(!IsAcceptableTrackingPayloadSize(TRACKING_PACKET_MIN_WIRE_SIZE - 1));
+    STATIC_REQUIRE(!IsAcceptableTrackingPayloadSize(0));
 }
 
 TEST_CASE("Foveated encoding presets calculate ALVR-style optimized eye sizes", "[protocol][foveation]")

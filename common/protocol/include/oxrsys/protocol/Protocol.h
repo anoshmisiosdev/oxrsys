@@ -304,6 +304,27 @@ struct TrackingPacket
     float rightControllerAimRot[4];
 };
 
+// Smallest TrackingPacket a receiver must accept off the wire.
+//
+// TrackingPacket only ever grows by appending fields, so a client built against an older
+// revision sends a prefix of the current struct. Receivers zero-initialise the packet and
+// copy the prefix, leaving the newer fields at zero (the runtime then falls back, e.g. aim
+// pose -> grip pose). Every size check on a received tracking packet MUST compare against
+// this, never against sizeof(TrackingPacket) — gating on sizeof() silently drops every
+// packet from an older client the moment a field is appended.
+//
+// This is the pre-aim-pose size: the last layout shipped to clients that are still in the
+// field. Do NOT raise it when appending new fields.
+constexpr size_t TRACKING_PACKET_MIN_WIRE_SIZE = offsetof(TrackingPacket, leftControllerAimPos);
+
+// The single acceptance rule every tracking transport (UDP, USB/TCP, wired) must use before
+// handing a received payload to the receiver. Centralised so that appending a field to
+// TrackingPacket cannot quietly start rejecting clients that are already in the field.
+constexpr bool IsAcceptableTrackingPayloadSize(size_t payloadSize)
+{
+    return payloadSize >= TRACKING_PACKET_MIN_WIRE_SIZE;
+}
+
 enum ButtonFlags : uint32_t
 {
     BUTTON_A = 0x0001,
