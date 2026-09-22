@@ -221,7 +221,12 @@ void Swapchain::InitMetal(void* metalDevice, const XrSwapchainCreateInfo* create
                                                                                     width:width_
                                                                                    height:height_
                                                                                 mipmapped:NO];
-    desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    // PixelFormatView lets external consumers that import these textures reinterpret the
+    // format (a D3D11 translation layer resolving a typeless DXGI_FORMAT_*_TYPELESS desc
+    // casts to a concrete format). Metal exempts same-family sRGB casts from this flag, so
+    // our own use does not need it, but importers validate against it and reject without.
+    desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead |
+                 MTLTextureUsagePixelFormatView;
     desc.storageMode = MTLStorageModePrivate;
     if (arraySize_ > 1)
     {
@@ -233,7 +238,19 @@ void Swapchain::InitMetal(void* metalDevice, const XrSwapchainCreateInfo* create
     imageStates_.assign(imageCount_, ImageState::Available);
     for (uint32_t i = 0; i < imageCount_; i++)
     {
-        id<MTLTexture> tex = [device newTextureWithDescriptor:desc];
+        // Shared (IOSurface-backed) so a consumer outside this process's Metal
+        // stack can adopt the image from a MTLSharedTextureHandle instead of
+        // copying it. Costs nothing here and is what lets a translation layer
+        // (e.g. D3D11-over-Metal under Wine) hand the app the runtime's own
+        // swapchain image as a native texture. Falls back to a private texture
+        // if the descriptor is not shareable.
+        id<MTLTexture> tex = [device newSharedTextureWithDescriptor:desc];
+        if (tex == nil)
+        {
+            spdlog::warn("OXRSys: shared swapchain texture unavailable, "
+                         "falling back to a non-shareable image");
+            tex = [device newTextureWithDescriptor:desc];
+        }
         textures_[i] = (void*)tex;
     }
 
@@ -261,7 +278,12 @@ void Swapchain::InitMetalStaging(void* metalDevice)
                                                                                     width:width_
                                                                                    height:height_
                                                                                 mipmapped:NO];
-    desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    // PixelFormatView lets external consumers that import these textures reinterpret the
+    // format (a D3D11 translation layer resolving a typeless DXGI_FORMAT_*_TYPELESS desc
+    // casts to a concrete format). Metal exempts same-family sRGB casts from this flag, so
+    // our own use does not need it, but importers validate against it and reject without.
+    desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead |
+                 MTLTextureUsagePixelFormatView;
     desc.storageMode = MTLStorageModePrivate;
     if (arraySize_ > 1)
     {
