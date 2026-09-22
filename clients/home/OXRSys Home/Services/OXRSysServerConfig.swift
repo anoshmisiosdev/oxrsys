@@ -6,6 +6,8 @@ struct OXRSysServerConfig: Equatable {
     static let minBitrateMbps = 1
     static let maxBitrateMbps = 200
     static let supportedRefreshRates = [60, 72, 80, 90, 120]
+    static let minWiredEyeHeightM = 1.0
+    static let maxWiredEyeHeightM = 2.2
 
     var runtimeEnabled = true
     var bitrateMbps = 50
@@ -32,8 +34,19 @@ struct OXRSysServerConfig: Equatable {
     var spatialAnchors = false
     var spatialScene = false
     var spatialPersistence = false
+    var wiredHeadset = false
+    var wiredDisplayId = 0
+    var wiredEyeHeightM = 1.6
+    var wiredPositionTracking = true
+    var wiredControllerAdapter = false
+    var wiredCameraMonitor = true
     var fileLogging = true
     var questLogcat = false
+
+    var headsetMode: HeadsetModeSetting {
+        get { wiredHeadset ? .wired : .streaming }
+        set { wiredHeadset = newValue == .wired }
+    }
 
     static let defaultText = """
     # OXRSys Runtime Configuration
@@ -126,6 +139,33 @@ struct OXRSysServerConfig: Equatable {
     scene = false
     persistence = false
 
+    [wired]
+    # Wired headset (Windows Mixed Reality over USB + HDMI/DisplayPort, macOS only).
+    # When true and a headset is plugged in, it replaces the streaming client.
+    # The panel must be visible to macOS as a display; see docs/platforms/wmr.md
+    # for the one-time EDID override.
+    wired_headset = false
+
+    # CGDirectDisplayID of the headset panel. 0 = auto-detect.
+    wired_display_id = 0
+
+    # Height of the eyes above the floor, in meters: where the head sits
+    # without positional tracking, and the starting height with it.
+    wired_eye_height_m = 1.6
+
+    # Positional (6DoF) head tracking through Basalt when libbasalt.dylib is
+    # installed next to the headset helper; false = orientation only.
+    wired_position_tracking = true
+
+    # Windows Mixed Reality motion controllers through a separate USB Bluetooth
+    # adapter (macOS's Bluetooth can't pair 1st-gen controllers). The headset
+    # helper starts wmr_btstack from next to itself; see docs/platforms/wmr.md.
+    wired_controller_adapter = false
+
+    # Open the headset helper's tracking-camera window (both cameras with the
+    # features Basalt tracks) on a desktop screen whenever the headset is used.
+    wired_camera_monitor = true
+
     [logging]
     # Write server logs to ~/Library/Application Support/OXRSys/oxrsys-runtime.log.
     file_logging = true
@@ -216,6 +256,25 @@ struct OXRSysServerConfig: Equatable {
         if let value = boolValue("persistence", in: text) {
             config.spatialPersistence = value
         }
+        if let value = boolValue("wired_headset", in: text) {
+            config.wiredHeadset = value
+        }
+        if let value = intValue("wired_display_id", in: text), value >= 0 {
+            config.wiredDisplayId = value
+        }
+        if let value = doubleValue("wired_eye_height_m", in: text),
+           (Self.minWiredEyeHeightM...Self.maxWiredEyeHeightM).contains(value) {
+            config.wiredEyeHeightM = value
+        }
+        if let value = boolValue("wired_position_tracking", in: text) {
+            config.wiredPositionTracking = value
+        }
+        if let value = boolValue("wired_controller_adapter", in: text) {
+            config.wiredControllerAdapter = value
+        }
+        if let value = boolValue("wired_camera_monitor", in: text) {
+            config.wiredCameraMonitor = value
+        }
         if let value = boolValue("file_logging", in: text) {
             config.fileLogging = value
         }
@@ -264,6 +323,14 @@ struct OXRSysServerConfig: Equatable {
                 ("anchors", boolString(spatialAnchors)),
                 ("scene", boolString(spatialScene)),
                 ("persistence", boolString(spatialPersistence)),
+            ]),
+            ("wired", [
+                ("wired_headset", boolString(wiredHeadset)),
+                ("wired_display_id", "\(wiredDisplayId)"),
+                ("wired_eye_height_m", decimalString(wiredEyeHeightM)),
+                ("wired_position_tracking", boolString(wiredPositionTracking)),
+                ("wired_controller_adapter", boolString(wiredControllerAdapter)),
+                ("wired_camera_monitor", boolString(wiredCameraMonitor)),
             ]),
             ("logging", [
                 ("file_logging", boolString(fileLogging)),

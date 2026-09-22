@@ -177,6 +177,23 @@ enum OcclusionModeSetting: String, CaseIterable, Identifiable {
     }
 }
 
+/// Which kind of headset the runtime drives. Maps to `wired.wired_headset`.
+enum HeadsetModeSetting: String, CaseIterable, Identifiable {
+    case streaming
+    case wired
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .streaming:
+            return "Streaming (Quest / PICO / visionOS / simulator)"
+        case .wired:
+            return "Wired Windows Mixed Reality headset (USB)"
+        }
+    }
+}
+
 struct HomePaths {
     static let appSupportDirectory = NSString(string: "~/Library/Application Support/OXRSys").expandingTildeInPath
     static let configFilePath = (appSupportDirectory as NSString).appendingPathComponent("oxrsys-runtime.toml")
@@ -203,6 +220,7 @@ enum RuntimeActivityState: String {
 enum RuntimeActivityTransport: String {
     case wifi
     case usbAdb = "usb_adb"
+    case wired
 }
 
 enum RuntimeDeviceType: String {
@@ -210,6 +228,7 @@ enum RuntimeDeviceType: String {
     case pico
     case simulator
     case visionPro = "vision_pro"
+    case wmr
     case unknown
 
     var displayName: String {
@@ -222,6 +241,8 @@ enum RuntimeDeviceType: String {
             return "Simulator"
         case .visionPro:
             return "Vision Pro"
+        case .wmr:
+            return "Windows Mixed Reality (wired)"
         case .unknown:
             return "Unknown"
         }
@@ -445,6 +466,8 @@ struct HomeRuntimeActivity: Equatable {
             return "Streaming (WiFi)"
         case (.streaming, .usbAdb):
             return "Streaming (USB)"
+        case (.streaming, .wired):
+            return "Wired headset"
         case (.streaming, _):
             return "Streaming"
         case (.idle, _):
