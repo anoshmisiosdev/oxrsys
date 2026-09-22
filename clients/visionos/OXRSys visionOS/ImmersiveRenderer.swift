@@ -12,6 +12,9 @@ nonisolated private enum ImmersiveRendererConstants {
     // only lets the CPU drift an extra frame ahead — pure added latency (~1 frame, ~11 ms @ 90 Hz)
     // with no throughput gain for a video blit. Drop to 2 to shave that frame.
     static let maxBuffersInFlight = 2
+    // Keep a late GPU from blocking the compositor render executor for seconds. A timeout only
+    // skips this iteration; the same fence is checked again before another frame is acquired.
+    static let gpuWaitTimeoutMS: UInt64 = 10
     // The assumed scene depth for reprojection, shared by the depth-buffer clear (compositor
     // positional warp) and the shader's planar translation warp so the two can never disagree.
     static let reprojectionPlaneDistance: Float = 2.0
@@ -146,13 +149,15 @@ actor ImmersiveRenderer {
     }
 
     private func renderFrame() {
-        guard let frame = layerRenderer.queryNextFrame() else { return }
         guard endFrameEvent.wait(
             untilSignaledValue: committedFrameIndex - UInt64(ImmersiveRendererConstants.maxBuffersInFlight),
-            timeoutMS: 10_000
+            timeoutMS: ImmersiveRendererConstants.gpuWaitTimeoutMS
         ) else {
             return
         }
+        // Compositor Services owns a finite frame pool. Do not acquire a frame until the GPU slot
+        // is reusable, because returning after queryNextFrame() can strand that frame in the pool.
+        guard let frame = layerRenderer.queryNextFrame() else { return }
 
         frame.startUpdate()
         frame.endUpdate()
@@ -165,14 +170,12 @@ actor ImmersiveRenderer {
         let drawables = frame.queryDrawables()
         guard !drawables.isEmpty else { return }
 
-        // A drawable presented without a device anchor is thrown away by the compositor, so
-        // rendering one is pure waste. This happens for the first frames after connecting, while
-        // the ARKit session is still coming up — skip them instead of encoding work that can
-        // never be shown.
+        // Tracking can be unavailable for the first frames while ARKit starts. A nil anchor is a
+        // supported Compositor Services mode: the frame is still presented, but without the
+        // compositor's predicted-pose adjustment. Most importantly, every queried drawable still
+        // completes its normal encode/present lifecycle instead of being stranded in the pool.
         let presentationTime = drawables[0].frameTiming.presentationTime.timeInterval
-        guard let deviceAnchor = worldTracking.queryDeviceAnchor(atTimestamp: presentationTime) else {
-            return
-        }
+        let deviceAnchor = worldTracking.queryDeviceAnchor(atTimestamp: presentationTime)
 
         frame.startSubmission()
         for drawable in drawables {
@@ -186,11 +189,10 @@ actor ImmersiveRenderer {
     }
 
     private func render(drawable: LayerRenderer.Drawable,
-                        deviceAnchor: DeviceAnchor,
+                        deviceAnchor: DeviceAnchor?,
                         commandBuffer: MTLCommandBuffer) {
         let presentationTime = drawable.frameTiming.presentationTime.timeInterval
-        let currentAnchor: DeviceAnchor? = deviceAnchor
-        drawable.deviceAnchor = currentAnchor
+        drawable.deviceAnchor = deviceAnchor
 
         publishEyeProjection(drawable)
 
@@ -212,7 +214,7 @@ actor ImmersiveRenderer {
             appModel.noteFrameDisplayed(displayLatencyMs: displayLatencyMs)
         }
 
-        let currentPose = currentAnchor.map {
+        let currentPose = deviceAnchor.map {
             (position: headPosition(from: $0), orientation: headOrientation(from: $0))
         }
         let renderPose = appModel.renderPose(forPresentationTimeNs: frame.presentationTimeNs)

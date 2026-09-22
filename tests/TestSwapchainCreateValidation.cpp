@@ -22,7 +22,7 @@ TEST_CASE("Swapchain validation matches the formats enumerated per graphics API"
     CHECK_FALSE(oxrsys::swapchain::IsSupportedFormat(GraphicsApi::Vulkan, 9999));
 }
 
-TEST_CASE("Unsupported swapchain usage and creation flags fail before allocation",
+TEST_CASE("Swapchain usage and creation flags are validated per graphics API",
           "[graphics][swapchain]")
 {
     XrSwapchainCreateInfo createInfo{XR_TYPE_SWAPCHAIN_CREATE_INFO};
@@ -34,9 +34,14 @@ TEST_CASE("Unsupported swapchain usage and creation flags fail before allocation
     createInfo.usageFlags |= XR_SWAPCHAIN_USAGE_UNORDERED_ACCESS_BIT;
     CHECK(oxrsys::swapchain::ValidateCreateInfo(GraphicsApi::Metal, createInfo) ==
           XR_ERROR_FEATURE_UNSUPPORTED);
-    createInfo.usageFlags = XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
-    CHECK(oxrsys::swapchain::ValidateCreateInfo(GraphicsApi::Metal, createInfo) ==
+    createInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
+                            XR_SWAPCHAIN_USAGE_SAMPLED_BIT |
+                            XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+    CHECK(oxrsys::swapchain::ValidateCreateInfo(GraphicsApi::Metal, createInfo) == XR_SUCCESS);
+    createInfo.format = 37;
+    CHECK(oxrsys::swapchain::ValidateCreateInfo(GraphicsApi::Vulkan, createInfo) ==
           XR_ERROR_FEATURE_UNSUPPORTED);
+    createInfo.format = 80;
     createInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
     createInfo.createFlags = XR_SWAPCHAIN_CREATE_PROTECTED_CONTENT_BIT;
     CHECK(oxrsys::swapchain::ValidateCreateInfo(GraphicsApi::Metal, createInfo) ==

@@ -43,6 +43,9 @@ latency.
 ### Metal
 
 `XR_KHR_metal_enable` sessions retain the application-provided Metal device and command queue.
+Metal swapchain validation accepts sampled, render-target, depth/stencil, and transfer-destination
+usage. Transfer-destination support covers applications such as Blender that render elsewhere and
+blit the completed view into the runtime-owned private texture.
 Released images are copied into bounded private staging textures on that queue. GPU-side shared
 events synchronize the encoder worker. A slot that cannot be reused safely causes a streaming-frame
 drop; the encoder never reads a live application swapchain image after release.

@@ -56,9 +56,15 @@ This file tracks user-facing, integration-facing, and runtime-relevant changes f
 
 ### Fixed
 
+- Fixed intermittent visionOS immersive-entry stalls and compositor terminations by waiting for a
+  reusable GPU slot before acquiring a finite-pool frame, reducing the shared-event wait from 10
+  seconds to 10 milliseconds, and presenting startup frames without pose adjustment when ARKit has
+  not produced a device anchor yet instead of abandoning their queried drawables.
+- Fixed Blender 5.1+ VR session startup on macOS by accepting Metal swapchains that declare
+  `XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT` for their final view blit.
 - Fixed the clipped and overlapping layout of the macOS simulator "Viewer Settings" sheet.
 - Fixed a race in visionOS tracking setup where a session start superseded by a reconnect could still run its stale provider array against the new ARKit session, leaving a dead provider inside a live session — observed as hand tracking reporting "provider is not running" for an entire session while world and accessory tracking worked. Session starts now carry a generation that is re-checked after each suspension point.
-- Fixed the visionOS client getting stuck immersed after a connection was lost: a single state change notified several observers at once, so two concurrent `openImmersiveSpace`/`dismissImmersiveSpace` calls could overlap and leave the space open with nothing driving it, while the render loop kept submitting drawables against stopped ARKit providers at full frame rate. Presentation transitions are now serialized, and the render loop idles while nothing is streaming and skips frames that have no device anchor instead of presenting drawables the compositor discards.
+- Fixed the visionOS client getting stuck immersed after a connection was lost: a single state change notified several observers at once, so two concurrent `openImmersiveSpace`/`dismissImmersiveSpace` calls could overlap and leave the space open with nothing driving it, while the render loop kept submitting drawables against stopped ARKit providers at full frame rate. Presentation transitions are now serialized, and the render loop idles while nothing is streaming.
 - Fixed the Apple streaming decoder never recovering when VideoToolbox invalidates the decompression session (`kVTInvalidSessionErr`/`-12903`), which the system does when the app loses its foreground or immersive privilege. Every later frame failed with the same status indefinitely while video kept arriving, leaving the headset on a frozen frame until the stream itself stopped; the decoder now rebuilds the session from the retained parameter sets, waits for a keyframe, and rate-limits the rebuild.
 - Fixed visionOS stream watchdogs only observing network delivery, so a dead decode pipeline was invisible to them and later misreported as "Server stopped streaming". Video arriving with no frames decoding for five seconds is now detected on its own and drops the connection so it can be re-established with a fresh decoder and ARKit session.
 - Fixed visionOS spatial controller buttons going dead after reconnecting while tracking kept working: button state was read from the `GCController` captured when the accessory was created, which goes stale when a controller drops and reconnects. Inputs are now read from the currently connected controller for that hand.

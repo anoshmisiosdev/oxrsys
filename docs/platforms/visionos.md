@@ -55,6 +55,15 @@ xcodebuild -project "clients/visionos/OXRSys visionOS.xcodeproj" \
 Both commands prove compilation only. A signed physical Vision Pro build remains required for
 network discovery, immersive presentation, tracking, decode, and latency qualification.
 
+## Compositor Frame Lifecycle
+
+The immersive render loop waits no more than 10 milliseconds for a reusable GPU slot before it
+asks Compositor Services for another frame. This ordering prevents a slow GPU from stranding a
+frame in the compositor's finite pool. Once the renderer queries drawables, it completes their
+normal submission and presentation lifecycle. If world tracking has not produced a device anchor
+during startup, the frame is presented with a nil anchor and without compositor pose adjustment;
+later frames resume the normal tracked path as soon as ARKit supplies an anchor.
+
 ## Local Network Discovery
 
 `Find Server` listens for the runtime's `ServerAnnounce` over IPv4 UDP broadcast. Apple requires the

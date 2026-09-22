@@ -57,6 +57,8 @@ As of March 17, 2026, the pinned non-interactive OpenXR-CTS baseline is green lo
 - Metal streaming snapshots dynamic swapchain images on the application-provided command queue,
   uses GPU-side shared-event synchronization, and drops a streaming frame when no staging slot can
   be reused safely.
+- Metal swapchains accept `XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT`; applications such as Blender blit
+  their rendered view into the runtime-owned texture before releasing it.
 - Vulkan streaming snapshots released color images with application-dispatched Vulkan functions
   into bounded exportable images. Queue submission is non-blocking; fence waits belong to the
   encoder worker. Missing export support, exhausted slots, or wait failures drop the streaming frame
@@ -74,6 +76,9 @@ As of March 17, 2026, the pinned non-interactive OpenXR-CTS baseline is green lo
   slot. Keep its C++ and Swift layouts synchronized.
 - The visionOS foveated-stream inverse warp must remain the exact inverse of the encoder
   `compress_axis` transform. Numerically revalidate fp32 round trips whenever either side changes.
+- The visionOS compositor loop must wait for a reusable GPU slot before acquiring a frame, use
+  bounded millisecond-scale waits, and complete every queried drawable's submission lifecycle even
+  when ARKit has not produced a device anchor yet.
 
 ## Streaming And Headset Contracts
 

@@ -17,13 +17,14 @@ trademarks referenced by this project.
 ## Highlights
 
 - macOS runtime for `arm64` and `x86_64`, with universal release packaging
-- `XR_KHR_metal_enable` and Vulkan/MoltenVK graphics paths
+- `XR_KHR_metal_enable`, including blit-to-swapchain applications such as Blender, and
+  Vulkan/MoltenVK graphics paths
 - VideoToolbox H.264, H.265, and negotiated HEVC Main10 streaming
 - WiFi UDP and reconnecting USB ADB reverse TCP transport
 - SDK-free native ADB setup in OXRSys Home, with local ADB server and external `adb` fallbacks
 - Quest controller, hand tracking, reprojection, passthrough, foveation, and ABR paths
-- native visionOS immersive viewer with automatic and direct-IP discovery, hand tracking, and
-  accessory-controller tracking
+- native visionOS immersive viewer with resilient compositor-frame submission, automatic and
+  direct-IP discovery, hand tracking, and accessory-controller tracking
 - shared Swift streaming and simulator packages for macOS, iOS, and visionOS clients
 - loader-backed runtime tests and a pinned OpenXR-CTS qualification lane
 

@@ -11,10 +11,21 @@ namespace oxrsys::swapchain
 
 constexpr XrSwapchainCreateFlags SupportedCreateFlags =
     XR_SWAPCHAIN_CREATE_STATIC_IMAGE_BIT;
-constexpr XrSwapchainUsageFlags SupportedUsageFlags =
-    XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
-    XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
-    XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+
+constexpr XrSwapchainUsageFlags SupportedUsageFlags(GraphicsApi api)
+{
+    XrSwapchainUsageFlags flags =
+        XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
+        XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+        XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+    if (api == GraphicsApi::Metal)
+    {
+        // Metal blit destinations do not require an MTLTextureUsage flag. Blender
+        // copies its rendered view into the OpenXR texture and declares that use.
+        flags |= XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+    }
+    return flags;
+}
 
 constexpr bool IsSupportedFormat(GraphicsApi api, int64_t format)
 {
@@ -48,7 +59,7 @@ constexpr XrResult ValidateCreateInfo(GraphicsApi api,
                                       const XrSwapchainCreateInfo& createInfo)
 {
     if ((createInfo.createFlags & ~SupportedCreateFlags) != 0 ||
-        (createInfo.usageFlags & ~SupportedUsageFlags) != 0)
+        (createInfo.usageFlags & ~SupportedUsageFlags(api)) != 0)
     {
         return XR_ERROR_FEATURE_UNSUPPORTED;
     }

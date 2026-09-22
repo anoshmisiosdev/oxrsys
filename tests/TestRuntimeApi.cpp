@@ -2843,7 +2843,7 @@ TEST_CASE("Unsupported swapchain mip counts report feature unsupported", "[runti
     CHECK(swapchain == XR_NULL_HANDLE);
 }
 
-TEST_CASE("Swapchain creation rejects unsupported flags and incompatible usage",
+TEST_CASE("Swapchain creation validates supported flags and compatible usage",
           "[runtime][swapchain][validation]")
 {
     RuntimeSessionContext context({XR_KHR_METAL_ENABLE_EXTENSION_NAME});
@@ -2866,10 +2866,13 @@ TEST_CASE("Swapchain creation rejects unsupported flags and incompatible usage",
     CHECK(swapchain == XR_NULL_HANDLE);
 
     swapchain = reinterpret_cast<XrSwapchain>(static_cast<uintptr_t>(0x1));
-    createInfo.usageFlags = XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
-    CHECK(xrCreateSwapchain(context.session, &createInfo, &swapchain) ==
-          XR_ERROR_FEATURE_UNSUPPORTED);
-    CHECK(swapchain == XR_NULL_HANDLE);
+    createInfo.format = 70; // MTLPixelFormatRGBA8Unorm, Blender's first advertised match.
+    createInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
+                            XR_SWAPCHAIN_USAGE_SAMPLED_BIT |
+                            XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+    XR_CHECK(xrCreateSwapchain(context.session, &createInfo, &swapchain));
+    REQUIRE(swapchain != XR_NULL_HANDLE);
+    XR_CHECK(xrDestroySwapchain(swapchain));
 
     swapchain = reinterpret_cast<XrSwapchain>(static_cast<uintptr_t>(0x1));
     createInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
