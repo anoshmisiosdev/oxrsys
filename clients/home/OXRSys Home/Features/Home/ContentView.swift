@@ -507,6 +507,8 @@ struct ContentView: View {
     private var streamingTab: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
+                headsetSection
+
                 GroupBox("Streaming Configuration") {
                     VStack(alignment: .leading, spacing: 16) {
                         Toggle("Runtime enabled", isOn: streamingBinding(\.runtimeEnabled))
@@ -671,6 +673,182 @@ struct ContentView: View {
 
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private var headsetSection: some View {
+        GroupBox("Headset") {
+            VStack(alignment: .leading, spacing: 16) {
+                Picker("Headset mode", selection: streamingBinding(\.headsetMode)) {
+                    ForEach(HeadsetModeSetting.allCases) { mode in
+                        Text(mode.displayName).tag(mode)
+                    }
+                }
+
+                if model.serverConfig.wiredHeadset {
+                    LabeledSlider(
+                        title: "Eye height",
+                        value: streamingBinding(\.wiredEyeHeightM),
+                        range: OXRSysServerConfig.minWiredEyeHeightM...OXRSysServerConfig.maxWiredEyeHeightM,
+                        displayValue: String(format: "%.2f m", model.serverConfig.wiredEyeHeightM)
+                    )
+
+                    HStack {
+                        Text("Panel display ID")
+                        Spacer()
+                        TextField(
+                            "0 = auto",
+                            value: streamingBinding(\.wiredDisplayId),
+                            format: .number
+                        )
+                        .textFieldStyle(.roundedBorder)
+                        .multilineTextAlignment(.trailing)
+                        .frame(width: 120)
+                        Text("0 = auto-detect")
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Toggle("Positional head tracking (6DoF, Basalt)", isOn: streamingBinding(\.wiredPositionTracking))
+
+                    Toggle("Show the tracking cameras in a window", isOn: streamingBinding(\.wiredCameraMonitor))
+
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("The headset replaces the streaming client while it is plugged in over USB and HDMI/DisplayPort. Positional tracking needs libbasalt.dylib next to the headset helper (drivers/tools/build_basalt.sh); without it, or with the toggle off, the head is tracked in orientation only at the eye height above.")
+                        Text("macOS hides Windows Mixed Reality panels until the one-time EDID display override is installed (`sudo python3 drivers/tools/wmr_edid_override.py --install`, then replug the video cable). Without it the panel stays black. See docs/platforms/wmr.md.")
+                    }
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                    Divider()
+
+                    motionControllersSection
+                } else {
+                    Text("Quest, PICO, visionOS, and the simulator connect as streaming clients over WiFi or USB ADB.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.top, 8)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.top, 14)
+    }
+
+    private var motionControllersSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Motion Controllers")
+                .font(.headline)
+
+            Toggle(
+                "Windows Mixed Reality controllers through a USB Bluetooth adapter",
+                isOn: streamingBinding(\.wiredControllerAdapter)
+            )
+
+            HStack(spacing: 8) {
+                if let adapter = model.usbBluetoothAdapters.first {
+                    Image(systemName: adapter.support == .supported ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                        .foregroundStyle(adapter.support == .supported ? .green : .orange)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("\(adapter.name) (\(adapter.usbID))")
+                        if adapter.support == .needsFirmware {
+                            Text("This adapter needs a firmware upload that OXRSys doesn't do yet. CSR8510 and Broadcom BCM20702 adapters work.")
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                } else {
+                    Image(systemName: "xmark.circle")
+                        .foregroundStyle(.secondary)
+                    Text("No USB Bluetooth adapter detected")
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Rescan") {
+                    model.rescanUsbBluetoothAdapters()
+                }
+            }
+
+            if model.serverConfig.wiredControllerAdapter {
+                motionControllerServiceControls
+            }
+
+            Text("macOS's own Bluetooth can't pair 1st-gen Windows Mixed Reality motion controllers. With this on, OXRSys takes over a separate USB Bluetooth adapter (it stops being usable by other apps) and hands the controllers to the headset. Pair each controller once; afterwards pressing its Windows button reconnects it. PlayStation Move controllers still pair through macOS Bluetooth.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .onAppear {
+            model.rescanUsbBluetoothAdapters()
+            model.refreshWmrControllers()
+        }
+    }
+
+    @ViewBuilder
+    private var motionControllerServiceControls: some View {
+        let service = model.wmrControllerService
+        let running = service?.isRunning == true
+
+        HStack(spacing: 8) {
+            Circle()
+                .fill(running ? Color.green : (service?.adapterState == .noAdapter ? Color.orange : Color.secondary))
+                .frame(width: 8, height: 8)
+            if running, let service {
+                Text("Controller service running on adapter \(service.adapterAddress)")
+            } else if service?.adapterState == .noAdapter {
+                Text("Controller service couldn't open the adapter")
+            } else if model.wmrControllerToolPath == nil {
+                Text("wmr_btstack not found next to the runtime (build drivers/tools/wmr_btstack)")
+            } else {
+                Text("Controller service not running")
+            }
+            Spacer()
+            if running {
+                Button("Restart") {
+                    model.restartWmrControllerService()
+                }
+                Button("Stop") {
+                    model.stopWmrControllerService()
+                }
+            } else {
+                Button("Start") {
+                    model.startWmrControllerService()
+                }
+                .disabled(model.wmrControllerToolPath == nil)
+            }
+        }
+
+        if running, let service {
+            VStack(alignment: .leading, spacing: 6) {
+                MotionControllerRow(hand: "L", title: "Left", service: service)
+                MotionControllerRow(hand: "R", title: "Right", service: service)
+            }
+
+            HStack {
+                if service.pairingSecondsLeft > 0 {
+                    Button("Stop Pairing (\(service.pairingSecondsLeft) s)") {
+                        model.pairWmrController(seconds: 0)
+                    }
+                } else {
+                    Button("Pair Controller…") {
+                        model.pairWmrController()
+                    }
+                }
+                Button("Forget Paired Controllers") {
+                    model.forgetWmrControllers()
+                }
+                .disabled(service.paired.isEmpty)
+                Spacer()
+            }
+
+            if service.pairingSecondsLeft > 0 {
+                Text("Take the battery cover off the controller and hold the small pairing button next to the batteries until the lights flash. It connects on its own within a few seconds.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
 
@@ -931,6 +1109,64 @@ struct ContentView: View {
             await Task.yield()
             update()
         }
+    }
+}
+
+private struct MotionControllerRow: View {
+    let hand: String
+    let title: String
+    let service: WmrControllerServiceStatus
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: iconName)
+                .foregroundStyle(iconColor)
+                .frame(width: 18)
+            Text(title)
+                .frame(width: 44, alignment: .leading)
+            Text(detail)
+                .foregroundStyle(.secondary)
+            Spacer()
+            if let controller = service.controller(hand: hand), controller.state == .connected {
+                if service.runtimeAttached.contains(hand) {
+                    Text("In use by the headset")
+                        .foregroundStyle(.secondary)
+                }
+                Text("\(controller.reportsPerSecond) Hz")
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var iconName: String {
+        switch service.controller(hand: hand)?.state {
+        case .connected: return "gamecontroller.fill"
+        case .connecting, .pairing: return "arrow.triangle.2.circlepath"
+        case nil: return "gamecontroller"
+        }
+    }
+
+    private var iconColor: Color {
+        switch service.controller(hand: hand)?.state {
+        case .connected: return .green
+        case .connecting, .pairing: return .orange
+        case nil: return .secondary
+        }
+    }
+
+    private var detail: String {
+        if let controller = service.controller(hand: hand) {
+            switch controller.state {
+            case .connected: return "Connected"
+            case .connecting: return "Connecting…"
+            case .pairing: return "Pairing…"
+            }
+        }
+        if service.pairedController(hand: hand) != nil {
+            return "Paired, switched off (press its Windows button)"
+        }
+        return "Not paired"
     }
 }
 
