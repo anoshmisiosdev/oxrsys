@@ -84,4 +84,5 @@ The generated loader manifest is `build/runtime/oxrsys-runtime.json`.
 - [Build](build.md) for every target and architecture
 - [macOS Home](platforms/macos-home.md) for launch, registration, and USB setup
 - [Quest and Pico](platforms/quest.md) for Android installation
+- [Windows Mixed Reality headsets](platforms/wmr.md) for the wired headset settings in Home
 - [Testing and Conformance](testing-and-conformance.md) before submitting a change

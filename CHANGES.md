@@ -6,6 +6,18 @@ This file tracks user-facing, integration-facing, and runtime-relevant changes f
 
 ### Added
 
+- Added a Headset section to the OXRSys Home Streaming tab that selects between streaming clients
+  and a wired Windows Mixed Reality headset (`wired.wired_headset`), and edits
+  `wired_eye_height_m`, `wired_display_id`, `wired_position_tracking` (6DoF head tracking through
+  Basalt) and `wired_camera_monitor` (the headset helper's tracking-camera window). Runtime
+  activity display now understands the `wired` transport and the `wmr` device type. The runtime's
+  wired backend lands separately; Home writes and reads the `[wired]` section today.
+- Added a Motion Controllers group to that section for 1st-gen Windows Mixed Reality motion
+  controllers, which macOS's own Bluetooth cannot pair. `wired.wired_controller_adapter` hands a
+  separate USB Bluetooth adapter to the `wmr_btstack` helper; Home finds adapters over IOKit by
+  Bluetooth HCI device class, keeps the helper running while the setting is on and an adapter is
+  plugged in, and shows adapter state, per-hand controller status and report rate, pairing with a
+  countdown, and forgetting bondings.
 - Added first-class macOS `arm64` and `x86_64` CI lanes plus universal release packaging with
   architecture validation for the runtime and OXRSys Home.
 - Added a macOS/iOS simulator build lane covering the Cardboard-style stereo viewer and ARKit

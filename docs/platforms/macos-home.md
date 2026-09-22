@@ -113,8 +113,9 @@ The file is updated when an OpenXR app creates or destroys an instance, when the
 starts or stops, and when a headset client connects or disconnects. The Home app polls it once per
 second and shows:
 
-- state: `Idle`, `Streaming (WiFi)`, or `Streaming (USB)`
-- device: `Quest`, `Pico`, `Simulator`, `Vision Pro`, or `Unknown`
+- state: `Idle`, `Streaming (WiFi)`, `Streaming (USB)`, or `Wired headset` (transport `wired`)
+- device: `Quest`, `Pico`, `Simulator`, `Vision Pro`, `Windows Mixed Reality (wired)` (device type
+  `wmr`), or `Unknown`
 - profile app: the OpenXR application name from `XrInstanceCreateInfo`, with the Home-launched
   app as a fallback before the runtime has written status
 
@@ -208,6 +209,12 @@ The structured editor covers the current runtime keys:
 - `spatial.anchors`
 - `spatial.scene`
 - `spatial.persistence`
+- `wired.wired_headset`
+- `wired.wired_display_id`
+- `wired.wired_eye_height_m`
+- `wired.wired_position_tracking`
+- `wired.wired_controller_adapter`
+- `wired.wired_camera_monitor`
 - `logging.file_logging`
 - `logging.quest_logcat`
 
@@ -245,6 +252,42 @@ foveated encoding and does not change the desktop OpenXR application's rendering
 `client_upscaling` enables the Quest shader upscaling path. `headset_audio` is reserved in
 config and protocol, but the runtime does not advertise audio as active until a real
 capture/playback path is attached.
+
+### Headset section
+
+The Headset section at the top of the Streaming tab picks the headset mode. `Streaming (Quest /
+PICO / visionOS / simulator)` is the default and writes `wired.wired_headset = false`. `Wired Windows
+Mixed Reality headset (USB)` writes `wired_headset = true`: a Windows Mixed Reality headset plugged
+into the Mac over USB and HDMI/DisplayPort then replaces the streaming client (see
+[wmr.md](wmr.md)). With wired selected, the section also exposes `wired_eye_height_m` (`1.0` to
+`2.2` m, the head height above the floor without positional tracking, and the starting height
+with it), `wired_display_id` (the panel's `CGDirectDisplayID`; `0` auto-detects), a
+`Positional head tracking (6DoF, Basalt)` toggle (`wired_position_tracking`, on by default; it
+only takes effect when `libbasalt.dylib` is installed next to the headset helper) and a `Show the
+tracking cameras in a window` toggle (`wired_camera_monitor`, on by default; the helper's camera
+monitor window opens on a desktop screen whenever the headset is used), and reminds the user that
+the one-time EDID display override from `drivers/tools/wmr_edid_override.py` is required before
+macOS shows the panel. Home does not edit `wired_helper_path`; the runtime looks for
+`oxrsys-headset-helper` next to the runtime dylib unless the key is set by hand.
+
+With wired selected, a Motion Controllers group below handles 1st-gen Windows Mixed Reality
+controllers, which macOS's Bluetooth can't pair. `Windows Mixed Reality controllers through a USB
+Bluetooth adapter` writes `wired_controller_adapter`. Home lists USB devices with a Bluetooth HCI
+class (IOKit, class `E0`/`01`/`01` on the device or on one of its interfaces, Apple devices
+excluded) every five seconds and marks Realtek and Intel adapters as needing firmware. While the
+setting is on, an adapter is present, and `wmr_btstack` sits next to the selected (or registered)
+runtime dylib, Home starts it detached with `-p 0` and restarts it at most every ten seconds;
+`Start`, `Restart` and `Stop` are also available. Home reads `wmr_controllers_status.json` every
+second for the adapter address, the Left and Right controller states (not paired, paired but off,
+connecting, connected with its report rate, in use by the headset) and the pairing countdown.
+`Pair Controller…` sends a 60 s pairing window over `wmr_bt.sock` and shows the pairing-button
+instructions; `Forget Paired Controllers` drops all bondings. Details:
+[wmr.md](wmr.md#wmr-controllers-through-a-usb-bluetooth-adapter).
+
+> The wired-headset runtime backend, `oxrsys-headset-helper`, the Monado-derived drivers under
+> `drivers/` and `wmr_btstack` are not part of this branch. Until they land, Home writes and reads
+> the `[wired]` keys and drives `wmr_btstack` if you build and install it yourself, but the runtime
+> ignores the section and keeps using the streaming path.
 
 `client_reprojection` controls short missing-frame smoothing on the Quest client. The default
 `pose` reuses a recent decoded texture with the matched server render pose; `pose_warp` additionally
@@ -291,6 +334,10 @@ The runtime reloads config file changes opportunistically:
   `client_reprojection`, `abr_mode`, `passthrough_enabled`,
   `app_alpha_blend_passthrough`, `occlusion_mode`, `[spatial]`, and `headset_audio` apply when streaming or the
   encoder/client connection is recreated
+- the `[wired]` keys are read when an app calls `xrGetSystem` and passed to the headset helper
+  when the runtime starts it, so switching headset mode takes effect for the next OpenXR app
+  launch (stop a running helper first for the other keys) — once the wired runtime backend is
+  present
 - file logger sink setup still requires a restart
 
 The Settings ADB section detects authorized ADB devices, applies reverse mappings for ports `9944`, `9945`, `9946`, and `9948`, then verifies them through the native USB ADB protocol, the local ADB server protocol, or `adb reverse --list` fallback. USB refresh/setup results are request-scoped so stale results after ADB mode, path, selected device, or transport changes are ignored. If a periodic refresh cannot read reverse mappings for the same still-authorized device, Home preserves previously verified reverse ports instead of flipping the main readiness pill to not ready. This prepares the USB TCP transport and the reserved reliable spatial channel; it is separate from Android `UsbManager` app permission prompts.

@@ -90,6 +90,7 @@ See [Install](docs/install.md), [Build](docs/build.md), and
 - [Simulator](docs/simulator.md)
 - [macOS Home](docs/platforms/macos-home.md)
 - [Quest and Pico](docs/platforms/quest.md)
+- [Windows Mixed Reality headsets](docs/platforms/wmr.md)
 - [iOS Viewer](docs/platforms/ios-viewer.md)
 - [visionOS](docs/platforms/visionos.md)
 - [Scripts](scripts/README.md)
