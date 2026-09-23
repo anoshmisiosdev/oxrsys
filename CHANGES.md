@@ -15,6 +15,14 @@ This file tracks user-facing, integration-facing, and runtime-relevant changes f
   The value is deliberately undamped, so a punch is reported at its true instantaneous speed.
   Reference spaces stay static, the head keeps its existing prediction/jitter handling untouched,
   and when no velocity is known the runtime still reports none rather than a fabricated value.
+- Added quad composition layer support. `XR_TYPE_COMPOSITION_LAYER_QUAD` was previously validated
+  and then discarded, so applications were told the layer had been accepted and nothing was ever
+  drawn. Quad layers are now composited over the projection layer on the GPU in submission order,
+  honouring the quad's space and pose, its size in metres, `eyeVisibility`, the `subImage`
+  swapchain/array index/`imageRect`, and both the source-alpha and unpremultiplied-alpha blend
+  flags. Head-locked (`XR_REFERENCE_SPACE_TYPE_VIEW`) quads are pinned to the submitted view poses
+  so they do not swim against the scene. Quads are drawn before downscaling, format conversion, and
+  foveated packing, so the foveated encoding path carries them too.
 - Added first-class macOS `arm64` and `x86_64` CI lanes plus universal release packaging with
   architecture validation for the runtime and OXRSys Home.
 - Added a macOS/iOS simulator build lane covering the Cardboard-style stereo viewer and ARKit

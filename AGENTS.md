@@ -51,6 +51,10 @@ As of March 17, 2026, the pinned non-interactive OpenXR-CTS baseline is green lo
   application-provided dispatch path. Vulkan v1 may fall back only to an already-loaded process
   `vkGetInstanceProcAddr` through `dlsym(RTLD_DEFAULT, ...)`.
 - `Session::EndFrame()` must remain non-blocking.
+- The runtime accepts projection and quad composition layers and rejects every other layer type with
+  `XR_ERROR_LAYER_INVALID`. Quad layers are composited over the eye images on the encoder worker, in
+  submission order, before downscaling, format conversion, and foveated packing. A quad that cannot
+  be drawn this frame is dropped rather than failing the application's `xrEndFrame`.
 - Encoded-frame dispatch is bounded and latest-frame-oriented. Replacing a pending frame must
   release its `FrameSource` resources; backpressure must never run in VideoToolbox callbacks or
   `Session::EndFrame()`.

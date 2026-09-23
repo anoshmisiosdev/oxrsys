@@ -64,10 +64,40 @@ FrameImageSource MakeSource(id<MTLDevice> device, uint32_t width, uint32_t heigh
     return source;
 }
 
+// A quad layer covering the middle of both eyes, straight through the real
+// encoder. The interesting case is the foveated one: the foveation kernel
+// validates its source textures' size and usage, so a composited eye image that
+// did not satisfy those would come back as a dropped frame rather than as a
+// wrong picture.
+FrameQuadLayer MakeQuadLayer(id<MTLDevice> device, MTLPixelFormat pixelFormat)
+{
+    FrameQuadLayer quad = {};
+    quad.image = MakeSource(device, 32, 32, pixelFormat);
+    quad.pose.orientation[3] = 1.0f;
+    quad.pose.position[2] = -1.0f;
+    quad.widthMeters = 0.5f;
+    quad.heightMeters = 0.5f;
+    quad.blend = FrameQuadBlend::PremultipliedAlpha;
+    return quad;
+}
+
+FrameEyeView MakeEyeView()
+{
+    FrameEyeView view = {};
+    view.pose.orientation[3] = 1.0f;
+    view.fov.angleLeft = -0.7853981634f;
+    view.fov.angleRight = 0.7853981634f;
+    view.fov.angleUp = 0.7853981634f;
+    view.fov.angleDown = -0.7853981634f;
+    view.valid = true;
+    return view;
+}
+
 void EncodeOneFrame(oxr::protocol::VideoCodec codec,
                     MTLPixelFormat pixelFormat = MTLPixelFormatBGRA8Unorm,
                     bool foveated = false,
-                    bool tenBit = false)
+                    bool tenBit = false,
+                    bool withQuadLayer = false)
 {
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     REQUIRE(device != nil);
@@ -113,6 +143,13 @@ void EncodeOneFrame(oxr::protocol::VideoCodec codec,
     FrameSource frame = {};
     frame.left = MakeSource(device, 64, 64, pixelFormat);
     frame.right = MakeSource(device, 64, 64, pixelFormat);
+    if (withQuadLayer)
+    {
+        frame.views[0] = MakeEyeView();
+        frame.views[1] = MakeEyeView();
+        frame.quads.push_back(MakeQuadLayer(device, pixelFormat));
+        REQUIRE(frame.HasQuadLayers());
+    }
 
     encoder.ForceKeyframe();
     REQUIRE(encoder.EncodeStereo(
@@ -208,6 +245,31 @@ TEST_CASE("Foveated encoding converts sRGB Metal sources",
     EncodeOneFrame(oxr::protocol::VideoCodec::H264,
                    MTLPixelFormatRGBA8Unorm_sRGB,
                    true);
+}
+
+TEST_CASE("Quad layers survive the encoder's downscale and conversion paths",
+          "[video][encoder][videotoolbox][quad]")
+{
+    constexpr MTLPixelFormat formats[] = {
+        MTLPixelFormatBGRA8Unorm,
+        MTLPixelFormatRGBA8Unorm_sRGB,
+    };
+    for (const MTLPixelFormat format : formats)
+    {
+        INFO("Metal pixel format " << static_cast<uint64_t>(format));
+        EncodeOneFrame(oxr::protocol::VideoCodec::H264, format,
+                       /*foveated=*/false, /*tenBit=*/false, /*withQuadLayer=*/true);
+    }
+}
+
+TEST_CASE("Foveated encoding accepts an eye image with quad layers composited into it",
+          "[video][encoder][videotoolbox][quad][foveation]")
+{
+    // Quads are drawn before the foveation kernel runs, so they are warped with
+    // the rest of the eye image. If the composite texture broke the kernel's
+    // preconditions the frame would be dropped instead.
+    EncodeOneFrame(oxr::protocol::VideoCodec::H264, MTLPixelFormatBGRA8Unorm,
+                   /*foveated=*/true, /*tenBit=*/false, /*withQuadLayer=*/true);
 }
 
 TEST_CASE("VideoToolbox shutdown drains submitted frame-source ownership",

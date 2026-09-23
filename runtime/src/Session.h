@@ -118,7 +118,17 @@ private:
     XrResult ValidateSwapchainSubImage(const XrSwapchainSubImage& subImage) const;
     XrResult ValidateProjectionLayer(const XrCompositionLayerProjection& layer,
                                      FrameSource& frameSource) const;
-    XrResult ValidateQuadLayer(const XrCompositionLayerQuad& layer) const;
+    // Re-expresses a quad layer's centre pose in the projection layer's space.
+    // Returns false when the two spaces cannot be related this frame.
+    static bool RelocateQuadPose(Space* quadSpace, const XrPosef& quadPose, Space* projectionSpace,
+                                 XrTime displayTime, const FrameSource& frameSource,
+                                 FramePose& outPose);
+    // Validates a quad layer and, on success, appends it to `outQuad` expressed
+    // in `projectionSpace` — the reference space the projection layer's views
+    // were submitted in, which is what the compositor projects against.
+    XrResult ValidateQuadLayer(const XrCompositionLayerQuad& layer, XrTime displayTime,
+                               Space* projectionSpace, const FrameSource& frameSource,
+                               FrameQuadLayer& outQuad) const;
 
     uint64_t handle_ = 0;
     Instance* instance_;

@@ -189,6 +189,7 @@ add_executable(oxrsys_runtime_tests
     tests/TestProtocolLayout.cpp
     tests/TestQuestPassthroughAlphaPolicy.cpp
     tests/TestQuestShellInteraction.cpp
+    tests/TestQuadLayerProjection.cpp
     clients/android-vr/app/src/main/cpp/QuestPassthroughAlphaPolicy.cpp
     clients/android-vr/app/src/main/cpp/QuestShellInteraction.cpp
     runtime/src/InputManager.cpp
@@ -309,12 +310,39 @@ set_tests_properties(oxrsys_runtime_api_tests PROPERTIES
 )
 list(APPEND OXRSYS_RUNTIME_TEST_TARGETS oxrsys_runtime_api_tests)
 
+add_executable(oxrsys_quad_layer_metal_tests
+    tests/TestQuadLayerMetal.mm
+    runtime/src/QuadLayerRenderer.mm
+)
+target_include_directories(oxrsys_quad_layer_metal_tests PRIVATE
+    runtime/src
+    common/protocol/include
+    ${openxr_SOURCE_DIR}/include
+)
+target_link_libraries(oxrsys_quad_layer_metal_tests PRIVATE
+    Catch2::Catch2WithMain
+    glm::glm
+    spdlog::spdlog
+    "-framework Metal"
+    "-framework Foundation"
+)
+target_compile_definitions(oxrsys_quad_layer_metal_tests PRIVATE
+    XR_USE_GRAPHICS_API_METAL
+)
+add_test(NAME oxrsys_quad_layer_metal_tests COMMAND oxrsys_quad_layer_metal_tests)
+set_tests_properties(oxrsys_quad_layer_metal_tests PROPERTIES
+    ENVIRONMENT "${OXRSYS_ISOLATED_TEST_ENV}"
+    TIMEOUT 60
+)
+list(APPEND OXRSYS_RUNTIME_TEST_TARGETS oxrsys_quad_layer_metal_tests)
+
 add_executable(oxrsys_videotoolbox_encoder_tests
     tests/TestVideoToolboxEncoder.mm
     tests/TestEncoderHelperClient.mm
     runtime/src/VideoEncoder.mm
     runtime/src/EncoderHelperClient.mm
     runtime/src/EncoderPathPolicy.cpp
+    runtime/src/QuadLayerRenderer.mm
     runtime/src/Config.cpp
     runtime/src/RuntimePlatform.cpp
 )
@@ -326,6 +354,7 @@ target_include_directories(oxrsys_videotoolbox_encoder_tests PRIVATE
 )
 target_link_libraries(oxrsys_videotoolbox_encoder_tests PRIVATE
     Catch2::Catch2WithMain
+    glm::glm
     spdlog::spdlog
     "-framework Metal"
     "-framework MetalPerformanceShaders"

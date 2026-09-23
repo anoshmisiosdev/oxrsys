@@ -1559,6 +1559,28 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
     // frame instead of accumulating latency.
     const uint64_t framePeriodNs = 1'000'000'000ull / std::max(fps_, 1u);
     const uint64_t snapshotWaitNs = std::min<uint64_t>(framePeriodNs, 16'666'667ull);
+    // Quad layers come from their own swapchains with their own snapshot
+    // fences. A quad whose copy is not ready yet is dropped for this frame
+    // rather than stalling or dropping the whole eye image behind it.
+    if (!frameSource.quads.empty())
+    {
+        const size_t submittedQuads = frameSource.quads.size();
+        frameSource.quads.erase(
+            std::remove_if(frameSource.quads.begin(), frameSource.quads.end(),
+                           [&](const FrameQuadLayer& quad) {
+                               return !WaitForHostFrameImage(quad.image, snapshotWaitNs);
+                           }),
+            frameSource.quads.end());
+        if (frameSource.quads.size() != submittedQuads)
+        {
+            static std::atomic_bool loggedQuadSnapshotTimeout{false};
+            if (!loggedQuadSnapshotTimeout.exchange(true))
+            {
+                spdlog::warn("VideoEncoder: dropping quad layer(s) whose swapchain snapshot "
+                             "was not ready in time");
+            }
+        }
+    }
     if (!WaitForHostFrameImage(frameSource.left, snapshotWaitNs) ||
         (stereo && !WaitForHostFrameImage(frameSource.right, snapshotWaitNs)))
     {
@@ -1640,6 +1662,10 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
     {
         EncodeWaitForFrameImage(cmdBuf, frameSource.right);
     }
+    for (const FrameQuadLayer& quad : frameSource.quads)
+    {
+        EncodeWaitForFrameImage(cmdBuf, quad.image);
+    }
 
     // Crop each eye out of its swapchain sub-rectangle (subImage.imageRect). UE packs both eyes
     // side-by-side in one swapchain, so without this both eyes would receive the full [L|R] frame.
@@ -1703,6 +1729,34 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
                 return dropAcquiredSlot("failed to crop right eye texture");
             }
         }
+    }
+
+    // Composite XrCompositionLayerQuad layers over each eye *here*, on the
+    // cropped eye image, so everything downstream -- direct blit, MPS
+    // downscale, compute conversion and the foveated compute path -- picks the
+    // quads up without knowing they exist. Quad projection is defined per eye,
+    // so it only applies to a stereo submission.
+    if (stereo && oxrsys::quad::QuadLayerRenderer::HasWorkForEye(frameSource, true))
+    {
+        id<MTLTexture> composed = (__bridge id<MTLTexture>)quadRenderer_.ComposeEye(
+            (__bridge void*)cmdBuf, (__bridge void*)leftTex, frameSource, true,
+            &slot.leftQuadTexture);
+        if (composed == nil)
+        {
+            return dropAcquiredSlot("failed to composite left eye quad layers");
+        }
+        leftTex = composed;
+    }
+    if (stereo && oxrsys::quad::QuadLayerRenderer::HasWorkForEye(frameSource, false))
+    {
+        id<MTLTexture> composed = (__bridge id<MTLTexture>)quadRenderer_.ComposeEye(
+            (__bridge void*)cmdBuf, (__bridge void*)rightTex, frameSource, false,
+            &slot.rightQuadTexture);
+        if (composed == nil)
+        {
+            return dropAcquiredSlot("failed to composite right eye quad layers");
+        }
+        rightTex = composed;
     }
 
     const auto leftCopyMode = oxrsys::video::SelectTextureCopyMode(
@@ -2106,6 +2160,7 @@ void VideoEncoder::ReleaseSlot(size_t slotIndex)
 void VideoEncoder::DestroySlots()
 {
     std::lock_guard<std::mutex> lock(slotMutex_);
+    quadRenderer_.Shutdown();
     for (BufferSlot& slot : slots_)
     {
         slot.inUse = false;
@@ -2134,6 +2189,16 @@ void VideoEncoder::DestroySlots()
         {
             [(id<MTLTexture>)slot.rightCropTexture release];
             slot.rightCropTexture = nullptr;
+        }
+        if (slot.leftQuadTexture != nullptr)
+        {
+            [(id<MTLTexture>)slot.leftQuadTexture release];
+            slot.leftQuadTexture = nullptr;
+        }
+        if (slot.rightQuadTexture != nullptr)
+        {
+            [(id<MTLTexture>)slot.rightQuadTexture release];
+            slot.rightQuadTexture = nullptr;
         }
         if (slot.metalTexture != nullptr)
         {
