@@ -38,6 +38,28 @@ Encoder and socket backpressure never runs inside `Session::EndFrame()` or a Vid
 When a bounded slot or queue is full, OXRSys drops stale streaming work instead of accumulating
 latency.
 
+## Composition Layers
+
+OXRSys accepts `XR_TYPE_COMPOSITION_LAYER_PROJECTION` and `XR_TYPE_COMPOSITION_LAYER_QUAD`; every
+other layer type is rejected with `XR_ERROR_LAYER_INVALID`.
+
+The projection layer supplies the eye images and, with them, the pose and field of view each eye was
+rendered with. Quad layers are composited over those eye images on the GPU, in submission order, so
+a quad submitted after the projection layer draws on top of it. Quads are drawn into a per-eye copy
+before downscaling, format conversion, and foveated packing, so they follow the same path as the
+rest of the eye image rather than being applied to the finished encode target.
+
+Per layer, OXRSys honours `space` and `pose` (relocated into the projection layer's space), `size`
+in metres, `eyeVisibility`, the `subImage` swapchain, array index and `imageRect`, and the
+`XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT` and
+`XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT` blend flags. A quad in
+`XR_REFERENCE_SPACE_TYPE_VIEW` is pinned to the submitted view poses rather than to the latest
+predicted head pose, so head-locked content does not swim against the scene.
+
+A quad that cannot be composited for a frame — no projection layer to sit on, a swapchain snapshot
+that is not ready, a pose entirely behind the eye — is dropped for that frame. It never fails the
+application's `xrEndFrame`.
+
 ## Graphics Integration
 
 ### Metal

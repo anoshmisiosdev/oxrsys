@@ -14,6 +14,7 @@
 
 #include "GraphicsTypes.h"
 #include "BoundedDrain.h"
+#include "QuadLayerRenderer.h"
 #include <oxrsys/protocol/Protocol.h>
 
 /**
@@ -138,6 +139,8 @@ private:
         void* foveatedScratchTexture = nullptr; // id<MTLTexture>
         void* leftCropTexture = nullptr;   // id<MTLTexture>, lazily (re)sized to sourceWidth/sourceHeight
         void* rightCropTexture = nullptr;  // id<MTLTexture>, lazily (re)sized to sourceWidth/sourceHeight
+        void* leftQuadTexture = nullptr;   // id<MTLTexture>, eye image with quad layers composited over it
+        void* rightQuadTexture = nullptr;  // id<MTLTexture>, ditto for the right eye
         bool inUse = false;
     };
 
@@ -171,6 +174,9 @@ private:
     uint32_t bitrateMbps_ = 50;
     oxr::protocol::VideoCodec codec_ = oxr::protocol::VideoCodec::H265;
     FoveationSettings foveationSettings_ = {};
+    // Composites XrCompositionLayerQuad layers into each eye image before the
+    // downscale/convert/foveate paths below consume it.
+    oxrsys::quad::QuadLayerRenderer quadRenderer_;
     bool tenBit_ = false;
     std::atomic_bool initialized_{false};
     uint32_t frameCount_ = 0;

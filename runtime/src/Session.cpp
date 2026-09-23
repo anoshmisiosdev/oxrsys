@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MPL-2.0
 
 #include "Session.h"
+#include "QuadLayerProjection.h"
 #include "CompositionLayerAlpha.h"
+#include "CompositionLayerQuad.h"
 #include "Config.h"
 #include "Instance.h"
 #include "Runtime.h"
@@ -11,6 +13,8 @@
 #include "InputManager.h"
 #include "StreamingServer.h"
 #include <spdlog/spdlog.h>
+#include <glm/glm.hpp>
+#include <glm/gtc/quaternion.hpp>
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -20,6 +24,7 @@
 #include <numeric>
 #include <thread>
 #include <utility>
+#include <vector>
 
 namespace
 {
@@ -33,6 +38,29 @@ int64_t MonotonicNowNs()
     struct timespec ts{};
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return static_cast<int64_t>(ts.tv_sec) * 1000000000LL + ts.tv_nsec;
+}
+
+FramePose ToFramePose(const XrPosef& pose)
+{
+    FramePose result = {};
+    result.orientation[0] = pose.orientation.x;
+    result.orientation[1] = pose.orientation.y;
+    result.orientation[2] = pose.orientation.z;
+    result.orientation[3] = pose.orientation.w;
+    result.position[0] = pose.position.x;
+    result.position[1] = pose.position.y;
+    result.position[2] = pose.position.z;
+    return result;
+}
+
+FrameFov ToFrameFov(const XrFovf& fov)
+{
+    FrameFov result = {};
+    result.angleLeft = fov.angleLeft;
+    result.angleRight = fov.angleRight;
+    result.angleUp = fov.angleUp;
+    result.angleDown = fov.angleDown;
+    return result;
 }
 
 struct SessionMetricSummary
@@ -545,6 +573,16 @@ XrResult Session::EndFrame(const XrFrameEndInfo* frameEndInfo)
     bool sourceAlphaProjectionLayer = false;
 
     FrameSource frameSource = {};
+    // The space the surviving projection layer's views are expressed in. Quad
+    // poses are relocated into it so the compositor can project them against
+    // the very views the application rendered.
+    Space* projectionSpace = nullptr;
+    // OpenXR composites layers in array order, so a quad submitted *before* the
+    // projection layer is drawn underneath it. The projection layer is opaque
+    // here, so those quads are fully occluded; collect only the ones that come
+    // after it rather than wrongly drawing them on top.
+    std::vector<FrameQuadLayer> pendingQuads;
+    size_t quadsBeforeProjection = 0;
 
     for (uint32_t i = 0; i < frameEndInfo->layerCount; i++)
     {
@@ -571,19 +609,52 @@ XrResult Session::EndFrame(const XrFrameEndInfo* frameEndInfo)
                 {
                     return result;
                 }
+                projectionSpace = Runtime::Get().FromHandle<Space>(
+                    reinterpret_cast<uint64_t>(projectionLayer.space));
+                // A second projection layer replaces the first, and anything
+                // stacked on the first is now underneath it.
+                quadsBeforeProjection += pendingQuads.size();
+                pendingQuads.clear();
                 break;
             }
             case XR_TYPE_COMPOSITION_LAYER_QUAD:
             {
-                XrResult result = ValidateQuadLayer(*reinterpret_cast<const XrCompositionLayerQuad*>(layer));
+                FrameQuadLayer quad = {};
+                XrResult result = ValidateQuadLayer(
+                    *reinterpret_cast<const XrCompositionLayerQuad*>(layer),
+                    frameEndInfo->displayTime, projectionSpace, frameSource, quad);
                 if (result != XR_SUCCESS)
                 {
                     return result;
+                }
+                if (projectionSpace == nullptr)
+                {
+                    // Nothing to project against yet, so this quad is either
+                    // underneath a projection layer still to come or in a frame
+                    // with no projection layer at all. Either way it is not
+                    // drawn; ValidateQuadLayer leaves it empty.
+                    ++quadsBeforeProjection;
+                }
+                else if (quad.IsValid())
+                {
+                    pendingQuads.push_back(std::move(quad));
                 }
                 break;
             }
             default:
                 return XR_ERROR_LAYER_INVALID;
+        }
+    }
+
+    frameSource.quads = std::move(pendingQuads);
+    if (quadsBeforeProjection > 0)
+    {
+        static std::atomic_bool loggedOccludedQuads{false};
+        if (!loggedOccludedQuads.exchange(true))
+        {
+            spdlog::info("OXRSys: ignoring {} quad layer(s) not stacked above a projection layer; "
+                         "an opaque projection layer submitted after them hides them entirely",
+                         quadsBeforeProjection);
         }
     }
 
@@ -730,6 +801,13 @@ XrResult Session::ValidateProjectionLayer(const XrCompositionLayerProjection& la
         imageSource.sourceY = static_cast<uint32_t>(view.subImage.imageRect.offset.y);
         imageSource.sourceWidth = static_cast<uint32_t>(view.subImage.imageRect.extent.width);
         imageSource.sourceHeight = static_cast<uint32_t>(view.subImage.imageRect.extent.height);
+        // The compositor needs the exact pose and frustum the eye was rendered
+        // with to place quad layers in the same image.
+        FrameEyeView& eyeView = frameSource.views[viewIndex == 0 ? 0 : 1];
+        eyeView.pose = ToFramePose(view.pose);
+        eyeView.fov = ToFrameFov(view.fov);
+        eyeView.valid = true;
+
         if (viewIndex == 0)
         {
             frameSource.left = std::move(imageSource);
@@ -743,7 +821,75 @@ XrResult Session::ValidateProjectionLayer(const XrCompositionLayerProjection& la
     return XR_SUCCESS;
 }
 
-XrResult Session::ValidateQuadLayer(const XrCompositionLayerQuad& layer) const
+bool Session::RelocateQuadPose(Space* quadSpace, const XrPosef& quadPose, Space* projectionSpace,
+                               XrTime displayTime, const FrameSource& frameSource,
+                               FramePose& outPose)
+{
+    if (quadSpace == nullptr || projectionSpace == nullptr)
+    {
+        return false;
+    }
+    if (quadSpace == projectionSpace)
+    {
+        outPose = ToFramePose(quadPose);
+        return true;
+    }
+
+    // Head-locked quads are pinned to the *submitted* view poses rather than
+    // located through the tracker, so they share an instant with the eye images
+    // they sit on. Going through LocateSpace here would use a head pose one
+    // prediction newer than the pixels and the quad would swim.
+    if (quadSpace->GetType() == Space::Type::Reference &&
+        quadSpace->GetReferenceSpaceType() == XR_REFERENCE_SPACE_TYPE_VIEW)
+    {
+        FramePose renderViewPose = {};
+        if (oxrsys::quad::MakeRenderViewPose(frameSource.views, renderViewPose))
+        {
+            const FramePose spaceOffset = ToFramePose(quadSpace->GetPoseInSpace());
+            outPose = oxrsys::quad::ComposePose(
+                oxrsys::quad::ComposePose(renderViewPose, spaceOffset), ToFramePose(quadPose));
+            return true;
+        }
+    }
+
+    XrSpaceLocation location = {};
+    location.type = XR_TYPE_SPACE_LOCATION;
+    if (quadSpace->LocateSpace(projectionSpace, displayTime, &location) != XR_SUCCESS)
+    {
+        return false;
+    }
+    const XrSpaceLocationFlags required =
+        XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+    if ((location.locationFlags & required) != required)
+    {
+        return false;
+    }
+
+    // Compose the layer's own offset pose on top of where its space sits.
+    const glm::quat spaceRotation(location.pose.orientation.w, location.pose.orientation.x,
+                                  location.pose.orientation.y, location.pose.orientation.z);
+    const glm::vec3 spacePosition(location.pose.position.x, location.pose.position.y,
+                                  location.pose.position.z);
+    const glm::quat layerRotation(quadPose.orientation.w, quadPose.orientation.x,
+                                  quadPose.orientation.y, quadPose.orientation.z);
+    const glm::vec3 layerPosition(quadPose.position.x, quadPose.position.y, quadPose.position.z);
+
+    const glm::quat finalRotation = spaceRotation * layerRotation;
+    const glm::vec3 finalPosition = spacePosition + spaceRotation * layerPosition;
+
+    outPose.orientation[0] = finalRotation.x;
+    outPose.orientation[1] = finalRotation.y;
+    outPose.orientation[2] = finalRotation.z;
+    outPose.orientation[3] = finalRotation.w;
+    outPose.position[0] = finalPosition.x;
+    outPose.position[1] = finalPosition.y;
+    outPose.position[2] = finalPosition.z;
+    return true;
+}
+
+XrResult Session::ValidateQuadLayer(const XrCompositionLayerQuad& layer, XrTime displayTime,
+                                    Space* projectionSpace, const FrameSource& frameSource,
+                                    FrameQuadLayer& outQuad) const
 {
     auto* space = Runtime::Get().FromHandle<Space>(reinterpret_cast<uint64_t>(layer.space));
     if (space == nullptr || space->GetSession() != this)
@@ -760,7 +906,50 @@ XrResult Session::ValidateQuadLayer(const XrCompositionLayerQuad& layer) const
         return XR_ERROR_VALIDATION_FAILURE;
     }
 
-    return ValidateSwapchainSubImage(layer.subImage);
+    XrResult subImageResult = ValidateSwapchainSubImage(layer.subImage);
+    if (subImageResult != XR_SUCCESS)
+    {
+        return subImageResult;
+    }
+
+    // Validation passed; everything below only decides whether this frame can
+    // actually draw the quad. A quad that cannot be composited is dropped
+    // silently rather than failing the application's xrEndFrame.
+    if (projectionSpace == nullptr || layer.size.width <= 0.0f || layer.size.height <= 0.0f)
+    {
+        return XR_SUCCESS;
+    }
+
+    FramePose quadPose = {};
+    if (!RelocateQuadPose(space, layer.pose, projectionSpace, displayTime, frameSource, quadPose))
+    {
+        return XR_SUCCESS;
+    }
+
+    auto* swapchain =
+        Runtime::Get().FromHandle<Swapchain>(reinterpret_cast<uint64_t>(layer.subImage.swapchain));
+    FrameImageSource imageSource =
+        swapchain->GetLastReleasedFrameImageSource(layer.subImage.imageArrayIndex);
+    if (!imageSource.IsValid())
+    {
+        return XR_SUCCESS;
+    }
+    // Sample only the sub-rectangle the application submitted, not the whole
+    // swapchain image.
+    imageSource.sourceX = static_cast<uint32_t>(layer.subImage.imageRect.offset.x);
+    imageSource.sourceY = static_cast<uint32_t>(layer.subImage.imageRect.offset.y);
+    imageSource.sourceWidth = static_cast<uint32_t>(layer.subImage.imageRect.extent.width);
+    imageSource.sourceHeight = static_cast<uint32_t>(layer.subImage.imageRect.extent.height);
+    imageSource.imageWidth = swapchain->GetWidth();
+    imageSource.imageHeight = swapchain->GetHeight();
+
+    outQuad.image = std::move(imageSource);
+    outQuad.pose = quadPose;
+    outQuad.widthMeters = layer.size.width;
+    outQuad.heightMeters = layer.size.height;
+    outQuad.eyeVisibility = oxrsys::runtime::ToFrameEyeVisibility(layer.eyeVisibility);
+    outQuad.blend = oxrsys::runtime::ToFrameQuadBlend(layer.layerFlags);
+    return XR_SUCCESS;
 }
 
 bool Session::IsFrameLoopRunningState() const

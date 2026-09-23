@@ -25,6 +25,7 @@ add_library(oxrsys_runtime SHARED
     src/SwapchainCommon.cpp
     src/SwapchainVulkan.cpp
     src/SwapchainMetal.mm
+    src/QuadLayerRenderer.mm
     src/VideoEncoder.mm
 )
 
