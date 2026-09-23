@@ -5,6 +5,7 @@
 #include "Instance.h"
 #include "Runtime.h"
 #include "Swapchain.h"
+#include "SwapchainRect.h"
 #include "Space.h"
 #include "InputManager.h"
 #include "StreamingServer.h"
@@ -721,6 +722,11 @@ XrResult Session::ValidateProjectionLayer(const XrCompositionLayerProjection& la
         auto* swapchain = Runtime::Get().FromHandle<Swapchain>(reinterpret_cast<uint64_t>(view.subImage.swapchain));
         FrameImageSource imageSource =
             swapchain->GetLastReleasedFrameImageSource(view.subImage.imageArrayIndex);
+        // Carry the sub-region the app asked for through to the compositor;
+        // ValidateSwapchainSubImage above already checked it against the
+        // swapchain bounds. Apps that submit the full image get a rect that
+        // covers it, which the consumers treat exactly as before.
+        imageSource.rect = FrameImageRectFromSubImage(view.subImage);
         if (viewIndex == 0)
         {
             frameSource.left = std::move(imageSource);

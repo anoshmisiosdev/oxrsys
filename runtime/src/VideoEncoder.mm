@@ -64,6 +64,12 @@ struct MetalFoveationUniforms
     vector_float2 centerShift;
     vector_float2 edgeRatio;
     vector_float2 eyeSizeRatio;
+    // XrSwapchainSubImage::imageRect of each eye, as a normalized remap of the
+    // source texture. Identity-shaped (scale 1, offset 0) for a full-image rect.
+    vector_float2 leftUvScale;
+    vector_float2 leftUvOffset;
+    vector_float2 rightUvScale;
+    vector_float2 rightUvOffset;
 };
 
 // Axis-aligned foveated encoding shader logic adapted from ALVR's AADT
@@ -78,6 +84,10 @@ struct FoveationUniforms
     float2 centerShift;
     float2 edgeRatio;
     float2 eyeSizeRatio;
+    float2 leftUvScale;
+    float2 leftUvOffset;
+    float2 rightUvScale;
+    float2 rightUvOffset;
 };
 
 static float compress_axis(float eyeUv, float centerSize, float centerShift, float edgeRatio)
@@ -131,9 +141,13 @@ kernel void foveation_kernel(texture2d<float, access::sample> leftTexture [[text
     compressedUv.y = compress_axis(eyeUv.y, params.centerSize.y, params.centerShift.y, params.edgeRatio.y);
     compressedUv = clamp(compressedUv, float2(0.0), float2(1.0));
 
+    float2 uvScale = rightEye ? params.rightUvScale : params.leftUvScale;
+    float2 uvOffset = rightEye ? params.rightUvOffset : params.leftUvOffset;
+    float2 srcUv = uvOffset + compressedUv * uvScale;
+
     float4 color = rightEye
-        ? rightTexture.sample(linearSampler, compressedUv)
-        : leftTexture.sample(linearSampler, compressedUv);
+        ? rightTexture.sample(linearSampler, srcUv)
+        : leftTexture.sample(linearSampler, srcUv);
     outputTexture.write(color, gid);
 }
 )METAL";
@@ -316,6 +330,40 @@ bool TextureAllowsUsage(id<MTLTexture> texture, MTLTextureUsage requiredUsage)
     const MTLTextureUsage declaredUsage = texture.usage;
     return declaredUsage == MTLTextureUsageUnknown ||
            (declaredUsage & requiredUsage) == requiredUsage;
+}
+
+// Encode a crop-and-scale of `rect` out of `src` into the whole of `dst`.
+// A rect that covers the full source image keeps the original code path
+// (no scale transform), so the common full-image case is unchanged.
+void EncodeScaledCrop(MPSImageBilinearScale* scaler,
+                      id<MTLCommandBuffer> cmdBuf,
+                      id<MTLTexture> src,
+                      const FrameImageRect& rect,
+                      id<MTLTexture> dst)
+{
+    if (rect.CoversFullImage((uint32_t)src.width, (uint32_t)src.height))
+    {
+        scaler.scaleTransform = nullptr;
+        scaler.clipRect = MPSRectNoClip;
+        [scaler encodeToCommandBuffer:cmdBuf sourceTexture:src destinationTexture:dst];
+        return;
+    }
+
+    const FrameImageScaleTransform mapping =
+        MakeFrameImageScaleTransform(rect, (uint32_t)dst.width, (uint32_t)dst.height);
+    MPSScaleTransform transform = {};
+    transform.scaleX = mapping.scaleX;
+    transform.scaleY = mapping.scaleY;
+    transform.translateX = mapping.translateX;
+    transform.translateY = mapping.translateY;
+
+    scaler.scaleTransform = &transform;
+    scaler.clipRect = MTLRegionMake2D(0, 0, dst.width, dst.height);
+    [scaler encodeToCommandBuffer:cmdBuf sourceTexture:src destinationTexture:dst];
+    // MPS reads the transform while encoding, so it is safe to clear it here;
+    // leaving it set would leak the crop into the next frame's full-image scale.
+    scaler.scaleTransform = nullptr;
+    scaler.clipRect = MPSRectNoClip;
 }
 
 id<MTLComputePipelineState> CreateFoveationPipeline(id<MTLDevice> device)
@@ -1011,6 +1059,20 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
         return dropAcquiredSlot("missing source texture");
     }
 
+    // XrSwapchainSubImage::imageRect: the sub-region of each swapchain image the
+    // app asked to present. Apps that submit the whole image resolve to the full
+    // texture here, which every path below treats exactly as it did before.
+    const FrameImageRect leftRect =
+        frameSource.left.GetRect((uint32_t)leftTex.width, (uint32_t)leftTex.height);
+    FrameImageRect rightRect = {};
+    if (stereo)
+    {
+        rightRect = frameSource.right.GetRect((uint32_t)rightTex.width, (uint32_t)rightTex.height);
+    }
+    const bool croppedSource =
+        !leftRect.CoversFullImage((uint32_t)leftTex.width, (uint32_t)leftTex.height) ||
+        (stereo && !rightRect.CoversFullImage((uint32_t)rightTex.width, (uint32_t)rightTex.height));
+
     id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)videoToolbox_.commandQueue;
     if (queue == nil)
     {
@@ -1037,9 +1099,9 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
         videoToolbox_.foveationSampler != nullptr &&
         slot.foveatedScratchTexture != nullptr;
     bool needsDownscale = stereo
-        ? (leftTex.width != (NSUInteger)eyeWidth_ || leftTex.height != (NSUInteger)height_ ||
-           rightTex.width != (NSUInteger)eyeWidth_ || rightTex.height != (NSUInteger)height_)
-        : (leftTex.width != (NSUInteger)width_ || leftTex.height != (NSUInteger)height_);
+        ? (leftRect.width != (int32_t)eyeWidth_ || leftRect.height != (int32_t)height_ ||
+           rightRect.width != (int32_t)eyeWidth_ || rightRect.height != (int32_t)height_)
+        : (leftRect.width != (int32_t)width_ || leftRect.height != (int32_t)height_);
 
     if (frameCount_ == 0)
     {
@@ -1050,6 +1112,12 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
                       stereo ? (uint32_t)rightTex.height : 0,
                       (uint32_t)dstTexture.width, (uint32_t)dstTexture.height,
                       useFoveatedEncoding ? true : needsDownscale);
+        if (croppedSource)
+        {
+            spdlog::info("VideoEncoder: honouring imageRect L=({},{} {}x{}) R=({},{} {}x{})",
+                          leftRect.offsetX, leftRect.offsetY, leftRect.width, leftRect.height,
+                          rightRect.offsetX, rightRect.offsetY, rightRect.width, rightRect.height);
+        }
         if (useFoveatedEncoding)
         {
             spdlog::info("VideoEncoder: foveated path targetEye={}x{} encoded={}x{} ratio={:.4f}x{:.4f} via compute scratch texture",
@@ -1068,8 +1136,8 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
         if (foveatedDstTexture == nil ||
             foveatedDstTexture.width != (NSUInteger)width_ ||
             foveatedDstTexture.height != (NSUInteger)height_ ||
-            rightTex.width != leftTex.width ||
-            rightTex.height != leftTex.height ||
+            rightRect.width != leftRect.width ||
+            rightRect.height != leftRect.height ||
             !TextureAllowsUsage(leftTex, MTLTextureUsageShaderRead) ||
             !TextureAllowsUsage(rightTex, MTLTextureUsageShaderRead) ||
             !TextureAllowsUsage(foveatedDstTexture, MTLTextureUsageShaderWrite) ||
@@ -1077,8 +1145,8 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
             eyeWidth_ == 0 ||
             height_ == 0 ||
             !IsFoveationSettingsValid(foveationSettings_,
-                                      (uint32_t)leftTex.width,
-                                      (uint32_t)leftTex.height))
+                                      (uint32_t)leftRect.width,
+                                      (uint32_t)leftRect.height))
         {
             return dropAcquiredSlot("invalid foveated texture, dimensions, usage, or settings");
         }
@@ -1088,6 +1156,15 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
         uniforms.centerShift = {foveationSettings_.centerShiftX, foveationSettings_.centerShiftY};
         uniforms.edgeRatio = {foveationSettings_.edgeRatioX, foveationSettings_.edgeRatioY};
         uniforms.eyeSizeRatio = {foveationSettings_.eyeWidthRatio, foveationSettings_.eyeHeightRatio};
+
+        const FrameImageUvTransform leftUv = MakeFrameImageUvTransform(
+            leftRect, (uint32_t)leftTex.width, (uint32_t)leftTex.height);
+        const FrameImageUvTransform rightUv = MakeFrameImageUvTransform(
+            rightRect, (uint32_t)rightTex.width, (uint32_t)rightTex.height);
+        uniforms.leftUvScale = {leftUv.scaleX, leftUv.scaleY};
+        uniforms.leftUvOffset = {leftUv.offsetX, leftUv.offsetY};
+        uniforms.rightUvScale = {rightUv.scaleX, rightUv.scaleY};
+        uniforms.rightUvOffset = {rightUv.offsetX, rightUv.offsetY};
 
         id<MTLComputeCommandEncoder> computeEncoder = [cmdBuf computeCommandEncoder];
         if (computeEncoder == nil)
@@ -1137,8 +1214,8 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
         id<MTLTexture> tmpLeft = (id<MTLTexture>)slot.tmpLeftTexture;
         id<MTLTexture> tmpRight = (id<MTLTexture>)slot.tmpRightTexture;
         MPSImageBilinearScale* scaler = (MPSImageBilinearScale*)videoToolbox_.scaler;
-        [scaler encodeToCommandBuffer:cmdBuf sourceTexture:leftTex destinationTexture:tmpLeft];
-        [scaler encodeToCommandBuffer:cmdBuf sourceTexture:rightTex destinationTexture:tmpRight];
+        EncodeScaledCrop(scaler, cmdBuf, leftTex, leftRect, tmpLeft);
+        EncodeScaledCrop(scaler, cmdBuf, rightTex, rightRect, tmpRight);
 
         id<MTLBlitCommandEncoder> blit = [cmdBuf blitCommandEncoder];
         [blit copyFromTexture:tmpLeft
@@ -1164,24 +1241,24 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
     else if (stereo)
     {
         id<MTLBlitCommandEncoder> blit = [cmdBuf blitCommandEncoder];
-        NSUInteger leftCopyW = MIN(leftTex.width, (NSUInteger)eyeWidth_);
-        NSUInteger leftCopyH = MIN(leftTex.height, (NSUInteger)height_);
+        NSUInteger leftCopyW = MIN((NSUInteger)leftRect.width, (NSUInteger)eyeWidth_);
+        NSUInteger leftCopyH = MIN((NSUInteger)leftRect.height, (NSUInteger)height_);
         [blit copyFromTexture:leftTex
                   sourceSlice:0
                   sourceLevel:0
-                 sourceOrigin:MTLOriginMake(0, 0, 0)
+                 sourceOrigin:MTLOriginMake(leftRect.offsetX, leftRect.offsetY, 0)
                    sourceSize:MTLSizeMake(leftCopyW, leftCopyH, 1)
                     toTexture:dstTexture
              destinationSlice:0
              destinationLevel:0
             destinationOrigin:MTLOriginMake(0, 0, 0)];
 
-        NSUInteger rightCopyW = MIN(rightTex.width, (NSUInteger)eyeWidth_);
-        NSUInteger rightCopyH = MIN(rightTex.height, (NSUInteger)height_);
+        NSUInteger rightCopyW = MIN((NSUInteger)rightRect.width, (NSUInteger)eyeWidth_);
+        NSUInteger rightCopyH = MIN((NSUInteger)rightRect.height, (NSUInteger)height_);
         [blit copyFromTexture:rightTex
                   sourceSlice:0
                   sourceLevel:0
-                 sourceOrigin:MTLOriginMake(0, 0, 0)
+                 sourceOrigin:MTLOriginMake(rightRect.offsetX, rightRect.offsetY, 0)
                    sourceSize:MTLSizeMake(rightCopyW, rightCopyH, 1)
                     toTexture:dstTexture
              destinationSlice:0
@@ -1192,17 +1269,17 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
     else if (needsDownscale)
     {
         MPSImageBilinearScale* scaler = (MPSImageBilinearScale*)videoToolbox_.scaler;
-        [scaler encodeToCommandBuffer:cmdBuf sourceTexture:leftTex destinationTexture:dstTexture];
+        EncodeScaledCrop(scaler, cmdBuf, leftTex, leftRect, dstTexture);
     }
     else
     {
         id<MTLBlitCommandEncoder> blit = [cmdBuf blitCommandEncoder];
-        NSUInteger copyW = MIN(leftTex.width, dstTexture.width);
-        NSUInteger copyH = MIN(leftTex.height, dstTexture.height);
+        NSUInteger copyW = MIN((NSUInteger)leftRect.width, dstTexture.width);
+        NSUInteger copyH = MIN((NSUInteger)leftRect.height, dstTexture.height);
         [blit copyFromTexture:leftTex
                   sourceSlice:0
                   sourceLevel:0
-                 sourceOrigin:MTLOriginMake(0, 0, 0)
+                 sourceOrigin:MTLOriginMake(leftRect.offsetX, leftRect.offsetY, 0)
                    sourceSize:MTLSizeMake(copyW, copyH, 1)
                     toTexture:dstTexture
              destinationSlice:0
