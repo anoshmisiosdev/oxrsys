@@ -52,6 +52,13 @@ public:
     XrPosef GetControllerPose(Hand hand) const;
     XrPosef GetControllerAimPose(Hand hand) const;
 
+    // Raw controller velocity (linear m/s, angular rad/s) in the same tracking frame as
+    // GetControllerPose, for reporting XrSpaceVelocity. Undamped (finite difference of raw
+    // poses), so fast motion like a punch is preserved at full speed. False if unavailable /
+    // not streaming, in which case no velocity must be reported at all.
+    bool GetControllerVelocity(Hand hand, glm::vec3& linearVelocity,
+                               glm::vec3& angularVelocity) const;
+
     // Hand tracking joints (26 joints, world space relative to baseSpace)
     void GetHandJointLocations(Hand hand, XrHandJointLocationEXT* joints, uint32_t jointCount) const;
 

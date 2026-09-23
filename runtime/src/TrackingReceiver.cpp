@@ -2,6 +2,8 @@
 
 #include "TrackingReceiver.h"
 
+#include "VelocityMath.h"
+
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
@@ -440,4 +442,87 @@ void TrackingReceiver::StorePacket(const oxr::protocol::TrackingPacket& packet, 
 
     hasData_.store(true);
     packetCount_.fetch_add(1);
+}
+
+bool TrackingReceiver::GetRawControllerVelocity(bool leftHand, glm::vec3& linearVelocity,
+                                                glm::vec3& angularVelocity) const
+{
+    std::lock_guard<std::mutex> lock(poseMutex_);
+    if (history_.size() < 2)
+    {
+        return false;
+    }
+
+    const uint32_t activeFlag = leftHand
+        ? oxr::protocol::TRACKING_FLAG_LEFT_CONTROLLER_ACTIVE
+        : oxr::protocol::TRACKING_FLAG_RIGHT_CONTROLLER_ACTIVE;
+
+    // The two most recent samples that both have this controller active, so the finite
+    // difference spans real tracked motion and never straddles an inactivity gap. If the
+    // controller went inactive between the two newest active samples, the chain is broken and we
+    // report nothing rather than a bogus delta spanning the gap.
+    const HistorySample* newer = nullptr;
+    const HistorySample* older = nullptr;
+    for (auto it = history_.rbegin(); it != history_.rend(); ++it)
+    {
+        const bool active = (it->packet.trackingFlags & activeFlag) != 0;
+        if (!active)
+        {
+            if (newer != nullptr)
+            {
+                return false; // active chain broken before we found a pair
+            }
+            continue; // skip trailing inactive samples
+        }
+        if (newer == nullptr)
+        {
+            newer = &(*it);
+            continue;
+        }
+        older = &(*it);
+        break;
+    }
+    if (newer == nullptr || older == nullptr)
+    {
+        return false;
+    }
+
+    // Prefer the client's own sample clock (same convention as GetPredictedPose); fall back to
+    // host receive time for clients that do not stamp packets. Unlike prediction we do NOT fall
+    // back on a non-positive packet delta: a duplicate or backwards pair means we do not know the
+    // interval, and reporting no velocity is strictly better than reporting a fabricated one.
+    const int64_t deltaNs =
+        (newer->packet.timestampNs > 0 && older->packet.timestampNs > 0)
+            ? (newer->packet.timestampNs - older->packet.timestampNs)
+            : (newer->receiveTimeNs - older->receiveTimeNs);
+
+    const double dt = static_cast<double>(deltaNs) / 1e9;
+    if (!oxrsys::velocity::IsUsableSampleInterval(dt)) // duplicate, backwards or stale pair
+    {
+        return false;
+    }
+
+    const float* newerPos = leftHand ? newer->packet.leftControllerPos : newer->packet.rightControllerPos;
+    const float* olderPos = leftHand ? older->packet.leftControllerPos : older->packet.rightControllerPos;
+    const float* newerRot = leftHand ? newer->packet.leftControllerRot : newer->packet.rightControllerRot;
+    const float* olderRot = leftHand ? older->packet.leftControllerRot : older->packet.rightControllerRot;
+
+    // Plain two-point finite difference: this reports the instantaneous peak. Do not smooth or
+    // average in more samples here — that clips exactly the spike punch/throw detection looks for.
+    linearVelocity = oxrsys::velocity::FiniteDifferenceLinearVelocity(LoadVec3(newerPos),
+                                                                     LoadVec3(olderPos), dt);
+    angularVelocity = oxrsys::velocity::FiniteDifferenceAngularVelocity(LoadQuat(newerRot),
+                                                                       LoadQuat(olderRot), dt);
+
+    // One line per hand for the lifetime of the receiver — enough to confirm in a log that
+    // XrSpaceVelocity is live, cheap enough to sit on the per-frame path.
+    const uint32_t handBit = leftHand ? 0x1u : 0x2u;
+    if ((velocityLoggedHands_.fetch_or(handBit) & handBit) == 0)
+    {
+        spdlog::info("TrackingReceiver: {} controller velocity live (undamped finite difference, "
+                     "dt={:.1f}ms, speed={:.2f}m/s)",
+                     leftHand ? "left" : "right", dt * 1000.0, glm::length(linearVelocity));
+    }
+
+    return true;
 }
