@@ -7,14 +7,20 @@
 #include <cstdint>
 #include <functional>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "GraphicsTypes.h"
 #include "BoundedDrain.h"
 #include <oxrsys/protocol/Protocol.h>
+
+// Runtime-side client for the out-of-process native-arm64 hardware HEVC
+// encoder helper (see runtime/encoder_helper/README.md).
+class HevcEncoderHelperClient;
 
 /**
  * Low-latency video encoder facade.
@@ -148,6 +154,28 @@ private:
     void ReleaseSlot(size_t slotIndex);
     void DestroySlots();
 
+    // Native-arm64 hardware-HEVC helper integration. When the helper starts and
+    // reports the hardware encoder, the per-frame VideoToolbox encode is
+    // delegated to it (out-of-process, native arm64); the in-process session
+    // stays live as the fallback for helper death.
+    bool TryStartHelper();
+    // Stops the helper and finalizes every frame still in flight to it, so their
+    // slots and callback-drain leases are released. The client object itself is
+    // released only once the callback drain is empty (ReleaseHelperClient), so a
+    // Metal completion handler racing teardown cannot use a freed client.
+    void StopHelper();
+    void ReleaseHelperClient();
+    std::shared_ptr<HevcEncoderHelperClient> AcquireHelperClient() const;
+    void ReclaimHelperFrames(const char* reason);
+    // Invoked from the helper client's reader thread. `cookie` is the
+    // EncodeFrameContext* the frame was submitted with (opaque across the IPC).
+    void OnHelperNal(uint64_t cookie, const uint8_t* data, size_t size, bool keyframe,
+                     int64_t ptsNs);
+    void OnHelperFrameDone(uint64_t cookie, bool dropped, double encodeMs, bool keyframe);
+    // Reclaims every frame in flight to a helper that just died, so the
+    // in-process fallback is not starved of slots.
+    void OnHelperDied();
+
     struct VideoToolboxState
     {
         void* session = nullptr;          // VTCompressionSessionRef
@@ -172,6 +200,16 @@ private:
     oxr::protocol::VideoCodec codec_ = oxr::protocol::VideoCodec::H265;
     FoveationSettings foveationSettings_ = {};
     bool tenBit_ = false;
+
+    // Out-of-process native-arm64 hardware HEVC helper. useHelper_ is set only
+    // once the helper is up AND reports the hardware encoder; if it dies
+    // mid-session the client reports not-alive and EncodeInternal reverts to the
+    // in-process session (never a black screen).
+    mutable std::mutex helperClientMutex_;
+    std::shared_ptr<HevcEncoderHelperClient> helperClient_;
+    std::atomic<bool> useHelper_{false};
+    std::mutex helperContextMutex_;
+    std::unordered_map<uint64_t, void*> helperContexts_; // cookie -> EncodeFrameContext*
     std::atomic_bool initialized_{false};
     uint32_t frameCount_ = 0;
     std::atomic<bool> forceKeyframe_{false};

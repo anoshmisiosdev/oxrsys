@@ -52,6 +52,20 @@ encoder_preset = "balanced"
 # H.264 and clients without the capability continue to receive 8-bit video.
 encoder_10bit = false
 
+# Out-of-process native-arm64 HARDWARE HEVC encoder helper.
+# When the runtime dylib is loaded in-process by an x86_64/Rosetta host (for
+# example CrossOver's Wine host), VideoToolbox refuses it the hardware HEVC
+# encoder and silently falls back to the software encoder (~27-40ms/frame).
+# With this enabled the runtime spawns a small native-arm64 helper process that
+# IS granted the hardware HEVC encoder (~8ms/frame), sharing the compose
+# IOSurfaces zero-copy via mach send rights. If the helper cannot start or does
+# not get the hardware encoder, the runtime transparently keeps using the
+# in-process encoder. Ignored for H.264 and for HEVC Main10. Default off.
+encoder_helper = false
+# Path to the helper binary. Empty = look for "oxrsys-encoder-helper" next to the
+# runtime dylib (also overridable at runtime via $OXRSYS_ENCODER_HELPER_PATH).
+encoder_helper_path = ""
+
 # Streaming transport: "auto" tries USB ADB reverse and WiFi, "wifi" disables USB TCP
 # listeners, and "usb_adb" disables WiFi discovery fallback.
 transport = "auto"

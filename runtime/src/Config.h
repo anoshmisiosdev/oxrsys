@@ -24,6 +24,14 @@ struct ConfigValues
     std::string videoCodec = "h265"; // "h265", "h264", "auto"
     std::string encoderPreset = "balanced"; // "quality", "balanced", "speed"
     bool encoder10Bit = false;      // Encode HEVC Main10 for capable H.265 clients
+
+    // Out-of-process native-arm64 hardware HEVC encoder helper. When the
+    // runtime dylib is loaded by an x86_64/Rosetta host it cannot reach
+    // VideoToolbox's hardware HEVC encoder; if enabled, the runtime spawns a
+    // native-arm64 helper that can, sharing the compose IOSurfaces zero-copy.
+    // Falls back to the in-process encoder when unavailable. Default off.
+    bool encoderHelperEnabled = false;
+    std::string encoderHelperPath; // empty = sibling of the runtime dylib
     std::string streamingTransport = "auto"; // "auto", "wifi", "usb_adb"
     std::string foveatedEncodingPreset = "off"; // "off", "light", "medium", "high"
     std::string clientFoveationPreset = "auto"; // "auto", "off", "light", "medium", "high"

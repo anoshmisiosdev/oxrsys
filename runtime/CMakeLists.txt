@@ -26,10 +26,12 @@ add_library(oxrsys_runtime SHARED
     src/SwapchainVulkan.cpp
     src/SwapchainMetal.mm
     src/VideoEncoder.mm
+    src/HevcEncoderHelperClient.mm
 )
 
 target_include_directories(oxrsys_runtime PRIVATE
     src
+    encoder_helper
     ${CMAKE_SOURCE_DIR}/common/protocol/include
     ${openxr_SOURCE_DIR}/include
     ${openxr_SOURCE_DIR}/src/common
@@ -60,6 +62,7 @@ target_link_libraries(oxrsys_runtime PRIVATE
     "-framework VideoToolbox"
     "-framework CoreMedia"
     "-framework CoreVideo"
+    "-framework IOSurface"
 )
 
 # Only export the negotiation entry point.

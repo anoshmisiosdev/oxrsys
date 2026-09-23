@@ -23,6 +23,8 @@ keyframe_interval_sec = 4
 video_codec = "h264"
 encoder_preset = "quality"
 encoder_10bit = true
+encoder_helper = true
+encoder_helper_path = "/opt/oxrsys/oxrsys-encoder-helper"
 foveated_encoding_preset = "medium"
 client_foveation_preset = "high"
 client_upscaling = true
@@ -56,6 +58,8 @@ quest_logcat = yes
     CHECK(values.videoCodec == "h264");
     CHECK(values.encoderPreset == "quality");
     CHECK(values.encoder10Bit == true);
+    CHECK(values.encoderHelperEnabled == true);
+    CHECK(values.encoderHelperPath == "/opt/oxrsys/oxrsys-encoder-helper");
     CHECK(values.foveatedEncodingPreset == "medium");
     CHECK(values.clientFoveationPreset == "high");
     CHECK(values.clientUpscaling == true);
@@ -110,6 +114,8 @@ occlusion_mode = "magic"
     defaults.passthroughEnabled = true;
     defaults.appAlphaBlendPassthrough = true;
     defaults.occlusionMode = "scene_mesh";
+    defaults.encoderHelperEnabled = true;
+    defaults.encoderHelperPath = "/opt/oxrsys/oxrsys-encoder-helper";
 
     const ConfigValues values = ParseConfigToml(input, defaults);
 
@@ -129,6 +135,8 @@ occlusion_mode = "magic"
     CHECK(values.passthroughEnabled == true);
     CHECK(values.appAlphaBlendPassthrough == true);
     CHECK(values.occlusionMode == "scene_mesh");
+    CHECK(values.encoderHelperEnabled == true);
+    CHECK(values.encoderHelperPath == "/opt/oxrsys/oxrsys-encoder-helper");
 }
 
 TEST_CASE("Config parser migrates legacy mixed reality mode to passthrough", "[config]")

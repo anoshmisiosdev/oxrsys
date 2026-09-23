@@ -172,6 +172,7 @@ add_executable(oxrsys_runtime_tests
     tests/TestBoundedDrain.cpp
     tests/TestClientLiveness.cpp
     tests/TestConfig.cpp
+    tests/TestEncoderHelperIpc.cpp
     tests/TestInputManager.cpp
     tests/TestRuntimePlatform.cpp
     tests/TestStreamingAbr.cpp
@@ -199,6 +200,7 @@ add_executable(oxrsys_runtime_tests
 )
 target_include_directories(oxrsys_runtime_tests PRIVATE
     runtime/src
+    runtime/encoder_helper
     clients/android-vr/app/src/main/cpp
     common/protocol/include
     ${openxr_SOURCE_DIR}/include
