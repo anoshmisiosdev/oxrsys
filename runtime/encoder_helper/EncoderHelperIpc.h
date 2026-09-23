@@ -38,7 +38,11 @@ namespace oxrsys::enc_ipc
 
 // Frame magic on the wire, ASCII "OXH1".
 inline constexpr uint32_t kMagic = 0x4F584831u;
-inline constexpr uint16_t kProtocolVersion = 1;
+// v2 added the negotiated codec + profile to Init. Both peers reject a frame
+// whose version is not theirs: an out-of-date helper binary next to a newer
+// runtime then fails at handshake (and the runtime falls back to the in-process
+// encoder) instead of misreading a payload.
+inline constexpr uint16_t kProtocolVersion = 2;
 
 // Bound the read loop before any allocation. One HEVC access unit for a
 // 2272x1264 stereo frame is far below this.
@@ -70,6 +74,27 @@ enum class PresetCode : uint32_t
     Quality = 2,
 };
 
+// Negotiated codec. Deliberately its own enum rather than oxr::protocol::
+// VideoCodec: this header must not depend on the runtime's protocol headers,
+// and the wire value must not move if that enum is ever reordered. The values
+// happen to match today; CodecFromProtocol on the runtime side is the only
+// place that mapping lives.
+enum class CodecCode : uint32_t
+{
+    H265 = 0,
+    H264 = 1,
+};
+
+// Bitstream profile the parent negotiated. The helper must honour it exactly —
+// it never substitutes a codec or profile the client did not agree to. Main10
+// is encoded from the same 8-bit BGRA compose surface as Main, matching what
+// the in-process path does: 10-bit bitstream precision, 8-bit source.
+enum class ProfileCode : uint32_t
+{
+    Main = 0,   // HEVC Main / H.264 Main, 8-bit
+    Main10 = 1, // HEVC Main10 (HEVC only; ignored for H.264)
+};
+
 // InitAck status codes — reported so the parent log can say exactly where the
 // helper failed rather than a generic "unavailable".
 enum class InitStatus : uint32_t
@@ -78,6 +103,23 @@ enum class InitStatus : uint32_t
     SurfaceTransferFailed = 1,
     SessionCreateFailed = 2,
     HardwareUnavailable = 3, // session created but RequireHardware not honored
+    UnsupportedCodec = 4,    // Init named a codec this helper cannot encode
+    BadProtocolVersion = 5,  // parent speaks a protocol version this helper does not
+};
+
+// The Init payload, in wire order. Shared by both peers so the field order can
+// only be got wrong in one place.
+struct InitPayload
+{
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t fps = 0;
+    uint32_t bitrateMbps = 0;
+    uint32_t keyframeIntervalSec = 2;
+    uint32_t slotCount = 0;
+    PresetCode preset = PresetCode::Balanced;
+    CodecCode codec = CodecCode::H265;    // v2
+    ProfileCode profile = ProfileCode::Main; // v2
 };
 
 // -----------------------------------------------------------------------------
@@ -175,6 +217,86 @@ inline std::vector<uint8_t> Frame(MsgType type, const std::vector<uint8_t>& payl
     PutU32(out, (uint32_t)payload.size());
     out.insert(out.end(), payload.begin(), payload.end());
     return out;
+}
+
+// Parsed frame header. `ok` is false for a foreign magic, a protocol version
+// that is not ours, or an implausible length — all of which must abort the
+// connection rather than be interpreted.
+struct FrameHeader
+{
+    MsgType type = MsgType::Init;
+    uint16_t version = 0;
+    uint32_t payloadLength = 0;
+    bool ok = false;
+};
+
+inline FrameHeader ParseHeader(const uint8_t* header, size_t size)
+{
+    FrameHeader out;
+    if (header == nullptr || size < kHeaderBytes)
+    {
+        return out;
+    }
+    Reader r(header, kHeaderBytes);
+    const uint32_t magic = r.U32();
+    out.type = (MsgType)r.U16();
+    out.version = r.U16();
+    out.payloadLength = r.U32();
+    out.ok = r.ok() && magic == kMagic && out.version == kProtocolVersion &&
+             out.payloadLength <= kMaxPayloadBytes;
+    return out;
+}
+
+// --- Init payload (de)serialization: one definition, both peers ---
+inline std::vector<uint8_t> SerializeInit(const InitPayload& init)
+{
+    std::vector<uint8_t> p;
+    PutU32(p, init.width);
+    PutU32(p, init.height);
+    PutU32(p, init.fps);
+    PutU32(p, init.bitrateMbps);
+    PutU32(p, init.keyframeIntervalSec);
+    PutU32(p, init.slotCount);
+    PutU32(p, (uint32_t)init.preset);
+    PutU32(p, (uint32_t)init.codec);
+    PutU32(p, (uint32_t)init.profile);
+    return p;
+}
+
+inline bool DeserializeInit(const uint8_t* data, size_t size, InitPayload& out)
+{
+    Reader r(data, size);
+    out.width = r.U32();
+    out.height = r.U32();
+    out.fps = r.U32();
+    out.bitrateMbps = r.U32();
+    out.keyframeIntervalSec = r.U32();
+    out.slotCount = r.U32();
+    const uint32_t preset = r.U32();
+    const uint32_t codec = r.U32();
+    const uint32_t profile = r.U32();
+    if (!r.ok())
+    {
+        return false;
+    }
+    if (preset > (uint32_t)PresetCode::Quality || codec > (uint32_t)CodecCode::H264 ||
+        profile > (uint32_t)ProfileCode::Main10)
+    {
+        return false;
+    }
+    if (out.slotCount == 0 || out.slotCount > kMaxSlots || out.width == 0 || out.height == 0)
+    {
+        return false;
+    }
+    out.preset = (PresetCode)preset;
+    out.codec = (CodecCode)codec;
+    out.profile = (ProfileCode)profile;
+    return true;
+}
+
+inline const char* CodecName(CodecCode codec)
+{
+    return codec == CodecCode::H264 ? "H.264" : "H.265";
 }
 
 // -----------------------------------------------------------------------------

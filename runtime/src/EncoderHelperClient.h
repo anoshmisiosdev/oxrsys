@@ -12,7 +12,7 @@
 #include <vector>
 
 /**
- * Runtime-side client for the native-arm64 HEVC encoder helper.
+ * Runtime-side client for the native-arm64 video encoder helper.
  *
  * The runtime dylib is x86_64 (Rosetta) and cannot reach VideoToolbox's
  * hardware HEVC encoder. This client spawns a native-arm64 helper process that
@@ -25,9 +25,23 @@
  * Header stays framework-free (IOSurfaces are passed as opaque void*); the .mm
  * resolves IOSurface / mach types.
  */
-class HevcEncoderHelperClient
+class EncoderHelperClient
 {
 public:
+    // Mirrors enc_ipc::CodecCode / ProfileCode. Declared here so the runtime
+    // does not have to include the wire header; EncoderHelperClient.mm
+    // static_asserts the two against each other.
+    enum class Codec : uint32_t
+    {
+        H265 = 0,
+        H264 = 1,
+    };
+    enum class Profile : uint32_t
+    {
+        Main = 0,   // HEVC Main / H.264 Main, 8-bit
+        Main10 = 1, // HEVC Main10 (10-bit bitstream from the 8-bit compose surface)
+    };
+
     struct Config
     {
         uint32_t width = 0;
@@ -36,6 +50,11 @@ public:
         uint32_t bitrateMbps = 0;
         uint32_t keyframeIntervalSec = 2;
         uint32_t preset = 0; // 0 balanced, 1 speed, 2 quality
+        // Negotiated codec/profile, as enc_ipc::CodecCode / ProfileCode values.
+        // The helper honours them exactly or refuses to start; it never
+        // substitutes a codec the client did not agree to.
+        Codec codec = Codec::H265;
+        Profile profile = Profile::Main;
         std::string helperPath;
     };
 
@@ -51,14 +70,14 @@ public:
     // slots are released and the software fallback is not starved.
     using OnDied = std::function<void()>;
 
-    HevcEncoderHelperClient() = default;
-    ~HevcEncoderHelperClient();
+    EncoderHelperClient() = default;
+    ~EncoderHelperClient();
 
     // Set before Start(). Called once when the helper dies mid-session.
     void SetDiedCallback(OnDied cb) { onDied_ = std::move(cb); }
 
-    HevcEncoderHelperClient(const HevcEncoderHelperClient&) = delete;
-    HevcEncoderHelperClient& operator=(const HevcEncoderHelperClient&) = delete;
+    EncoderHelperClient(const EncoderHelperClient&) = delete;
+    EncoderHelperClient& operator=(const EncoderHelperClient&) = delete;
 
     // Spawns the helper, transfers the `count` IOSurfaces (index == slot), and
     // waits for its init acknowledgement. `iosurfaces[i]` is an IOSurfaceRef.

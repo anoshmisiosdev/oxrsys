@@ -5,6 +5,7 @@
 #include "EncoderHelperIpc.h"
 
 #include <cstring>
+#include <string>
 #include <vector>
 
 using namespace oxrsys::enc_ipc;
@@ -12,7 +13,7 @@ using namespace oxrsys::enc_ipc;
 namespace
 {
 
-// Mirrors HevcEncoderHelperClient::SubmitFrame / the helper's Encode handler.
+// Mirrors EncoderHelperClient::SubmitFrame / the helper's Encode handler.
 std::vector<uint8_t> BuildEncodePayload(uint64_t cookie, uint32_t slot, int64_t ptsNs,
                                         bool forceKeyframe)
 {
@@ -97,4 +98,121 @@ TEST_CASE("Encoder helper protocol bounds are sane for the runtime's slot count"
     CHECK(kMaxPayloadBytes >= 1u * 1024u * 1024u);
     // 'BGRA' is the compose format the runtime hands the helper.
     CHECK(kPixelFormatBGRA == 0x42475241u);
+}
+
+TEST_CASE("Encoder helper Init carries the negotiated codec and profile", "[encoder_helper]")
+{
+    // The helper must encode what the client and runtime agreed, never a
+    // substitute, so the negotiated codec and profile travel explicitly.
+    InitPayload sent;
+    sent.width = 2272;
+    sent.height = 1264;
+    sent.fps = 72;
+    sent.bitrateMbps = 50;
+    sent.keyframeIntervalSec = 2;
+    sent.slotCount = 3;
+    sent.preset = PresetCode::Speed;
+    sent.codec = CodecCode::H264;
+    sent.profile = ProfileCode::Main;
+
+    const std::vector<uint8_t> payload = SerializeInit(sent);
+    InitPayload received;
+    REQUIRE(DeserializeInit(payload.data(), payload.size(), received));
+    CHECK(received.width == 2272u);
+    CHECK(received.height == 1264u);
+    CHECK(received.fps == 72u);
+    CHECK(received.bitrateMbps == 50u);
+    CHECK(received.keyframeIntervalSec == 2u);
+    CHECK(received.slotCount == 3u);
+    CHECK(received.preset == PresetCode::Speed);
+    CHECK(received.codec == CodecCode::H264);
+    CHECK(received.profile == ProfileCode::Main);
+
+    // HEVC Main10 rides the same 8-bit BGRA surface contract; only the profile
+    // field changes.
+    sent.codec = CodecCode::H265;
+    sent.profile = ProfileCode::Main10;
+    const std::vector<uint8_t> tenBit = SerializeInit(sent);
+    CHECK(tenBit.size() == payload.size());
+    REQUIRE(DeserializeInit(tenBit.data(), tenBit.size(), received));
+    CHECK(received.codec == CodecCode::H265);
+    CHECK(received.profile == ProfileCode::Main10);
+    CHECK(std::string(CodecName(received.codec)) == "H.265");
+    CHECK(std::string(CodecName(CodecCode::H264)) == "H.264");
+}
+
+TEST_CASE("Encoder helper Init rejects payloads it cannot honour", "[encoder_helper]")
+{
+    InitPayload valid;
+    valid.width = 1920;
+    valid.height = 1080;
+    valid.slotCount = 3;
+    const std::vector<uint8_t> payload = SerializeInit(valid);
+    InitPayload out;
+
+    // Truncated.
+    CHECK_FALSE(DeserializeInit(payload.data(), payload.size() - 1, out));
+
+    // Out-of-range enum values: reading a codec the helper has no mapping for
+    // must fail the handshake rather than fall through to a default codec.
+    std::vector<uint8_t> badCodec = payload;
+    badCodec[7 * 4] = 9;
+    CHECK_FALSE(DeserializeInit(badCodec.data(), badCodec.size(), out));
+
+    std::vector<uint8_t> badProfile = payload;
+    badProfile[8 * 4] = 7;
+    CHECK_FALSE(DeserializeInit(badProfile.data(), badProfile.size(), out));
+
+    // Geometry / slot count the child cannot allocate for.
+    InitPayload noSlots = valid;
+    noSlots.slotCount = 0;
+    const std::vector<uint8_t> zeroSlots = SerializeInit(noSlots);
+    CHECK_FALSE(DeserializeInit(zeroSlots.data(), zeroSlots.size(), out));
+
+    InitPayload tooManySlots = valid;
+    tooManySlots.slotCount = kMaxSlots + 1;
+    const std::vector<uint8_t> overflow = SerializeInit(tooManySlots);
+    CHECK_FALSE(DeserializeInit(overflow.data(), overflow.size(), out));
+
+    InitPayload noGeometry = valid;
+    noGeometry.width = 0;
+    const std::vector<uint8_t> zeroWidth = SerializeInit(noGeometry);
+    CHECK_FALSE(DeserializeInit(zeroWidth.data(), zeroWidth.size(), out));
+}
+
+TEST_CASE("Encoder helper header parse rejects a foreign or stale peer", "[encoder_helper]")
+{
+    const std::vector<uint8_t> framed = Frame(MsgType::Init, SerializeInit(InitPayload{
+                                                                 2272, 1264, 72, 50, 2, 3,
+                                                                 PresetCode::Balanced,
+                                                                 CodecCode::H265,
+                                                                 ProfileCode::Main}));
+    const FrameHeader good = ParseHeader(framed.data(), framed.size());
+    CHECK(good.ok);
+    CHECK(good.type == MsgType::Init);
+    CHECK(good.version == kProtocolVersion);
+    CHECK(good.payloadLength == framed.size() - kHeaderBytes);
+
+    // A helper binary left over from protocol v1 beside a v2 runtime: reject the
+    // frame so the runtime falls back to the in-process encoder instead of
+    // misreading a payload whose layout it does not know.
+    std::vector<uint8_t> staleVersion = framed;
+    staleVersion[6] = 1;
+    staleVersion[7] = 0;
+    CHECK_FALSE(ParseHeader(staleVersion.data(), staleVersion.size()).ok);
+
+    std::vector<uint8_t> foreignMagic = framed;
+    foreignMagic[0] ^= 0xFF;
+    CHECK_FALSE(ParseHeader(foreignMagic.data(), foreignMagic.size()).ok);
+
+    // An absurd length must be refused before anything is allocated for it.
+    std::vector<uint8_t> hugePayload = framed;
+    hugePayload[8] = 0xFF;
+    hugePayload[9] = 0xFF;
+    hugePayload[10] = 0xFF;
+    hugePayload[11] = 0xFF;
+    CHECK_FALSE(ParseHeader(hugePayload.data(), hugePayload.size()).ok);
+
+    CHECK_FALSE(ParseHeader(framed.data(), kHeaderBytes - 1).ok);
+    CHECK_FALSE(ParseHeader(nullptr, kHeaderBytes).ok);
 }

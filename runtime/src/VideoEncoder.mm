@@ -2,7 +2,8 @@
 
 #import "VideoEncoder.h"
 #import "Config.h"
-#import "HevcEncoderHelperClient.h"
+#import "EncoderHelperClient.h"
+#import "EncoderPathPolicy.h"
 #import "VideoTextureFormat.h"
 
 #import <CoreVideo/CoreVideo.h>
@@ -310,6 +311,71 @@ CMVideoCodecType VideoToolboxCodecType(oxr::protocol::VideoCodec codec)
         default:
             return kCMVideoCodecType_HEVC;
     }
+}
+
+// Does THIS process actually get a hardware encoder for `codecType`?
+//
+// The answer is not a property of the machine: VideoToolbox grants an x86_64
+// (Rosetta) process the hardware H.264 encoder but not the hardware HEVC one,
+// and that grant is Apple's to change. So ask VideoToolbox rather than reading
+// the architecture: VTCopyVideoEncoderList reports, per codec, whether a
+// hardware encoder is visible here. If the list cannot be had, fall back to the
+// definitive test — try to create a RequireHardware=YES session and see.
+bool ProbeHardwareSession(CMVideoCodecType codecType, uint32_t width, uint32_t height)
+{
+    NSDictionary* spec = @{
+        (NSString*)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @YES,
+        (NSString*)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES,
+    };
+    VTCompressionSessionRef probe = nullptr;
+    const OSStatus status = VTCompressionSessionCreate(
+        kCFAllocatorDefault, (int32_t)std::max(width, 16u), (int32_t)std::max(height, 16u),
+        codecType, (__bridge CFDictionaryRef)spec, nullptr, kCFAllocatorDefault, nullptr, nullptr,
+        &probe);
+    if (status != noErr || probe == nullptr)
+    {
+        spdlog::info("VideoEncoder: RequireHardware=YES probe failed ({}) - no hardware encoder in "
+                     "this process",
+                     status);
+        return false;
+    }
+    VTCompressionSessionInvalidate(probe);
+    CFRelease(probe);
+    return true;
+}
+
+bool HardwareEncoderAvailableInProcess(CMVideoCodecType codecType, uint32_t width, uint32_t height)
+{
+    CFArrayRef encoderList = nullptr;
+    if (VTCopyVideoEncoderList(nullptr, &encoderList) == noErr && encoderList != nullptr)
+    {
+        bool sawCodec = false;
+        bool hardware = false;
+        const CFIndex count = CFArrayGetCount(encoderList);
+        for (CFIndex i = 0; i < count; i++)
+        {
+            NSDictionary* entry = (__bridge NSDictionary*)(CFDictionaryRef)CFArrayGetValueAtIndex(
+                encoderList, i);
+            NSNumber* entryCodec = entry[(NSString*)kVTVideoEncoderList_CodecType];
+            if (entryCodec == nil || (CMVideoCodecType)[entryCodec intValue] != codecType)
+            {
+                continue;
+            }
+            sawCodec = true;
+            NSNumber* isHardware = entry[(NSString*)kVTVideoEncoderList_IsHardwareAccelerated];
+            if (isHardware != nil && [isHardware boolValue])
+            {
+                hardware = true;
+                break;
+            }
+        }
+        CFRelease(encoderList);
+        if (sawCodec)
+        {
+            return hardware;
+        }
+    }
+    return ProbeHardwareSession(codecType, width, height);
 }
 
 CFStringRef VideoToolboxProfileLevel(oxr::protocol::VideoCodec codec, bool tenBit)
@@ -893,9 +959,37 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
         slots_[i].inUse = false;
     }
 
+    const ConfigValues initialConfig = Config::Get().GetValues();
+
+    // Which process encodes this codec, and why. Decided from what VideoToolbox
+    // will actually grant this process — not from its architecture — so the
+    // logic survives Apple changing what Rosetta is allowed.
+    const bool hardwareInProcess =
+        HardwareEncoderAvailableInProcess(VideoToolboxCodecType(codec_), width, height);
+    {
+        oxrsys::encoder::EncodePathInputs pathInputs;
+        pathInputs.codec = codec_;
+        pathInputs.tenBit = tenBit_ && codec_ == oxr::protocol::VideoCodec::H265;
+        pathInputs.inProcessHardwareAvailable = hardwareInProcess;
+        pathInputs.override_ =
+            oxrsys::encoder::ParseHelperOverride(initialConfig.encoderHelperMode);
+        encodePath_ = oxrsys::encoder::ChooseEncodePath(pathInputs);
+        spdlog::info("VideoEncoder: {} encode path for {} - {} (in-process hardware encoder: {})",
+                     encodePath_.useHelper ? "out-of-process native-arm64 helper" : "in-process",
+                     VideoCodecName(codec_),
+                     oxrsys::encoder::DescribeEncodePathReason(encodePath_.reason),
+                     hardwareInProcess ? "yes" : "no");
+    }
+
+    // RequireHardware is an assertion, not a wish: we only demand it when the
+    // query above says this process can have it. The @NO that used to be
+    // unconditional is what made a Rosetta host silently get the ~27-40ms/frame
+    // software HEVC encoder; now that path is entered knowingly, logged, and
+    // (when the helper covers the codec) only as the fallback behind it.
     NSDictionary* encoderSpec = @{
         (NSString*)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @YES,
-        (NSString*)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @NO,
+        (NSString*)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder:
+            hardwareInProcess ? @YES : @NO,
     };
 
     VTCompressionSessionRef compressionSession = nullptr;
@@ -910,6 +1004,23 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
         CompressionOutputCallback,
         nullptr,
         &compressionSession);
+    if (status != noErr && hardwareInProcess)
+    {
+        // The query promised a hardware encoder and the create still refused it.
+        // Retry without the requirement rather than failing the session: a slow
+        // encoder beats no video. Loudly, because it should not happen.
+        spdlog::warn("VideoEncoder: hardware-required compression session failed ({}) although a "
+                     "hardware {} encoder was reported - retrying without the requirement",
+                     status, VideoCodecName(codec_));
+        NSDictionary* relaxedSpec = @{
+            (NSString*)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @YES,
+            (NSString*)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @NO,
+        };
+        status = VTCompressionSessionCreate(
+            kCFAllocatorDefault, width, height, VideoToolboxCodecType(codec_),
+            (__bridge CFDictionaryRef)relaxedSpec, nullptr, kCFAllocatorDefault,
+            CompressionOutputCallback, nullptr, &compressionSession);
+    }
     if (status != noErr)
     {
         spdlog::error("VideoEncoder: Failed to create compression session: {}", status);
@@ -939,7 +1050,7 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
                      primariesStatus, transferStatus, matrixStatus);
     }
 
-    const ConfigValues config = Config::Get().GetValues();
+    const ConfigValues& config = initialConfig;
     const std::string& preset = config.encoderPreset;
     const OSStatus profileStatus = VTSessionSetProperty(compressionSession,
         kVTCompressionPropertyKey_ProfileLevel,
@@ -1015,14 +1126,49 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
         videoToolbox_.session = compressionSession;
     }
 
-    // VideoToolbox refuses the hardware HEVC encoder to an x86_64/Rosetta
-    // process and silently returns a software session instead. When the helper
-    // is enabled, delegate the per-frame encode to a native-arm64 child process
-    // that is granted the hardware encoder; this session stays live as the
-    // fallback. See runtime/encoder_helper/README.md.
-    if (TryStartHelper())
+    // Say out loud what this session actually is. The old unconditional
+    // RequireHardware=NO meant a Rosetta host ran the software HEVC encoder with
+    // nothing in the log to say so; a line here makes that impossible.
     {
-        spdlog::info("VideoEncoder: hardware HEVC via the native-arm64 out-of-process helper");
+        bool sessionUsesHardware = false;
+        CFBooleanRef hardwareRef = nullptr;
+        if (VTSessionCopyProperty(compressionSession,
+                                  kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,
+                                  kCFAllocatorDefault, &hardwareRef) == noErr &&
+            hardwareRef != nullptr)
+        {
+            sessionUsesHardware = CFBooleanGetValue(hardwareRef);
+            CFRelease(hardwareRef);
+        }
+        if (sessionUsesHardware)
+        {
+            spdlog::info("VideoEncoder: in-process {} session is hardware-accelerated",
+                         VideoCodecName(codec_));
+        }
+        else if (encodePath_.useHelper)
+        {
+            spdlog::info("VideoEncoder: in-process {} session is SOFTWARE - kept only as the "
+                         "fallback behind the native-arm64 hardware helper",
+                         VideoCodecName(codec_));
+        }
+        else
+        {
+            spdlog::warn("VideoEncoder: in-process {} session is SOFTWARE ({}) - expect high "
+                         "per-frame encode cost",
+                         VideoCodecName(codec_),
+                         oxrsys::encoder::DescribeEncodePathReason(encodePath_.reason));
+        }
+    }
+
+    // VideoToolbox refuses the hardware HEVC encoder to an x86_64/Rosetta
+    // process and silently returns a software session instead. When the policy
+    // above chose the helper, delegate the per-frame encode to a native-arm64
+    // child process that is granted the hardware encoder; this session stays
+    // live as the fallback. See runtime/encoder_helper/README.md.
+    if (encodePath_.useHelper && TryStartHelper())
+    {
+        spdlog::info("VideoEncoder: hardware {} via the native-arm64 out-of-process helper",
+                     VideoCodecName(codec_));
     }
 
     initialized_ = true;
@@ -1035,21 +1181,6 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
 bool VideoEncoder::TryStartHelper()
 {
     const ConfigValues config = Config::Get().GetValues();
-    if (!config.encoderHelperEnabled)
-    {
-        return false;
-    }
-    // The helper only implements HEVC Main (8-bit).
-    if (codec_ != oxr::protocol::VideoCodec::H265)
-    {
-        spdlog::info("VideoEncoder: encoder helper skipped - it only supports H.265");
-        return false;
-    }
-    if (tenBit_)
-    {
-        spdlog::info("VideoEncoder: encoder helper skipped - HEVC Main10 is encoded in-process");
-        return false;
-    }
 
     // Resolve the helper binary: explicit config, then environment override,
     // then a sibling of the runtime dylib.
@@ -1081,7 +1212,7 @@ bool VideoEncoder::TryStartHelper()
         surfaces[i] = (void*)surface;
     }
 
-    HevcEncoderHelperClient::Config helperConfig;
+    EncoderHelperClient::Config helperConfig;
     helperConfig.width = width_;
     helperConfig.height = height_;
     helperConfig.fps = fps_;
@@ -1090,9 +1221,16 @@ bool VideoEncoder::TryStartHelper()
     helperConfig.preset = config.encoderPreset == "speed"      ? 1u
                           : config.encoderPreset == "quality"  ? 2u
                                                                : 0u;
+    // The helper encodes what the client and runtime negotiated, nothing else.
+    helperConfig.codec = codec_ == oxr::protocol::VideoCodec::H264
+                             ? EncoderHelperClient::Codec::H264
+                             : EncoderHelperClient::Codec::H265;
+    helperConfig.profile = (tenBit_ && codec_ == oxr::protocol::VideoCodec::H265)
+                               ? EncoderHelperClient::Profile::Main10
+                               : EncoderHelperClient::Profile::Main;
     helperConfig.helperPath = helperPath;
 
-    auto client = std::make_shared<HevcEncoderHelperClient>();
+    auto client = std::make_shared<EncoderHelperClient>();
     client->SetDiedCallback([this]() { OnHelperDied(); });
     const bool started = client->Start(
         helperConfig, surfaces.data(), surfaces.size(),
@@ -1117,7 +1255,7 @@ bool VideoEncoder::TryStartHelper()
     return true;
 }
 
-std::shared_ptr<HevcEncoderHelperClient> VideoEncoder::AcquireHelperClient() const
+std::shared_ptr<EncoderHelperClient> VideoEncoder::AcquireHelperClient() const
 {
     // Only the pointer copy is guarded: callers keep the client alive for the
     // duration of their use, so teardown never frees it underneath them.
@@ -1128,7 +1266,7 @@ std::shared_ptr<HevcEncoderHelperClient> VideoEncoder::AcquireHelperClient() con
 void VideoEncoder::StopHelper()
 {
     useHelper_.store(false);
-    if (std::shared_ptr<HevcEncoderHelperClient> client = AcquireHelperClient())
+    if (std::shared_ptr<EncoderHelperClient> client = AcquireHelperClient())
     {
         client->Stop();
     }
@@ -1816,7 +1954,7 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
         // completion handler), so the helper reads finished pixels. Every field
         // of `context` is written before the submit: once the cookie is in the
         // map the helper's reader thread may finalize and delete it at any time.
-        std::shared_ptr<HevcEncoderHelperClient> helperClient =
+        std::shared_ptr<EncoderHelperClient> helperClient =
             this->useHelper_.load() ? this->AcquireHelperClient() : nullptr;
         if (helperClient != nullptr && helperClient->IsAlive())
         {
@@ -2007,7 +2145,7 @@ void VideoEncoder::SetBitrate(uint32_t bitrateMbps)
     // fallback session.
     if (useHelper_.load())
     {
-        if (std::shared_ptr<HevcEncoderHelperClient> client = AcquireHelperClient();
+        if (std::shared_ptr<EncoderHelperClient> client = AcquireHelperClient();
             client != nullptr && client->IsAlive())
         {
             client->SetBitrate(bitrateMbps);

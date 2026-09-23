@@ -53,7 +53,8 @@ FrameImageSource MakeSource(id<MTLDevice> device, uint32_t width, uint32_t heigh
 
 void EncodeOneFrame(oxr::protocol::VideoCodec codec,
                     MTLPixelFormat pixelFormat = MTLPixelFormatBGRA8Unorm,
-                    bool foveated = false)
+                    bool foveated = false,
+                    bool tenBit = false)
 {
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     REQUIRE(device != nil);
@@ -77,6 +78,10 @@ void EncodeOneFrame(oxr::protocol::VideoCodec codec,
         settings.edgeRatioY = 2.0f;
         encoder.SetFoveationSettings(settings);
     }
+    // HEVC Main10 is a 10-bit bitstream from the same 8-bit BGRA compose
+    // surface, both in-process and in the helper; it must produce Annex-B NAL
+    // units like any other profile.
+    encoder.SetTenBitEncoding(tenBit);
     REQUIRE(encoder.Initialize(128, 64, 60, 8, graphics, codec));
 
     FrameSource frame = {};
@@ -191,5 +196,9 @@ TEST_CASE("VideoToolbox encodes Metal textures with every advertised codec",
     if (capabilities.supportsH265)
     {
         EncodeOneFrame(oxr::protocol::VideoCodec::H265);
+        // Main10 goes down whichever encode path the policy picked, so this also
+        // covers the helper when encoder_helper forces it on.
+        EncodeOneFrame(oxr::protocol::VideoCodec::H265, MTLPixelFormatBGRA8Unorm,
+                       /*foveated=*/false, /*tenBit=*/true);
     }
 }

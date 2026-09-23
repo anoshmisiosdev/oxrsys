@@ -26,7 +26,8 @@ add_library(oxrsys_runtime SHARED
     src/SwapchainVulkan.cpp
     src/SwapchainMetal.mm
     src/VideoEncoder.mm
-    src/HevcEncoderHelperClient.mm
+    src/EncoderHelperClient.mm
+    src/EncoderPathPolicy.cpp
 )
 
 target_include_directories(oxrsys_runtime PRIVATE

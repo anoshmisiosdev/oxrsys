@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: MPL-2.0
 //
-// oxrsys-encoder-helper — native arm64 out-of-process HEVC encoder.
+// oxrsys-encoder-helper — native arm64 out-of-process video encoder.
 //
 // The OXRSys runtime dylib is loaded in-process by CrossOver's x86_64 Wine host
 // (Rosetta), and VideoToolbox refuses the hardware HEVC encoder to an x86_64
 // process (kVTCouldNotFindVideoEncoderErr / silent software fallback). This
-// helper runs native arm64, so VideoToolbox grants it the hardware HEVC encoder.
+// helper runs native arm64, so VideoToolbox grants it the hardware encoder.
+//
+// It encodes whichever codec and profile the runtime negotiated with the client
+// — H.265 Main, H.265 Main10 or H.264 Main — and never substitutes another: if
+// it cannot honour the request it says so in InitAck and exits, and the runtime
+// keeps using its in-process session.
 //
 // It receives the runtime's compose IOSurfaces once at startup (zero-copy, as
 // mach send rights), then per frame it is told "encode slot N" over a Unix
@@ -85,6 +90,8 @@ struct HelperState
     uint32_t keyframeIntervalSec = 2;
     uint32_t slotCount = 0;
     PresetCode preset = PresetCode::Balanced;
+    CodecCode codec = CodecCode::H265;
+    ProfileCode profile = ProfileCode::Main;
 
     IOSurfaceRef surfaces[kMaxSlots] = {};
     CVPixelBufferRef pixelBuffers[kMaxSlots] = {};
@@ -146,26 +153,24 @@ bool RecvMsg(MsgType& outType, std::vector<uint8_t>& outPayload)
     uint8_t header[kHeaderBytes];
     if (!ReadAll(g.sock, header, kHeaderBytes)) return false;
 
-    Reader r(header, kHeaderBytes);
-    uint32_t magic = r.U32();
-    uint16_t type = r.U16();
-    r.U16(); // version
-    uint32_t len = r.U32();
-    if (magic != kMagic || len > kMaxPayloadBytes)
+    const FrameHeader parsed = ParseHeader(header, kHeaderBytes);
+    if (!parsed.ok)
     {
-        LOGE("bad frame magic=0x%08x len=%u", magic, len);
+        LOGE("bad frame header (version=%u len=%u) — expected protocol v%u", parsed.version,
+             parsed.payloadLength, (unsigned)kProtocolVersion);
         return false;
     }
-    outType = (MsgType)type;
-    outPayload.resize(len);
-    if (len > 0 && !ReadAll(g.sock, outPayload.data(), len)) return false;
+    outType = parsed.type;
+    outPayload.resize(parsed.payloadLength);
+    if (parsed.payloadLength > 0 && !ReadAll(g.sock, outPayload.data(), parsed.payloadLength))
+        return false;
     return true;
 }
 
 // --------------------------------------------------------------------------
 // Mach rendezvous: hand the parent a send right to our receive port, then
 // collect one IOSurface send right per slot. Parent-side is the mirror in
-// HevcEncoderHelperClient.mm. See EncoderHelperIpc.h for the ownership rules.
+// EncoderHelperClient.mm. See EncoderHelperIpc.h for the ownership rules.
 // --------------------------------------------------------------------------
 bool MachRendezvousAndReceiveSurfaces(const std::string& rendezvousName, uint32_t expectedSlots)
 {
@@ -314,6 +319,32 @@ void SendNal(uint64_t cookie, int64_t ptsNs, const uint8_t* body, size_t bodyLen
     SendMsg(MsgType::Nal, payload);
 }
 
+// VPS/SPS/PPS (HEVC) or SPS/PPS (H.264). The two live behind different
+// CoreMedia accessors, which is the only place the NAL path is codec-specific:
+// both emit the same Annex-B framing the runtime's in-process path emits.
+size_t ParameterSetCount(CMFormatDescriptionRef fd)
+{
+    size_t count = 0;
+    const OSStatus st =
+        g.codec == CodecCode::H264
+            ? CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fd, 0, nullptr, nullptr, &count,
+                                                                 nullptr)
+            : CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fd, 0, nullptr, nullptr, &count,
+                                                                 nullptr);
+    return st == noErr ? count : 0;
+}
+
+bool ParameterSetAt(CMFormatDescriptionRef fd, size_t index, const uint8_t** ps, size_t* psSize)
+{
+    const OSStatus st =
+        g.codec == CodecCode::H264
+            ? CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fd, index, ps, psSize, nullptr,
+                                                                 nullptr)
+            : CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fd, index, ps, psSize, nullptr,
+                                                                 nullptr);
+    return st == noErr && *ps != nullptr && *psSize > 0;
+}
+
 void EmitSampleNalUnits(CMSampleBufferRef sb, bool key, uint64_t cookie, int64_t ptsNs)
 {
     if (key)
@@ -321,16 +352,12 @@ void EmitSampleNalUnits(CMSampleBufferRef sb, bool key, uint64_t cookie, int64_t
         CMFormatDescriptionRef fd = CMSampleBufferGetFormatDescription(sb);
         if (fd != nullptr)
         {
-            size_t count = 0;
-            CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fd, 0, nullptr, nullptr, &count,
-                                                               nullptr);
+            const size_t count = ParameterSetCount(fd);
             for (size_t i = 0; i < count; ++i)
             {
                 const uint8_t* ps = nullptr;
                 size_t psSize = 0;
-                if (CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fd, i, &ps, &psSize, nullptr,
-                                                                       nullptr) == noErr &&
-                    ps != nullptr && psSize > 0)
+                if (ParameterSetAt(fd, i, &ps, &psSize))
                 {
                     SendNal(cookie, ptsNs, ps, psSize, true);
                 }
@@ -400,6 +427,23 @@ void SetNumberProp(VTCompressionSessionRef s, CFStringRef key, int32_t value)
     CFRelease(n);
 }
 
+CMVideoCodecType CodecType(CodecCode codec)
+{
+    return codec == CodecCode::H264 ? kCMVideoCodecType_H264 : kCMVideoCodecType_HEVC;
+}
+
+// Mirrors VideoToolboxProfileLevel() in runtime/src/VideoEncoder.mm — the helper
+// must request exactly the profile the runtime negotiated, never a substitute.
+CFStringRef ProfileLevel(CodecCode codec, ProfileCode profile)
+{
+    if (codec == CodecCode::H264)
+    {
+        return kVTProfileLevel_H264_Main_AutoLevel;
+    }
+    return profile == ProfileCode::Main10 ? kVTProfileLevel_HEVC_Main10_AutoLevel
+                                          : kVTProfileLevel_HEVC_Main_AutoLevel;
+}
+
 InitStatus CreateSession()
 {
     NSDictionary* spec = @{
@@ -409,19 +453,28 @@ InitStatus CreateSession()
 
     VTCompressionSessionRef s = nullptr;
     OSStatus st = VTCompressionSessionCreate(kCFAllocatorDefault, g.width, g.height,
-                                             kCMVideoCodecType_HEVC,
+                                             CodecType(g.codec),
                                              (__bridge CFDictionaryRef)spec, nullptr,
                                              kCFAllocatorDefault, CompressionCallback, nullptr, &s);
     if (st != noErr || s == nullptr)
     {
-        LOGE("VTCompressionSessionCreate(RequireHardware=YES) failed: %d", (int)st);
+        LOGE("VTCompressionSessionCreate(%s, RequireHardware=YES) failed: %d",
+             CodecName(g.codec), (int)st);
         return InitStatus::SessionCreateFailed;
     }
 
     VTSessionSetProperty(s, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
     VTSessionSetProperty(s, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
-    VTSessionSetProperty(s, kVTCompressionPropertyKey_ProfileLevel,
-                         kVTProfileLevel_HEVC_Main_AutoLevel);
+    const OSStatus profileStatus = VTSessionSetProperty(
+        s, kVTCompressionPropertyKey_ProfileLevel, ProfileLevel(g.codec, g.profile));
+    if (profileStatus != noErr)
+    {
+        // Same contract as the in-process path: an unavailable profile is a
+        // downgrade to the encoder default, logged, not a failed session.
+        LOGW("profile for %s/%s unavailable (%d) — falling back to the encoder default",
+             CodecName(g.codec), g.profile == ProfileCode::Main10 ? "Main10" : "Main",
+             (int)profileStatus);
+    }
 
     if (g.preset == PresetCode::Speed)
         VTSessionSetProperty(s, kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality,
@@ -460,7 +513,8 @@ InitStatus CreateSession()
         usingHardware = CFBooleanGetValue(hwRef);
         CFRelease(hwRef);
     }
-    LOGI("VT session created %ux%u @%ufps %uMbps hardware=%s", g.width, g.height, g.fps,
+    LOGI("VT session created %s/%s %ux%u @%ufps %uMbps hardware=%s", CodecName(g.codec),
+         g.profile == ProfileCode::Main10 ? "Main10" : "Main", g.width, g.height, g.fps,
          g.bitrateMbps, usingHardware ? "YES" : "NO");
     return usingHardware ? InitStatus::Ok : InitStatus::HardwareUnavailable;
 }
@@ -539,21 +593,24 @@ int main(int argc, char** argv)
         return 3;
     }
     {
-        Reader r(payload.data(), payload.size());
-        g.width = r.U32();
-        g.height = r.U32();
-        g.fps = r.U32();
-        g.bitrateMbps = r.U32();
-        g.keyframeIntervalSec = r.U32();
-        g.slotCount = r.U32();
-        g.preset = (PresetCode)r.U32();
-        if (!r.ok() || g.slotCount == 0 || g.slotCount > kMaxSlots)
+        InitPayload init;
+        if (!DeserializeInit(payload.data(), payload.size(), init))
         {
-            LOGE("bad Init payload slotCount=%u", g.slotCount);
+            LOGE("bad Init payload (%zu bytes)", payload.size());
             return 3;
         }
+        g.width = init.width;
+        g.height = init.height;
+        g.fps = init.fps;
+        g.bitrateMbps = init.bitrateMbps;
+        g.keyframeIntervalSec = init.keyframeIntervalSec;
+        g.slotCount = init.slotCount;
+        g.preset = init.preset;
+        g.codec = init.codec;
+        g.profile = init.profile;
     }
-    LOGI("Init: %ux%u @%ufps %uMbps key=%us slots=%u preset=%u", g.width, g.height, g.fps,
+    LOGI("Init: %s/%s %ux%u @%ufps %uMbps key=%us slots=%u preset=%u", CodecName(g.codec),
+         g.profile == ProfileCode::Main10 ? "Main10" : "Main", g.width, g.height, g.fps,
          g.bitrateMbps, g.keyframeIntervalSec, g.slotCount, (uint32_t)g.preset);
 
     // 2. Mach rendezvous: receive the compose surfaces (zero-copy).
@@ -582,7 +639,7 @@ int main(int argc, char** argv)
              (uint32_t)status);
         return 4;
     }
-    LOGI("ready: hardware HEVC encoder live");
+    LOGI("ready: hardware %s encoder live", CodecName(g.codec));
 
     // 5. Encode loop.
     while (g.running.load())

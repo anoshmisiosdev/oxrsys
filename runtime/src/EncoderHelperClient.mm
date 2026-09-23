@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-#import "HevcEncoderHelperClient.h"
+#import "EncoderHelperClient.h"
 
 #define OXRSYS_ENC_IPC_WANT_MACH 1
 #import "../encoder_helper/EncoderHelperIpc.h"
@@ -30,6 +30,11 @@ namespace
 {
 
 constexpr int kChildSocketFd = 3; // fd the helper reads its control socket on
+
+static_assert((uint32_t)EncoderHelperClient::Codec::H265 == (uint32_t)CodecCode::H265, "");
+static_assert((uint32_t)EncoderHelperClient::Codec::H264 == (uint32_t)CodecCode::H264, "");
+static_assert((uint32_t)EncoderHelperClient::Profile::Main == (uint32_t)ProfileCode::Main, "");
+static_assert((uint32_t)EncoderHelperClient::Profile::Main10 == (uint32_t)ProfileCode::Main10, "");
 
 bool WriteAllFd(int fd, const uint8_t* data, size_t len)
 {
@@ -62,15 +67,19 @@ bool RecvFramed(int fd, MsgType& type, std::vector<uint8_t>& payload)
 {
     uint8_t header[kHeaderBytes];
     if (!ReadAllFd(fd, header, kHeaderBytes)) return false;
-    Reader r(header, kHeaderBytes);
-    uint32_t magic = r.U32();
-    uint16_t t = r.U16();
-    r.U16();
-    uint32_t len = r.U32();
-    if (magic != kMagic || len > kMaxPayloadBytes) return false;
-    type = (MsgType)t;
-    payload.resize(len);
-    if (len > 0 && !ReadAllFd(fd, payload.data(), len)) return false;
+    const FrameHeader parsed = ParseHeader(header, kHeaderBytes);
+    if (!parsed.ok)
+    {
+        // A stale helper binary beside a newer runtime lands here. Refusing the
+        // frame drops us to the in-process encoder instead of misreading it.
+        spdlog::warn("EncoderHelper: rejecting frame (version={} len={}), expected protocol v{}",
+                     parsed.version, parsed.payloadLength, (unsigned)kProtocolVersion);
+        return false;
+    }
+    type = parsed.type;
+    payload.resize(parsed.payloadLength);
+    if (parsed.payloadLength > 0 && !ReadAllFd(fd, payload.data(), parsed.payloadLength))
+        return false;
     return true;
 }
 
@@ -86,12 +95,12 @@ std::string MakeRendezvousName()
 
 } // namespace
 
-HevcEncoderHelperClient::~HevcEncoderHelperClient()
+EncoderHelperClient::~EncoderHelperClient()
 {
     Stop();
 }
 
-bool HevcEncoderHelperClient::SendFramed(uint16_t type, const std::vector<uint8_t>& payload)
+bool EncoderHelperClient::SendFramed(uint16_t type, const std::vector<uint8_t>& payload)
 {
     std::vector<uint8_t> framed = Frame((MsgType)type, payload);
     std::lock_guard<std::mutex> lock(writeMutex_);
@@ -99,7 +108,7 @@ bool HevcEncoderHelperClient::SendFramed(uint16_t type, const std::vector<uint8_
     return WriteAllFd(sockFd_, framed.data(), framed.size());
 }
 
-bool HevcEncoderHelperClient::Start(const Config& config, void* const* iosurfaces, size_t count,
+bool EncoderHelperClient::Start(const Config& config, void* const* iosurfaces, size_t count,
                                     OnNal onNal, OnFrameDone onFrameDone)
 {
     if (count == 0 || count > kMaxSlots || config.helperPath.empty())
@@ -224,14 +233,17 @@ bool HevcEncoderHelperClient::Start(const Config& config, void* const* iosurface
 
     // 1. Send Init config.
     {
-        std::vector<uint8_t> p;
-        PutU32(p, config.width);
-        PutU32(p, config.height);
-        PutU32(p, config.fps);
-        PutU32(p, config.bitrateMbps);
-        PutU32(p, config.keyframeIntervalSec);
-        PutU32(p, (uint32_t)count);
-        PutU32(p, config.preset);
+        InitPayload init;
+        init.width = config.width;
+        init.height = config.height;
+        init.fps = config.fps;
+        init.bitrateMbps = config.bitrateMbps;
+        init.keyframeIntervalSec = config.keyframeIntervalSec;
+        init.slotCount = (uint32_t)count;
+        init.preset = (PresetCode)config.preset;
+        init.codec = (CodecCode)config.codec;
+        init.profile = (ProfileCode)config.profile;
+        const std::vector<uint8_t> p = SerializeInit(init);
         if (!SendFramed((uint16_t)MsgType::Init, p))
         {
             spdlog::error("EncoderHelper: failed to send Init");
@@ -341,12 +353,12 @@ bool HevcEncoderHelperClient::Start(const Config& config, void* const* iosurface
     alive_.store(true);
     everAlive_.store(true);
     readerThread_ = std::thread([this]() { ReaderLoop(); });
-    spdlog::info("EncoderHelper: ready — hardware HEVC encoder live in native-arm64 helper (pid={})",
-                 childPid_);
+    spdlog::info("EncoderHelper: ready — hardware {} encoder live in native-arm64 helper (pid={})",
+                 CodecName((CodecCode)config.codec), childPid_);
     return true;
 }
 
-void HevcEncoderHelperClient::ReaderLoop()
+void EncoderHelperClient::ReaderLoop()
 {
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     for (;;)
@@ -388,7 +400,7 @@ void HevcEncoderHelperClient::ReaderLoop()
     NotifyDiedIfNeeded();
 }
 
-void HevcEncoderHelperClient::NotifyDiedIfNeeded()
+void EncoderHelperClient::NotifyDiedIfNeeded()
 {
     // A genuine mid-session death only: init-time failures (never alive) and an
     // orderly Stop() must not fire this, and it fires at most once.
@@ -402,7 +414,7 @@ void HevcEncoderHelperClient::NotifyDiedIfNeeded()
     }
 }
 
-void HevcEncoderHelperClient::MarkDead(const char* reason)
+void EncoderHelperClient::MarkDead(const char* reason)
 {
     bool was = alive_.exchange(false);
     if (was || sockFd_ >= 0)
@@ -424,7 +436,7 @@ void HevcEncoderHelperClient::MarkDead(const char* reason)
     (void)was;
 }
 
-void HevcEncoderHelperClient::SubmitFrame(uint64_t cookie, uint32_t slot, int64_t ptsNs,
+void EncoderHelperClient::SubmitFrame(uint64_t cookie, uint32_t slot, int64_t ptsNs,
                                           bool forceKeyframe)
 {
     if (!alive_.load()) return;
@@ -437,7 +449,7 @@ void HevcEncoderHelperClient::SubmitFrame(uint64_t cookie, uint32_t slot, int64_
         MarkDead("encode submit write failed");
 }
 
-void HevcEncoderHelperClient::SetBitrate(uint32_t bitrateMbps)
+void EncoderHelperClient::SetBitrate(uint32_t bitrateMbps)
 {
     if (!alive_.load()) return;
     std::vector<uint8_t> p;
@@ -445,7 +457,7 @@ void HevcEncoderHelperClient::SetBitrate(uint32_t bitrateMbps)
     SendFramed((uint16_t)MsgType::SetBitrate, p);
 }
 
-void HevcEncoderHelperClient::Stop()
+void EncoderHelperClient::Stop()
 {
     if (stopping_.exchange(true))
     {

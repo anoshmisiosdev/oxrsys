@@ -173,6 +173,7 @@ add_executable(oxrsys_runtime_tests
     tests/TestClientLiveness.cpp
     tests/TestConfig.cpp
     tests/TestEncoderHelperIpc.cpp
+    tests/TestEncoderPathPolicy.cpp
     tests/TestInputManager.cpp
     tests/TestRuntimePlatform.cpp
     tests/TestStreamingAbr.cpp
@@ -196,6 +197,7 @@ add_executable(oxrsys_runtime_tests
     runtime/src/RuntimeSockets.cpp
     runtime/src/StreamingFrameQueue.cpp
     runtime/src/VideoCodecSelection.cpp
+    runtime/src/EncoderPathPolicy.cpp
     runtime/src/VulkanDispatch.cpp
 )
 target_include_directories(oxrsys_runtime_tests PRIVATE
@@ -309,11 +311,14 @@ list(APPEND OXRSYS_RUNTIME_TEST_TARGETS oxrsys_runtime_api_tests)
 add_executable(oxrsys_videotoolbox_encoder_tests
     tests/TestVideoToolboxEncoder.mm
     runtime/src/VideoEncoder.mm
+    runtime/src/EncoderHelperClient.mm
+    runtime/src/EncoderPathPolicy.cpp
     runtime/src/Config.cpp
     runtime/src/RuntimePlatform.cpp
 )
 target_include_directories(oxrsys_videotoolbox_encoder_tests PRIVATE
     runtime/src
+    runtime/encoder_helper
     common/protocol/include
     ${openxr_SOURCE_DIR}/include
 )
@@ -326,6 +331,7 @@ target_link_libraries(oxrsys_videotoolbox_encoder_tests PRIVATE
     "-framework VideoToolbox"
     "-framework CoreMedia"
     "-framework CoreVideo"
+    "-framework IOSurface"
 )
 target_compile_definitions(oxrsys_videotoolbox_encoder_tests PRIVATE
     XR_USE_GRAPHICS_API_METAL
