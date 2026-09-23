@@ -90,13 +90,23 @@ public:
     bool IsUsingHardware() const { return usingHardware_.load(); }
 
     // Submit slot for encoding. cookie is echoed back on the NAL/done callbacks.
-    // Safe to call from any thread; a no-op if the helper is not alive.
-    void SubmitFrame(uint64_t cookie, uint32_t slot, int64_t ptsNs, bool forceKeyframe);
+    // Safe to call from any thread. Returns true once the request is written to
+    // the helper, which then owns its completion: FrameDone, or the died
+    // callback if it never answers. False means it was never sent (helper not
+    // alive, or the write failed - which also marks the helper dead), so no
+    // callback will ever mention this cookie and the caller still owns the frame.
+    bool SubmitFrame(uint64_t cookie, uint32_t slot, int64_t ptsNs, bool forceKeyframe);
 
     void SetBitrate(uint32_t bitrateMbps);
 
     // Orderly shutdown: asks the helper to exit, joins the reader, reaps child.
     void Stop();
+
+    // Diagnostics (and tests): the helper's pid while it runs, -1 otherwise; and
+    // the raw waitpid() status Stop() reaped it with, -1 until then (or if it
+    // was reaped elsewhere).
+    int HelperPid() const { return childPid_; }
+    int HelperExitStatus() const { return childExitStatus_; }
 
 private:
     bool SendFramed(uint16_t type, const std::vector<uint8_t>& payload);
@@ -108,8 +118,10 @@ private:
     int sockFd_ = -1;        // parent end of the control socket
     int stderrReadFd_ = -1;  // parent end of the helper's captured stderr
     int childPid_ = -1;
+    int childExitStatus_ = -1;
 
-    std::mutex writeMutex_;
+    std::mutex writeMutex_;      // guards sockFd_ / socketShutdown_ and serializes writes
+    bool socketShutdown_ = false; // shutdown(2) done; the fd is closed only in Stop()
     std::atomic<bool> alive_{false};
     std::atomic<bool> everAlive_{false};
     std::atomic<bool> usingHardware_{false};

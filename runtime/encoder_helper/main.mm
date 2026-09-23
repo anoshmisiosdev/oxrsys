@@ -21,6 +21,7 @@
 
 #define OXRSYS_ENC_IPC_WANT_MACH 1
 #include "EncoderHelperIpc.h"
+#include "EncoderSessionColor.h"
 
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
@@ -32,6 +33,7 @@
 #include <servers/bootstrap.h>
 
 #include <atomic>
+#include <csignal>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -112,38 +114,23 @@ struct FrameCtx
 // --------------------------------------------------------------------------
 // Socket I/O
 // --------------------------------------------------------------------------
-bool WriteAll(int fd, const uint8_t* data, size_t len)
-{
-    size_t off = 0;
-    while (off < len)
-    {
-        ssize_t n = ::write(fd, data + off, len - off);
-        if (n > 0) { off += (size_t)n; continue; }
-        if (n < 0 && (errno == EINTR)) continue;
-        return false;
-    }
-    return true;
-}
-
-bool ReadAll(int fd, uint8_t* data, size_t len)
-{
-    size_t off = 0;
-    while (off < len)
-    {
-        ssize_t n = ::read(fd, data + off, len - off);
-        if (n > 0) { off += (size_t)n; continue; }
-        if (n == 0) return false; // EOF: parent gone
-        if (n < 0 && errno == EINTR) continue;
-        return false;
-    }
-    return true;
-}
-
 bool SendMsg(MsgType type, const std::vector<uint8_t>& payload)
 {
     std::vector<uint8_t> framed = Frame(type, payload);
     std::lock_guard<std::mutex> lock(g.writeMutex);
-    return WriteAll(g.sock, framed.data(), framed.size());
+    if (SendAll(g.sock, framed.data(), framed.size()))
+    {
+        return true;
+    }
+    // The host closed its end (orderly Stop, or it vanished). Nothing to do
+    // but say so once; the main loop's next read hits EOF and exits cleanly.
+    static bool reported = false;
+    if (!reported)
+    {
+        reported = true;
+        LOGW("socket write failed (%s) — host gone, dropping output", strerror(errno));
+    }
+    return false;
 }
 
 // Read one framed message; returns false on EOF/error. On success fills type +
@@ -151,7 +138,7 @@ bool SendMsg(MsgType type, const std::vector<uint8_t>& payload)
 bool RecvMsg(MsgType& outType, std::vector<uint8_t>& outPayload)
 {
     uint8_t header[kHeaderBytes];
-    if (!ReadAll(g.sock, header, kHeaderBytes)) return false;
+    if (!RecvAll(g.sock, header, kHeaderBytes)) return false;
 
     const FrameHeader parsed = ParseHeader(header, kHeaderBytes);
     if (!parsed.ok)
@@ -162,7 +149,7 @@ bool RecvMsg(MsgType& outType, std::vector<uint8_t>& outPayload)
     }
     outType = parsed.type;
     outPayload.resize(parsed.payloadLength);
-    if (parsed.payloadLength > 0 && !ReadAll(g.sock, outPayload.data(), parsed.payloadLength))
+    if (parsed.payloadLength > 0 && !RecvAll(g.sock, outPayload.data(), parsed.payloadLength))
         return false;
     return true;
 }
@@ -465,6 +452,17 @@ InitStatus CreateSession()
 
     VTSessionSetProperty(s, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
     VTSessionSetProperty(s, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
+
+    // The same BT.709 colour contract as the in-process session, from the one
+    // shared definition, so both paths' bitstreams carry identical VUI colour
+    // descriptions and use the same RGB-to-YCbCr matrix (Main10 included).
+    const oxrsys::encoder_color::ApplyResult color =
+        oxrsys::encoder_color::ApplySessionColorProperties(s);
+    if (!color.ok())
+    {
+        LOGW("failed to apply complete BT.709 color metadata (primaries=%d transfer=%d matrix=%d)",
+             (int)color.primaries, (int)color.transferFunction, (int)color.yCbCrMatrix);
+    }
     const OSStatus profileStatus = VTSessionSetProperty(
         s, kVTCompressionPropertyKey_ProfileLevel, ProfileLevel(g.codec, g.profile));
     if (profileStatus != noErr)
@@ -566,6 +564,13 @@ int main(int argc, char** argv)
 {
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 
+    // This is our own process, so a process-wide SIG_IGN is fine here (unlike
+    // in the runtime dylib, which lives in the host's process). The host
+    // vanishing must end this helper through EOF, not a signal: that covers the
+    // control socket and also stderr, which is a pipe the host reads and may
+    // already have closed when our last log line is written.
+    signal(SIGPIPE, SIG_IGN);
+
     int sockFd = -1;
     std::string rendezvous;
     for (int i = 1; i < argc; ++i)
@@ -582,6 +587,8 @@ int main(int argc, char** argv)
         return 2;
     }
     g.sock = sockFd;
+    // Belt and braces with SIG_IGN above; the runtime also sets it on its end.
+    DisableSigPipe(sockFd);
     LOGI("started pid=%d socket-fd=%d rendezvous=%s", getpid(), sockFd, rendezvous.c_str());
 
     // 1. Read Init config from the socket.

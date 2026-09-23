@@ -4,8 +4,12 @@
 
 #include "EncoderHelperIpc.h"
 
+#include <cerrno>
+#include <csignal>
 #include <cstring>
 #include <string>
+#include <sys/socket.h>
+#include <unistd.h>
 #include <vector>
 
 using namespace oxrsys::enc_ipc;
@@ -215,4 +219,82 @@ TEST_CASE("Encoder helper header parse rejects a foreign or stale peer", "[encod
 
     CHECK_FALSE(ParseHeader(framed.data(), kHeaderBytes - 1).ok);
     CHECK_FALSE(ParseHeader(nullptr, kHeaderBytes).ok);
+}
+
+namespace
+{
+
+// The runtime is a library inside someone else's process, so these tests must
+// not lean on a process-wide SIG_IGN either: assert SIGPIPE is at its default
+// (terminate) disposition, so that a write that raised it would kill the test
+// binary rather than pass unnoticed.
+void RequireDefaultSigPipe()
+{
+    struct sigaction current = {};
+    REQUIRE(sigaction(SIGPIPE, nullptr, &current) == 0);
+    REQUIRE(current.sa_handler == SIG_DFL);
+}
+
+} // namespace
+
+TEST_CASE("Encoder helper control socket reports a vanished peer as EPIPE, not SIGPIPE",
+          "[encoder_helper]")
+{
+    RequireDefaultSigPipe();
+    const std::vector<uint8_t> framed = Frame(MsgType::Encode, BuildEncodePayload(1, 0, 0, false));
+
+    SECTION("SO_NOSIGPIPE on the descriptor")
+    {
+        int sv[2] = {-1, -1};
+        REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        REQUIRE(DisableSigPipe(sv[0]));
+        ::close(sv[1]); // the helper died
+
+        // Before the fix this raised SIGPIPE and the process died right here.
+        errno = 0;
+        CHECK_FALSE(SendAll(sv[0], framed.data(), framed.size()));
+        CHECK(errno == EPIPE);
+        // And keeps failing cleanly on every later write.
+        CHECK_FALSE(SendAll(sv[0], framed.data(), framed.size()));
+        ::close(sv[0]);
+    }
+
+    SECTION("MSG_NOSIGNAL alone, for a descriptor that missed SO_NOSIGPIPE")
+    {
+        int sv[2] = {-1, -1};
+        REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        ::close(sv[1]);
+        errno = 0;
+        CHECK_FALSE(SendAll(sv[0], framed.data(), framed.size()));
+        CHECK(errno == EPIPE);
+        ::close(sv[0]);
+    }
+
+    SECTION("a locally shut-down socket, as MarkDead leaves it")
+    {
+        int sv[2] = {-1, -1};
+        REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        REQUIRE(DisableSigPipe(sv[0]));
+        REQUIRE(::shutdown(sv[0], SHUT_RDWR) == 0);
+        errno = 0;
+        CHECK_FALSE(SendAll(sv[0], framed.data(), framed.size()));
+        CHECK(errno == EPIPE);
+        uint8_t byte = 0;
+        CHECK_FALSE(RecvAll(sv[0], &byte, 1)); // EOF, which ends the reader loop
+        ::close(sv[0]);
+        ::close(sv[1]);
+    }
+
+    SECTION("a live peer still receives the whole frame")
+    {
+        int sv[2] = {-1, -1};
+        REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        REQUIRE(DisableSigPipe(sv[0]));
+        REQUIRE(SendAll(sv[0], framed.data(), framed.size()));
+        std::vector<uint8_t> received(framed.size());
+        REQUIRE(RecvAll(sv[1], received.data(), received.size()));
+        CHECK(received == framed);
+        ::close(sv[0]);
+        ::close(sv[1]);
+    }
 }

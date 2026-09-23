@@ -79,6 +79,22 @@ are for synthetic content; real frames measured 27–40 ms.)
   stopped or died is finalized as dropped so its slot and drain lease are
   returned — a mid-session helper crash degrades to the in-process encoder
   rather than starving it of slots.
+* **No SIGPIPE, either way.** The runtime is a library inside the game's
+  process, so a write to a helper that has died must not raise SIGPIPE (whose
+  default action would kill the game). Every control-socket descriptor gets
+  `SO_NOSIGPIPE` and every write goes through `send(..., MSG_NOSIGNAL)`
+  (`enc_ipc::SendAll`); a dead peer is then just `EPIPE`, which marks the helper
+  dead and falls back. The runtime never installs a process-wide
+  `signal(SIGPIPE, SIG_IGN)` in its host. The helper, being its own process,
+  does ignore SIGPIPE, so a host that vanishes ends it through EOF rather than a
+  signal (that also covers its stderr pipe). A dead helper's socket is shut down,
+  not closed, until `Stop()` has joined the reader thread, so the reader can
+  never end up reading a descriptor number the host has since reused.
+* **Frame ownership.** Publishing a frame's context to the in-flight map hands
+  it to the helper's reader thread, which may finalize it at once (FrameDone, or
+  helper death). Everything the submit needs is read before publishing; a frame
+  whose submit was never written is reclaimed by its cookie, a per-encoder
+  sequence number rather than the context's address.
 * **Timestamps** cross the boundary as int64 ns the parent supplies and the
   child echoes back; the child never generates a timestamp the parent compares
   (mach clocks are not comparable across the Rosetta boundary). Encode duration
@@ -90,24 +106,57 @@ are for synthetic content; real frames measured 27–40 ms.)
 > XPC-touching call (IOSurface lookup / VideoToolbox) then hangs forever. The
 > child must use the normally inherited bootstrap port.
 
+## Colour
+
+Both sessions apply one colour contract, defined once in
+`EncoderSessionColor.h`: BT.709 primaries, transfer function and YCbCr matrix,
+for every codec and profile (Main10 included; it is a 10-bit bitstream from the
+same 8-bit SDR source, not HDR). VideoToolbox writes these into the SPS VUI and
+uses the matching matrix for its RGB-to-YCbCr conversion. The helper once set
+none of them and emitted an SPS with no VUI at all, so its stream could decode
+with different colours from the in-process one; `TestEncoderHelperClient.mm`
+now parses the helper's SPS and checks the colour description.
+
+VideoToolbox offers no property for the range flag. Every hardware encoder
+(the helper's, and the in-process one on arm64 or for H.264 under Rosetta)
+signals video range; the software HEVC encoder a Rosetta process falls back to
+signals full range. The helper is hardware-only, so it always matches the
+in-process hardware session.
+
 ## Build
 
-The helper is arm64; the runtime dylib is x86_64. They are separate targets.
+The helper is part of the standard build. `runtime/CMakeLists.txt` adds this
+directory, and the `oxrsys-encoder-helper` target:
+
+* is **always arm64**, whatever `CMAKE_OSX_ARCHITECTURES` the runtime uses
+  (`x86_64`, `arm64` or universal), via the target's own `OSX_ARCHITECTURES`;
+* is written next to `liboxrsys-runtime.dylib` (`build/<preset>/runtime/`),
+  where the runtime looks for it by default;
+* is a dependency of `oxrsys_runtime`, so `cmake --build` and
+  `cmake --build … --target oxrsys_runtime` (what the packaging scripts run)
+  both produce it;
+* is ad-hoc signed after linking.
 
 ```sh
-# Bulletproof single-file build (system frameworks only):
-runtime/encoder_helper/build-helper.sh
-# -> build/helper/oxrsys-encoder-helper   (arm64, ad-hoc signed)
-
-# Or via CMake (own build dir, arm64):
-cmake -S runtime/encoder_helper -B build/helper -G Ninja \
-      -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=arm64
-cmake --build build/helper
-lipo -info build/helper/oxrsys-encoder-helper   # must say: arm64
+cmake --preset macos-x64
+cmake --build build/macos-x64 --target oxrsys_runtime
+lipo -archs build/macos-x64/runtime/liboxrsys-runtime.dylib   # x86_64
+lipo -archs build/macos-x64/runtime/oxrsys-encoder-helper     # arm64
 ```
 
-The runtime-side glue (`../src/EncoderHelperClient.mm`) builds as part of the
-normal x86_64 `oxrsys_runtime` target.
+`scripts/macos_build_package.sh` copies it into the package as
+`runtime/oxrsys-encoder-helper` and refuses a helper that is not arm64-only;
+`scripts/macos_sign_notarize.sh` signs it with the hardened runtime and ships
+it in the archive. ctest runs `oxrsys_videotoolbox_encoder_tests` with
+`OXRSYS_ENCODER_HELPER_PATH` pointing at the build's own helper.
+
+To iterate on the helper alone, either of these still works:
+
+```sh
+runtime/encoder_helper/build-helper.sh              # -> build/helper/oxrsys-encoder-helper
+cmake -S runtime/encoder_helper -B build/helper -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build/helper
+```
 
 ## Selection policy
 
@@ -147,9 +196,10 @@ encoder_helper = "auto"    # "true" / "false" force it on or off for debugging
 # encoder_helper_path = ""   # empty = sibling of the runtime dylib
 ```
 
-Deploy `oxrsys-encoder-helper` next to `liboxrsys-runtime.dylib` (or set
-`encoder_helper_path` / `$OXRSYS_ENCODER_HELPER_PATH`). Both must be
-`codesign --force --sign -` ad-hoc signed.
+The build and the package already put `oxrsys-encoder-helper` next to
+`liboxrsys-runtime.dylib`. When installing by hand, copy it alongside the dylib
+(or set `encoder_helper_path` / `$OXRSYS_ENCODER_HELPER_PATH`); it must stay
+signed (the build ad-hoc signs it; release packaging uses a Developer ID).
 
 The runtime log then shows the decision and its reason, e.g.
 `VideoEncoder: out-of-process native-arm64 helper encode path for H.265: no

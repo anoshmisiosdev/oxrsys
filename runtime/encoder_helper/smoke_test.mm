@@ -32,6 +32,7 @@
 
 #define OXRSYS_ENC_IPC_WANT_MACH 1
 #include "EncoderHelperIpc.h"
+#include "EncoderSessionColor.h"
 
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
@@ -124,22 +125,11 @@ static void PaintSurface(IOSurfaceRef surface, int frame)
     IOSurfaceUnlock(surface, 0, nullptr);
 }
 
-static bool WriteAll(int fd, const uint8_t* d, size_t n)
-{
-    size_t o = 0;
-    while (o < n) { ssize_t r = write(fd, d + o, n - o); if (r <= 0) { if (r < 0 && errno == EINTR) continue; return false; } o += r; }
-    return true;
-}
-static bool ReadAll(int fd, uint8_t* d, size_t n)
-{
-    size_t o = 0;
-    while (o < n) { ssize_t r = read(fd, d + o, n - o); if (r == 0) return false; if (r < 0) { if (errno == EINTR) continue; return false; } o += r; }
-    return true;
-}
+static bool ReadAll(int fd, uint8_t* d, size_t n) { return RecvAll(fd, d, n); }
 static bool Send(int fd, MsgType t, const std::vector<uint8_t>& p)
 {
     auto f = Frame(t, p);
-    return WriteAll(fd, f.data(), f.size());
+    return SendAll(fd, f.data(), f.size()); // EPIPE, not SIGPIPE, if the helper died
 }
 static bool Recv(int fd, MsgType& t, std::vector<uint8_t>& p)
 {
@@ -271,6 +261,9 @@ static bool RunInProcess(SurfaceSet& surfaces, CodecCode codec, ProfileCode prof
     }
     VTSessionSetProperty(session, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
     VTSessionSetProperty(session, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
+    // Same colour contract as the runtime and the helper, so the comparison
+    // stays property-for-property.
+    oxrsys::encoder_color::ApplySessionColorProperties(session);
     VTSessionSetProperty(session, kVTCompressionPropertyKey_ProfileLevel,
                          ProfileLevel(codec, profile));
     int32_t bitrate = (int32_t)(kMbps * 1000000u);
@@ -364,6 +357,8 @@ static bool RunHelper(const char* helperPath, SurfaceSet& surfaces, CodecCode co
 {
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) { perror("socketpair"); return false; }
+    DisableSigPipe(sv[0]);
+    DisableSigPipe(sv[1]);
     std::random_device rd;
     char name[128];
     snprintf(name, sizeof(name), "org.oxrsys.enc.smoke.%d.%08x", getpid(), rd());

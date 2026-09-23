@@ -36,37 +36,10 @@ static_assert((uint32_t)EncoderHelperClient::Codec::H264 == (uint32_t)CodecCode:
 static_assert((uint32_t)EncoderHelperClient::Profile::Main == (uint32_t)ProfileCode::Main, "");
 static_assert((uint32_t)EncoderHelperClient::Profile::Main10 == (uint32_t)ProfileCode::Main10, "");
 
-bool WriteAllFd(int fd, const uint8_t* data, size_t len)
-{
-    size_t off = 0;
-    while (off < len)
-    {
-        ssize_t n = ::write(fd, data + off, len - off);
-        if (n > 0) { off += (size_t)n; continue; }
-        if (n < 0 && errno == EINTR) continue;
-        return false;
-    }
-    return true;
-}
-
-bool ReadAllFd(int fd, uint8_t* data, size_t len)
-{
-    size_t off = 0;
-    while (off < len)
-    {
-        ssize_t n = ::read(fd, data + off, len - off);
-        if (n > 0) { off += (size_t)n; continue; }
-        if (n == 0) return false;
-        if (n < 0 && errno == EINTR) continue;
-        return false;
-    }
-    return true;
-}
-
 bool RecvFramed(int fd, MsgType& type, std::vector<uint8_t>& payload)
 {
     uint8_t header[kHeaderBytes];
-    if (!ReadAllFd(fd, header, kHeaderBytes)) return false;
+    if (!RecvAll(fd, header, kHeaderBytes)) return false;
     const FrameHeader parsed = ParseHeader(header, kHeaderBytes);
     if (!parsed.ok)
     {
@@ -78,7 +51,7 @@ bool RecvFramed(int fd, MsgType& type, std::vector<uint8_t>& payload)
     }
     type = parsed.type;
     payload.resize(parsed.payloadLength);
-    if (parsed.payloadLength > 0 && !ReadAllFd(fd, payload.data(), parsed.payloadLength))
+    if (parsed.payloadLength > 0 && !RecvAll(fd, payload.data(), parsed.payloadLength))
         return false;
     return true;
 }
@@ -104,8 +77,11 @@ bool EncoderHelperClient::SendFramed(uint16_t type, const std::vector<uint8_t>& 
 {
     std::vector<uint8_t> framed = Frame((MsgType)type, payload);
     std::lock_guard<std::mutex> lock(writeMutex_);
-    if (sockFd_ < 0) return false;
-    return WriteAllFd(sockFd_, framed.data(), framed.size());
+    if (sockFd_ < 0 || socketShutdown_) return false;
+    // SendAll never raises SIGPIPE (see EncoderHelperIpc.h): a helper that has
+    // died makes this fail with EPIPE, and the caller marks it dead and falls
+    // back to the in-process encoder instead of the host process being killed.
+    return SendAll(sockFd_, framed.data(), framed.size());
 }
 
 bool EncoderHelperClient::Start(const Config& config, void* const* iosurfaces, size_t count,
@@ -134,6 +110,15 @@ bool EncoderHelperClient::Start(const Config& config, void* const* iosurfaces, s
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0)
     {
         spdlog::error("EncoderHelper: socketpair failed: {}", strerror(errno));
+        return false;
+    }
+    // Before anything can write to it: a write to a peer that has died must
+    // fail with EPIPE, not raise SIGPIPE in the host (the game, under Wine).
+    // Set on both ends; the helper's end is the same socket it inherits as fd 3.
+    if (!DisableSigPipe(sv[0]) || !DisableSigPipe(sv[1]))
+    {
+        spdlog::error("EncoderHelper: SO_NOSIGPIPE failed: {}", strerror(errno));
+        ::close(sv[0]); ::close(sv[1]);
         return false;
     }
     // --- stderr capture pipe (child stderr -> parent log) ---
@@ -361,11 +346,14 @@ bool EncoderHelperClient::Start(const Config& config, void* const* iosurfaces, s
 void EncoderHelperClient::ReaderLoop()
 {
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    // The descriptor stays open until Stop() has joined this thread; MarkDead
+    // only shuts it down, so this can never end up reading a reused fd number.
+    const int fd = sockFd_;
     for (;;)
     {
         MsgType type;
         std::vector<uint8_t> payload;
-        if (!RecvFramed(sockFd_, type, payload))
+        if (!RecvFramed(fd, type, payload))
         {
             if (!stopping_.load())
                 MarkDead("helper socket closed (crash or exit)");
@@ -416,37 +404,39 @@ void EncoderHelperClient::NotifyDiedIfNeeded()
 
 void EncoderHelperClient::MarkDead(const char* reason)
 {
-    bool was = alive_.exchange(false);
-    if (was || sockFd_ >= 0)
+    alive_.store(false);
+    // Shut the socket down rather than closing it: that unblocks the reader
+    // thread (its read returns EOF) and EOFs the child, while the descriptor
+    // number stays ours until Stop() has joined the reader. Closing it here,
+    // possibly from the submitting thread, would let the reader's next read()
+    // land on whatever the host process opens next under the same number.
+    std::lock_guard<std::mutex> lock(writeMutex_);
+    if (sockFd_ >= 0 && !socketShutdown_)
     {
         spdlog::warn("EncoderHelper: marking helper dead: {}", reason);
-    }
-    // Closing the socket unblocks the reader thread and signals the child EOF.
-    {
-        std::lock_guard<std::mutex> lock(writeMutex_);
-        if (sockFd_ >= 0)
-        {
-            ::close(sockFd_);
-            sockFd_ = -1;
-        }
+        ::shutdown(sockFd_, SHUT_RDWR);
+        socketShutdown_ = true;
     }
     // The owner is notified from ReaderLoop's exit, not here: this can run on
     // the submitting thread while the reader is still delivering callbacks for
     // frames the owner would then free.
-    (void)was;
 }
 
-void EncoderHelperClient::SubmitFrame(uint64_t cookie, uint32_t slot, int64_t ptsNs,
-                                          bool forceKeyframe)
+bool EncoderHelperClient::SubmitFrame(uint64_t cookie, uint32_t slot, int64_t ptsNs,
+                                      bool forceKeyframe)
 {
-    if (!alive_.load()) return;
+    if (!alive_.load()) return false;
     std::vector<uint8_t> p;
     PutU64(p, cookie);
     PutU32(p, slot);
     PutI64(p, ptsNs);
     p.push_back(forceKeyframe ? 1 : 0);
     if (!SendFramed((uint16_t)MsgType::Encode, p))
+    {
         MarkDead("encode submit write failed");
+        return false;
+    }
+    return true;
 }
 
 void EncoderHelperClient::SetBitrate(uint32_t bitrateMbps)
@@ -469,14 +459,24 @@ void EncoderHelperClient::Stop()
         SendFramed((uint16_t)MsgType::Shutdown, empty);
     }
 
-    // Close the socket to unblock the reader (also EOFs the child).
+    // Shut the socket down to unblock the reader (also EOFs the child), and
+    // close it only once the reader can no longer be using it.
     {
         std::lock_guard<std::mutex> lock(writeMutex_);
-        if (sockFd_ >= 0) { ::close(sockFd_); sockFd_ = -1; }
+        if (sockFd_ >= 0 && !socketShutdown_)
+        {
+            ::shutdown(sockFd_, SHUT_RDWR);
+            socketShutdown_ = true;
+        }
     }
     alive_.store(false);
 
     if (readerThread_.joinable()) readerThread_.join();
+
+    {
+        std::lock_guard<std::mutex> lock(writeMutex_);
+        if (sockFd_ >= 0) { ::close(sockFd_); sockFd_ = -1; }
+    }
 
     if (stderrReadFd_ >= 0) { ::close(stderrReadFd_); stderrReadFd_ = -1; }
     if (stderrThread_.joinable()) stderrThread_.join();
@@ -488,13 +488,15 @@ void EncoderHelperClient::Stop()
         {
             int st = 0;
             pid_t r = waitpid(childPid_, &st, WNOHANG);
-            if (r == childPid_ || (r < 0 && errno == ECHILD)) { childPid_ = -1; break; }
+            if (r == childPid_) { childExitStatus_ = st; childPid_ = -1; break; }
+            if (r < 0 && errno == ECHILD) { childPid_ = -1; break; }
             usleep(2000);
         }
         if (childPid_ > 0)
         {
             kill(childPid_, SIGKILL);
-            waitpid(childPid_, nullptr, 0);
+            int st = 0;
+            if (waitpid(childPid_, &st, 0) == childPid_) childExitStatus_ = st;
             childPid_ = -1;
         }
     }

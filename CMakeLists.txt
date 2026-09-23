@@ -310,6 +310,7 @@ list(APPEND OXRSYS_RUNTIME_TEST_TARGETS oxrsys_runtime_api_tests)
 
 add_executable(oxrsys_videotoolbox_encoder_tests
     tests/TestVideoToolboxEncoder.mm
+    tests/TestEncoderHelperClient.mm
     runtime/src/VideoEncoder.mm
     runtime/src/EncoderHelperClient.mm
     runtime/src/EncoderPathPolicy.cpp

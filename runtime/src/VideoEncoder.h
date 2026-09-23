@@ -106,6 +106,9 @@ public:
     void SetFoveationSettings(const FoveationSettings& settings) { foveationSettings_ = settings; }
     // Applies before Initialize(); only the H.265 VideoToolbox path supports Main10.
     void SetTenBitEncoding(bool enabled) { tenBit_ = enabled; }
+    // Diagnostics (and tests): pid of the live out-of-process encoder helper
+    // frames are currently sent to, or -1 when they are encoded in-process.
+    int EncoderHelperPid() const;
     static bool SupportsFoveatedEncoding(const GraphicsContext& graphicsContext);
     static BackendCapabilities QueryBackendCapabilities(const GraphicsContext* graphicsContext = nullptr);
     static bool SupportsCodec(oxr::protocol::VideoCodec codec);
@@ -168,8 +171,9 @@ private:
     void ReleaseHelperClient();
     std::shared_ptr<EncoderHelperClient> AcquireHelperClient() const;
     void ReclaimHelperFrames(const char* reason);
-    // Invoked from the helper client's reader thread. `cookie` is the
-    // EncodeFrameContext* the frame was submitted with (opaque across the IPC).
+    // Invoked from the helper client's reader thread. `cookie` is the sequence
+    // number the frame was submitted with, the key of its EncodeFrameContext in
+    // helperContexts_ (opaque across the IPC).
     void OnHelperNal(uint64_t cookie, const uint8_t* data, size_t size, bool keyframe,
                      int64_t ptsNs);
     void OnHelperFrameDone(uint64_t cookie, bool dropped, double encodeMs, bool keyframe);
@@ -217,6 +221,9 @@ private:
     std::atomic<bool> useHelper_{false};
     std::mutex helperContextMutex_;
     std::unordered_map<uint64_t, void*> helperContexts_; // cookie -> EncodeFrameContext*
+    // Source of helper cookies: unique for the encoder's lifetime, unlike a
+    // context address, which the allocator may hand to the next frame.
+    std::atomic<uint64_t> nextHelperCookie_{0};
     std::atomic_bool initialized_{false};
     uint32_t frameCount_ = 0;
     std::atomic<bool> forceKeyframe_{false};

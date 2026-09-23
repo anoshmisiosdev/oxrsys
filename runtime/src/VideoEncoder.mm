@@ -4,6 +4,7 @@
 #import "Config.h"
 #import "EncoderHelperClient.h"
 #import "EncoderPathPolicy.h"
+#import "EncoderSessionColor.h"
 #import "VideoTextureFormat.h"
 
 #import <CoreVideo/CoreVideo.h>
@@ -1035,19 +1036,14 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
 
     // Define one deterministic SDR color contract for every encoded stream. VideoToolbox embeds
     // these values in H.264/H.265 metadata and uses the matching matrix for RGB-to-YCbCr conversion.
-    const OSStatus primariesStatus = VTSessionSetProperty(compressionSession,
-        kVTCompressionPropertyKey_ColorPrimaries,
-        kCVImageBufferColorPrimaries_ITU_R_709_2);
-    const OSStatus transferStatus = VTSessionSetProperty(compressionSession,
-        kVTCompressionPropertyKey_TransferFunction,
-        kCVImageBufferTransferFunction_ITU_R_709_2);
-    const OSStatus matrixStatus = VTSessionSetProperty(compressionSession,
-        kVTCompressionPropertyKey_YCbCrMatrix,
-        kCVImageBufferYCbCrMatrix_ITU_R_709_2);
-    if (primariesStatus != noErr || transferStatus != noErr || matrixStatus != noErr)
+    // The contract lives in EncoderSessionColor.h, shared with the out-of-process helper's session,
+    // so the two encode paths cannot drift apart.
+    const oxrsys::encoder_color::ApplyResult colorStatus =
+        oxrsys::encoder_color::ApplySessionColorProperties(compressionSession);
+    if (!colorStatus.ok())
     {
         spdlog::warn("VideoEncoder: failed to apply complete BT.709 color metadata (primaries={} transfer={} matrix={})",
-                     primariesStatus, transferStatus, matrixStatus);
+                     colorStatus.primaries, colorStatus.transferFunction, colorStatus.yCbCrMatrix);
     }
 
     const ConfigValues& config = initialConfig;
@@ -1253,6 +1249,16 @@ bool VideoEncoder::TryStartHelper()
     }
     useHelper_.store(true);
     return true;
+}
+
+int VideoEncoder::EncoderHelperPid() const
+{
+    if (!useHelper_.load())
+    {
+        return -1;
+    }
+    std::shared_ptr<EncoderHelperClient> client = AcquireHelperClient();
+    return client != nullptr && client->IsAlive() ? client->HelperPid() : -1;
 }
 
 std::shared_ptr<EncoderHelperClient> VideoEncoder::AcquireHelperClient() const
@@ -1951,26 +1957,41 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
         // Preferred path: delegate the VideoToolbox encode to the native-arm64
         // helper, which is granted the hardware HEVC encoder. Composition into
         // this slot's IOSurface has completed (this is the command buffer's
-        // completion handler), so the helper reads finished pixels. Every field
-        // of `context` is written before the submit: once the cookie is in the
-        // map the helper's reader thread may finalize and delete it at any time.
+        // completion handler), so the helper reads finished pixels.
+        //
+        // Publishing the context (inserting it into helperContexts_) hands its
+        // ownership away: from that instant the helper's reader thread may
+        // finalize and delete it - on FrameDone, or on helper death via
+        // OnHelperDied -> ReclaimHelperFrames, which reclaims every published
+        // context whether or not it was ever submitted. So everything the
+        // submit needs is read out of `context` BEFORE publishing, and
+        // `context` is not dereferenced again on this thread afterwards.
         std::shared_ptr<EncoderHelperClient> helperClient =
             this->useHelper_.load() ? this->AcquireHelperClient() : nullptr;
         if (helperClient != nullptr && helperClient->IsAlive())
         {
-            const uint64_t cookie = (uint64_t)(uintptr_t)context;
+            // A per-encoder sequence number, not the context's address: an
+            // address can be reused by the next frame's context as soon as this
+            // one is freed, and the orphan lookup below must never find (and
+            // finalize) a different frame than the one it published.
+            const uint64_t cookie = this->nextHelperCookie_.fetch_add(1) + 1;
+            const uint32_t slot = (uint32_t)context->slotIndex;
             context->metrics.encodeSubmitMs = 0.0;
             context->encodeSubmitFinished = Clock::now();
             {
                 std::lock_guard<std::mutex> lock(this->helperContextMutex_);
                 this->helperContexts_[cookie] = context;
             }
-            helperClient->SubmitFrame(cookie, (uint32_t)context->slotIndex, timestampNs,
-                                      forceKeyframe);
-            if (!helperClient->IsAlive())
+            // `context` is published: only `cookie` identifies it from here on.
+            if (!helperClient->SubmitFrame(cookie, slot, timestampNs, forceKeyframe))
             {
-                // The helper died during this submit. OnHelperDied reclaims the
-                // frames it saw; take this one if it was inserted after that.
+                // Never sent: the helper was already gone, or died under this
+                // write (EPIPE; the client has marked it dead). No completion
+                // will come for this frame. OnHelperDied may already have
+                // reclaimed it; otherwise take it back here. Looked up by
+                // cookie, never through the `context` pointer, which may
+                // already have been finalized. A frame that WAS sent is left to
+                // the helper: FrameDone, or OnHelperDied if it never answers.
                 EncodeFrameContext* orphan = nullptr;
                 {
                     std::lock_guard<std::mutex> lock(this->helperContextMutex_);

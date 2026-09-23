@@ -2,15 +2,21 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "EncoderSessionColor.h"
 #include "VideoEncoder.h"
+#include "VuiColorTestSupport.h"
 
 #import <Metal/Metal.h>
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <csignal>
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <set>
+#include <thread>
 #include <vector>
 
 namespace
@@ -81,6 +87,7 @@ void EncodeOneFrame(oxr::protocol::VideoCodec codec,
     bool dropped = true;
     size_t nalCount = 0;
     bool annexB = true;
+    std::vector<std::vector<uint8_t>> nals;
 
     VideoEncoder encoder;
     if (foveated)
@@ -116,6 +123,10 @@ void EncodeOneFrame(oxr::protocol::VideoCodec codec,
             ++nalCount;
             annexB = annexB && size >= 4 && data != nullptr &&
                      data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 1;
+            if (data != nullptr)
+            {
+                nals.emplace_back(data, data + size);
+            }
         },
         [&](const VideoEncoder::FrameMetrics& metrics) {
             {
@@ -151,6 +162,23 @@ void EncodeOneFrame(oxr::protocol::VideoCodec codec,
         CHECK_FALSE(dropped);
         CHECK(nalCount > 0);
         CHECK(annexB);
+
+        // Whichever process encoded this (in-process, or the helper when the
+        // policy or encoder_helper picked it), the stream must carry the one
+        // BT.709 colour description both sessions are configured from.
+        //
+        // Range is deliberately not asserted here: no session property sets
+        // it, and VideoToolbox's software HEVC encoder (all a Rosetta process
+        // gets for HEVC, and all an encoder-less CI runner gets) signals full
+        // range where every hardware encoder signals video range. The helper
+        // is hardware-only; its range is checked in TestEncoderHelperClient.
+        const oxrsys::test::VuiColor color = oxrsys::test::ParseVuiColor(
+            nals, codec == oxr::protocol::VideoCodec::H265);
+        CHECK(color.present);
+        CHECK(color.primaries == oxrsys::test::CFToString(oxrsys::encoder_color::kPrimaries));
+        CHECK(color.transfer ==
+              oxrsys::test::CFToString(oxrsys::encoder_color::kTransferFunction));
+        CHECK(color.matrix == oxrsys::test::CFToString(oxrsys::encoder_color::kYCbCrMatrix));
     }
 
     encoder.Shutdown();
@@ -232,4 +260,107 @@ TEST_CASE("VideoToolbox encodes Metal textures with every advertised codec",
         EncodeOneFrame(oxr::protocol::VideoCodec::H265, MTLPixelFormatBGRA8Unorm,
                        /*foveated=*/false, /*tenBit=*/true);
     }
+}
+
+TEST_CASE("VideoEncoder falls back in-process when the encoder helper dies mid-stream",
+          "[video][encoder][videotoolbox][helper][lifecycle]")
+{
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    REQUIRE(device != nil);
+    id<MTLCommandQueue> queue = [device newCommandQueue];
+    REQUIRE(queue != nil);
+    GraphicsContext graphics = GraphicsContext::Metal((__bridge void*)device,
+                                                       (__bridge void*)queue);
+
+    std::mutex mutex;
+    std::condition_variable changed;
+    size_t accepted = 0;
+    size_t completions = 0;
+    size_t deliveredAfterKill = 0;
+    size_t duplicateCompletions = 0;
+    std::set<uint64_t> completedFrames;
+    bool killed = false;
+
+    VideoEncoder encoder;
+    // H.265: the codec a Rosetta host is refused hardware for, so `auto` picks
+    // the helper there; elsewhere this needs encoder_helper = "true".
+    REQUIRE(encoder.Initialize(128, 64, 60, 8, graphics, oxr::protocol::VideoCodec::H265));
+    const int helperPid = encoder.EncoderHelperPid();
+    if (helperPid <= 0)
+    {
+        encoder.Shutdown();
+        [queue release];
+        [device release];
+        SKIP("this configuration encodes in-process; nothing to kill");
+    }
+
+    auto submit = [&](int64_t timestampNs) {
+        FrameSource frame = {};
+        frame.left = MakeSource(device, 64, 64, MTLPixelFormatBGRA8Unorm);
+        frame.right = MakeSource(device, 64, 64, MTLPixelFormatBGRA8Unorm);
+        const bool ok = encoder.EncodeStereo(
+            std::move(frame), timestampNs, [](const uint8_t*, size_t, bool, int64_t) {},
+            [&](const VideoEncoder::FrameMetrics& metrics) {
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    ++completions;
+                    if (!completedFrames.insert(metrics.frameNumber).second)
+                    {
+                        ++duplicateCompletions;
+                    }
+                    if (killed && !metrics.frameDropped)
+                    {
+                        ++deliveredAfterKill;
+                    }
+                }
+                changed.notify_all();
+            });
+        std::lock_guard<std::mutex> lock(mutex);
+        accepted += ok ? 1 : 0;
+    };
+
+    // Stream through the helper, then kill it (our own child, not Wine's) with
+    // frames still in flight: their completions will never come, so the encoder
+    // has to reclaim them, and every frame after that has to encode in-process.
+    int64_t timestampNs = 1'000'000;
+    for (int i = 0; i < 6; ++i, timestampNs += 16'666'667)
+    {
+        submit(timestampNs);
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        killed = true;
+    }
+    REQUIRE(kill(helperPid, SIGKILL) == 0);
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    for (;;)
+    {
+        submit(timestampNs);
+        timestampNs += 16'666'667;
+        std::unique_lock<std::mutex> lock(mutex);
+        if (changed.wait_for(lock, std::chrono::milliseconds(20),
+                             [&] { return deliveredAfterKill >= 3; }) ||
+            std::chrono::steady_clock::now() > deadline)
+        {
+            break;
+        }
+    }
+
+    CHECK(encoder.EncoderHelperPid() == -1);
+    // Every slot and callback-drain lease held by a frame that was in flight to
+    // the dead helper came back, or this would time out.
+    CHECK(encoder.Shutdown(std::chrono::seconds(5)));
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        INFO("accepted " << accepted << ", completions " << completions);
+        CHECK(deliveredAfterKill >= 3);
+        // Exactly one completion per frame: none lost with the helper, none
+        // finalized twice (by both the death reclaim and the submit path).
+        CHECK(completions >= accepted);
+        CHECK(duplicateCompletions == 0);
+    }
+    [queue release];
+    [device release];
 }

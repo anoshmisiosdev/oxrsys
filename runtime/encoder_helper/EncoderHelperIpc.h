@@ -4,7 +4,7 @@
 
 // -----------------------------------------------------------------------------
 // Wire protocol between the OXRSys runtime (parent, x86_64 under Rosetta) and
-// the native-arm64 HEVC encoder helper (child), spoken over an inherited Unix
+// the native-arm64 video encoder helper (child), spoken over an inherited Unix
 // stream socket. This header is FRAMEWORK-FREE by construction so it compiles
 // unchanged in the x86_64 runtime dylib and the arm64 helper executable.
 //
@@ -27,11 +27,16 @@
 //    process and reports them as already-converted milliseconds.
 // -----------------------------------------------------------------------------
 
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <string>
 #include <vector>
+
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 namespace oxrsys::enc_ipc
 {
@@ -297,6 +302,77 @@ inline bool DeserializeInit(const uint8_t* data, size_t size, InitPayload& out)
 inline const char* CodecName(CodecCode codec)
 {
     return codec == CodecCode::H264 ? "H.264" : "H.265";
+}
+
+// -----------------------------------------------------------------------------
+// Control-socket I/O that never raises SIGPIPE.
+//
+// A write to a stream socket whose peer has gone raises SIGPIPE, whose default
+// action terminates the writer. On the runtime side the writer is the game
+// process (the dylib lives inside someone else's process, under Wine), so a
+// helper crash would take the game down with it; on the helper side it would
+// turn "the host went away" into a signal death. Suppressed per socket, never
+// with a process-wide signal(SIGPIPE, SIG_IGN), which a library has no business
+// installing in its host: SO_NOSIGPIPE on the descriptor, plus MSG_NOSIGNAL on
+// every send as a second, per-call guard. A write to a dead peer then just
+// fails with EPIPE, which both peers already treat as "the other side is gone".
+// -----------------------------------------------------------------------------
+
+// Call on every control-socket descriptor as soon as it exists.
+inline bool DisableSigPipe(int fd)
+{
+    int one = 1;
+    return setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one)) == 0;
+}
+
+inline constexpr int kSendFlags =
+#if defined(MSG_NOSIGNAL)
+    MSG_NOSIGNAL;
+#else
+    0;
+#endif
+
+// Writes all of `data`, retrying on EINTR. False on any other error (errno is
+// left as send() set it: EPIPE when the peer is gone).
+inline bool SendAll(int fd, const uint8_t* data, size_t len)
+{
+    size_t off = 0;
+    while (off < len)
+    {
+        const ssize_t n = ::send(fd, data + off, len - off, kSendFlags);
+        if (n > 0)
+        {
+            off += (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR)
+        {
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+// Reads exactly `len` bytes, retrying on EINTR. False on EOF or error.
+inline bool RecvAll(int fd, uint8_t* data, size_t len)
+{
+    size_t off = 0;
+    while (off < len)
+    {
+        const ssize_t n = ::read(fd, data + off, len - off);
+        if (n > 0)
+        {
+            off += (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR)
+        {
+            continue;
+        }
+        return false; // 0 = EOF: the peer is gone
+    }
+    return true;
 }
 
 // -----------------------------------------------------------------------------
