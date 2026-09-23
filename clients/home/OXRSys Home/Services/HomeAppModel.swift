@@ -4,6 +4,25 @@ import Combine
 import Foundation
 import UniformTypeIdentifiers
 
+/// Facts about how this process was started, as opposed to what the user asked for.
+enum HomeLaunchContext {
+    /// True when the app was launched as an XCTest host instead of by a person.
+    ///
+    /// The unit tests are hosted by the app target, so the whole app starts up before a
+    /// single assertion runs. Onboarding UI has no audience in that process, and a modal
+    /// alert raised during the first layout pass is actively harmful there: `NSAlert`
+    /// resolves the app icon through IconServices, whose `ISIconManager` singleton does a
+    /// synchronous XPC round trip inside a `dispatch_once`. If `iconservicesagent` does not
+    /// answer, the main thread is wedged for the lifetime of the process and the app never
+    /// finishes launching.
+    static var isHostingUnitTests: Bool {
+        let environment = ProcessInfo.processInfo.environment
+        return environment["XCTestConfigurationFilePath"] != nil
+            || environment["XCTestBundlePath"] != nil
+            || environment["XCTestSessionIdentifier"] != nil
+    }
+}
+
 private struct RuntimeStatsStreamIdentity: Equatable {
     let processID: Int?
     let transport: RuntimeActivityTransport?
@@ -268,6 +287,9 @@ final class HomeAppModel: ObservableObject, @unchecked Sendable {
 
     func presentRuntimeSetupGuidanceIfNeeded() {
         refreshRuntimeStatus()
+        guard !HomeLaunchContext.isHostingUnitTests else {
+            return
+        }
         guard !hasPresentedRuntimeSetupGuidanceThisLaunch, !isSelectedRuntimeRegistered else {
             return
         }
