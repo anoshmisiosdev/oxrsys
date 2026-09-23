@@ -16,6 +16,13 @@
 namespace
 {
 
+// How long a backend is given to deliver the completion for a single submitted
+// frame unprompted, before the encoder is flushed instead. Hardware sessions
+// and the out-of-process helper both answer in single-digit milliseconds, so
+// this is ~100x their latency; it is deliberately not a "the encode failed"
+// timeout, because on a software session it is simply the wrong question.
+constexpr std::chrono::milliseconds kSpontaneousCompletionGrace{750};
+
 std::shared_ptr<void> AdoptTexture(id<MTLTexture> texture)
 {
     return std::shared_ptr<void>((void*)texture, [](void* value) {
@@ -63,6 +70,18 @@ void EncodeOneFrame(oxr::protocol::VideoCodec codec,
 
     GraphicsContext graphics = GraphicsContext::Metal((__bridge void*)device,
                                                        (__bridge void*)queue);
+
+    // Declared ahead of the encoder so it outlives it. The callbacks below
+    // capture this state by reference and the last of them can still fire from
+    // the encoder's own teardown flush, which runs while these are in scope
+    // only if they are destroyed after it.
+    std::mutex mutex;
+    std::condition_variable ready;
+    bool completed = false;
+    bool dropped = true;
+    size_t nalCount = 0;
+    bool annexB = true;
+
     VideoEncoder encoder;
     if (foveated)
     {
@@ -88,13 +107,6 @@ void EncodeOneFrame(oxr::protocol::VideoCodec codec,
     frame.left = MakeSource(device, 64, 64, pixelFormat);
     frame.right = MakeSource(device, 64, 64, pixelFormat);
 
-    std::mutex mutex;
-    std::condition_variable ready;
-    bool completed = false;
-    bool dropped = true;
-    size_t nalCount = 0;
-    bool annexB = true;
-
     encoder.ForceKeyframe();
     REQUIRE(encoder.EncodeStereo(
         std::move(frame),
@@ -116,7 +128,26 @@ void EncodeOneFrame(oxr::protocol::VideoCodec codec,
 
     {
         std::unique_lock<std::mutex> lock(mutex);
-        REQUIRE(ready.wait_for(lock, std::chrono::seconds(5), [&] { return completed; }));
+        if (!ready.wait_for(lock, kSpontaneousCompletionGrace, [&] { return completed; }))
+        {
+            // A hardware session hands this lone frame back on its own within a
+            // few milliseconds. A software VideoToolbox session - which is all
+            // an encoder-less CI runner can offer - buffers it until the
+            // compression session is flushed, and no amount of further waiting
+            // will produce it. So drain the encoder and re-check: the assertion
+            // is that the frame encoded, not that a particular backend chose to
+            // volunteer it unprompted.
+            //
+            // The lock is dropped first because both callbacks take `mutex`
+            // from VideoToolbox's own thread during the flush. Shutdown only
+            // returns true once every one of them has run, and it is idempotent
+            // (a second call short-circuits on resourcesDestroyed_), so the
+            // Shutdown below stays correct.
+            lock.unlock();
+            encoder.Shutdown(std::chrono::seconds(5));
+            lock.lock();
+        }
+        CHECK(completed);
         CHECK_FALSE(dropped);
         CHECK(nalCount > 0);
         CHECK(annexB);
