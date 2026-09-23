@@ -6,6 +6,15 @@ This file tracks user-facing, integration-facing, and runtime-relevant changes f
 
 ### Added
 
+- Added real controller velocity reporting through `XrSpaceVelocity`. `xrLocateSpace` previously
+  answered every velocity query with `velocityFlags = 0` (spec-legal "no data"), so games that read
+  controller speed rather than differentiating poses themselves saw no motion — UNDERDOGS and other
+  boxing titles never registered fast punches, because hand positions were correct while the
+  reported speed was always zero. The runtime now derives controller velocity from a finite
+  difference of the two most recent raw tracking samples and reports it in the base space's frame.
+  The value is deliberately undamped, so a punch is reported at its true instantaneous speed.
+  Reference spaces stay static, the head keeps its existing prediction/jitter handling untouched,
+  and when no velocity is known the runtime still reports none rather than a fabricated value.
 - Added first-class macOS `arm64` and `x86_64` CI lanes plus universal release packaging with
   architecture validation for the runtime and OXRSys Home.
 - Added a macOS/iOS simulator build lane covering the Cardboard-style stereo viewer and ARKit

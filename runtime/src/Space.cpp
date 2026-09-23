@@ -5,6 +5,7 @@
 #include "Runtime.h"
 #include "InputManager.h"
 #include "ActionSet.h"
+#include "VelocityMath.h"
 #include <glm/glm.hpp>
 #include <glm/gtc/quaternion.hpp>
 
@@ -92,6 +93,12 @@ struct LocatedWorldPose
 {
     XrPosef pose{};
     bool active = true;
+    // Set for controller (action pose) spaces only — reference spaces (LOCAL/STAGE/VIEW) are
+    // treated as static, so they have no velocity of their own. Carried here so the velocity
+    // path reuses the hand GetWorldPose already resolved instead of redoing the action-data and
+    // path-string lookups on every frame.
+    bool isController = false;
+    InputManager::Hand hand = InputManager::Hand::Left;
 };
 
 // Compute world pose of a space.
@@ -142,15 +149,18 @@ static LocatedWorldPose GetWorldPose(Space* space, const InputManager& inputMana
         }
 
         result.active = poseActive;
+        result.isController = true;
         if (poseActive && !poseBindingPath.empty())
         {
             InputManager::Hand hand = HandFromBindingPath(poseBindingPath);
+            result.hand = hand;
             result.pose = inputManager.GetPoseComponentForProfile(
                 hand, ComponentFromBindingPath(poseBindingPath), poseProfilePath);
         }
         else
         {
             InputManager::Hand hand = HandFromPath(space->GetSubactionPath());
+            result.hand = hand;
             result.pose = inputManager.GetControllerPose(hand);
         }
     }
@@ -168,6 +178,21 @@ static LocatedWorldPose GetWorldPose(Space* space, const InputManager& inputMana
     result.pose.orientation = ToXr(finalRot);
     result.pose.position = ToXr(finalPos);
     return result;
+}
+
+// World-frame velocity of an already-located space (linear m/s, angular rad/s), for
+// XrSpaceVelocity. Only controller (action pose) spaces move here; reference spaces
+// (LOCAL/STAGE/VIEW) are treated as static, so their velocity is zero. The controller velocity is
+// undamped — derived from raw poses — so punch/throw-style mechanics see true speed. Returns false
+// when no velocity is known, and the caller must then report none rather than fabricate one.
+static bool GetWorldVelocity(const LocatedWorldPose& located, const InputManager& inputManager,
+                             glm::vec3& linVel, glm::vec3& angVel)
+{
+    if (!located.isController)
+    {
+        return false;
+    }
+    return inputManager.GetControllerVelocity(located.hand, linVel, angVel);
 }
 
 XrResult Space::LocateSpace(Space* baseSpace, XrTime time, XrSpaceLocation* location)
@@ -210,9 +235,16 @@ XrResult Space::LocateSpace(Space* baseSpace, XrTime time, XrSpaceLocation* loca
 
     if (XrSpaceVelocity* velocity = FindSpaceVelocity(location->next))
     {
-        velocity->velocityFlags = 0;
-        velocity->linearVelocity = {0.0f, 0.0f, 0.0f};
-        velocity->angularVelocity = {0.0f, 0.0f, 0.0f};
+        glm::vec3 thisLin(0.0f);
+        glm::vec3 thisAng(0.0f);
+        glm::vec3 baseLin(0.0f);
+        glm::vec3 baseAng(0.0f);
+        const bool haveThis = GetWorldVelocity(thisPose, inputManager, thisLin, thisAng);
+        GetWorldVelocity(basePose, inputManager, baseLin, baseAng); // static base stays 0
+
+        oxrsys::velocity::FillRelativeVelocity(
+            *velocity, haveThis, thisPose.active && basePose.active,
+            ToGlm(basePose.pose.orientation), thisLin, thisAng, baseLin, baseAng);
     }
 
     return XR_SUCCESS;

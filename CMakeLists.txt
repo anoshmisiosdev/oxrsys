@@ -172,6 +172,7 @@ add_executable(oxrsys_runtime_tests
     tests/TestBoundedDrain.cpp
     tests/TestClientLiveness.cpp
     tests/TestConfig.cpp
+    tests/TestControllerVelocity.cpp
     tests/TestEncoderHelperIpc.cpp
     tests/TestEncoderPathPolicy.cpp
     tests/TestInputManager.cpp
