@@ -55,7 +55,8 @@ Use `assembleOptimizedRelease` as an additional diagnostic, not as the stable si
   --architectures universal
 ```
 
-The helper validates both `arm64` and `x86_64` slices in the runtime and Home executable. Also check
+The helper validates both `arm64` and `x86_64` slices in the runtime and Home executable, and that
+`runtime/oxrsys-encoder-helper` is arm64 only. Also check
 that the package manifest contains the relative `./liboxrsys-runtime.dylib` path. A package build is
 not evidence that signing, notarization, launch, or streaming succeeds.
 

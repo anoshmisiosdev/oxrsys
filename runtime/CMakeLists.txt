@@ -94,3 +94,15 @@ add_custom_command(TARGET oxrsys_runtime POST_BUILD
         ${CMAKE_CURRENT_BINARY_DIR}/oxrsys-runtime.toml
     COMMENT "Copying oxrsys-runtime.toml to build directory"
 )
+
+# --- Native-arm64 encoder helper ---
+# Always built arm64, even when this runtime is x86_64 or universal (see
+# encoder_helper/CMakeLists.txt). It is placed next to liboxrsys-runtime.dylib,
+# which is where VideoEncoder looks for it when encoder_helper_path is empty,
+# and oxrsys_runtime depends on it so building the runtime target alone (as the
+# packaging scripts do) always produces a matching helper.
+add_subdirectory(encoder_helper)
+set_target_properties(oxrsys-encoder-helper PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "$<TARGET_FILE_DIR:oxrsys_runtime>"
+)
+add_dependencies(oxrsys_runtime oxrsys-encoder-helper)

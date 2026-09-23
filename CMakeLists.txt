@@ -342,9 +342,13 @@ target_compile_definitions(oxrsys_videotoolbox_encoder_tests PRIVATE
 add_test(NAME oxrsys_videotoolbox_encoder_tests
     COMMAND oxrsys_videotoolbox_encoder_tests
 )
+# The encoder tests drive the build's own native-arm64 helper, wherever the
+# runtime dylib that would normally sit beside it is.
+add_dependencies(oxrsys_videotoolbox_encoder_tests oxrsys-encoder-helper)
 set_tests_properties(oxrsys_videotoolbox_encoder_tests PROPERTIES
-    ENVIRONMENT "${OXRSYS_ISOLATED_TEST_ENV}"
-    TIMEOUT 30
+    ENVIRONMENT
+        "${OXRSYS_ISOLATED_TEST_ENV};OXRSYS_ENCODER_HELPER_PATH=$<TARGET_FILE:oxrsys-encoder-helper>"
+    TIMEOUT 60
 )
 list(APPEND OXRSYS_RUNTIME_TEST_TARGETS oxrsys_videotoolbox_encoder_tests)
 
