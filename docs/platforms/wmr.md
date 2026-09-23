@@ -1,13 +1,20 @@
 # Windows Mixed Reality Headsets (macOS)
 
-Status: **runtime integration, orientation only**. The Monado WMR driver
-builds and links on macOS, a probe tool prints IMU orientation, a display tool
-renders a test scene on the panel, and the runtime can use the headset in
-place of a streaming client: with `wired_headset = true` an OpenXR app renders
-at the panel's native eye size and refresh rate, sees the headset's FOV and
-orientation, and its frames are shown on the panel through the distortion
-warp. Verified end to end on a Dell Visor with the smoke client below. There
-is no positional tracking and no controller input yet.
+Status: **runtime integration, 6DoF with Basalt**. The Monado WMR driver builds
+and links on macOS, a probe tool prints IMU orientation, a display tool renders
+a test scene on the panel, and `oxrsys-headset-helper` owns the headset while
+the runtime is a socket client of it: with `wired_headset = true` an OpenXR app
+renders at the panel's native eye size and refresh rate, sees the headset's FOV
+and pose, and its frames are shown on the panel through the distortion warp.
+Head tracking is orientation-only by default and 6DoF when a Basalt VIT plugin
+is installed (`wired_position_tracking`, see below). Controllers are supported
+through the headset radio, over Bluetooth, and — for 1st-gen WMR motion
+controllers, which macOS cannot pair — through `wmr_btstack` on a separate USB
+Bluetooth adapter. Verified end to end on a Dell Visor with the smoke client
+below.
+
+This branch collects the whole Windows Mixed Reality effort; it is not one of
+the branches being prepared for upstream review.
 
 ## What This Is
 

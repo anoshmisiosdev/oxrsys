@@ -284,11 +284,6 @@ connecting, connected with its report rate, in use by the headset) and the pairi
 instructions; `Forget Paired Controllers` drops all bondings. Details:
 [wmr.md](wmr.md#wmr-controllers-through-a-usb-bluetooth-adapter).
 
-> The wired-headset runtime backend, `oxrsys-headset-helper`, the Monado-derived drivers under
-> `drivers/` and `wmr_btstack` are not part of this branch. Until they land, Home writes and reads
-> the `[wired]` keys and drives `wmr_btstack` if you build and install it yourself, but the runtime
-> ignores the section and keeps using the streaming path.
-
 `client_reprojection` controls short missing-frame smoothing on the Quest client. The default
 `pose` reuses a recent decoded texture with the matched server render pose; `pose_warp` additionally
 allows a small GLES image-space orientation correction when safety checks pass. `off` disables the
@@ -336,8 +331,7 @@ The runtime reloads config file changes opportunistically:
   encoder/client connection is recreated
 - the `[wired]` keys are read when an app calls `xrGetSystem` and passed to the headset helper
   when the runtime starts it, so switching headset mode takes effect for the next OpenXR app
-  launch (stop a running helper first for the other keys) — once the wired runtime backend is
-  present
+  launch (stop a running helper first for the other keys)
 - file logger sink setup still requires a restart
 
 The Settings ADB section detects authorized ADB devices, applies reverse mappings for ports `9944`, `9945`, `9946`, and `9948`, then verifies them through the native USB ADB protocol, the local ADB server protocol, or `adb reverse --list` fallback. USB refresh/setup results are request-scoped so stale results after ADB mode, path, selected device, or transport changes are ignored. If a periodic refresh cannot read reverse mappings for the same still-authorized device, Home preserves previously verified reverse ports instead of flipping the main readiness pill to not ready. This prepares the USB TCP transport and the reserved reliable spatial channel; it is separate from Android `UsbManager` app permission prompts.
