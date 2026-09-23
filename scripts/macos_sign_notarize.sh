@@ -10,7 +10,7 @@ SCRIPT_NAME="$(basename "$0")"
 DEFAULT_CMAKE_BUILD_DIR="${REPO_ROOT}/build"
 DEFAULT_HOME_DERIVED_DATA="${REPO_ROOT}/build/xcode/OXRSysHome"
 DEFAULT_HOME_APP="${DEFAULT_HOME_DERIVED_DATA}/Build/Products/Release/OXRSys Home.app"
-DEFAULT_HOME_ENTITLEMENTS="${REPO_ROOT}/clients/Apple/oxrsys-home/OXRSys Home/OXRSys Home.entitlements"
+DEFAULT_HOME_ENTITLEMENTS="${REPO_ROOT}/clients/home/OXRSys Home/Resources/OXRSys Home.entitlements"
 DEFAULT_ARCHIVE_DIR="${REPO_ROOT}/build/dist"
 
 CMAKE_BUILD_DIR="${DEFAULT_CMAKE_BUILD_DIR}"
@@ -19,6 +19,7 @@ HOME_APP=""
 HOME_ENTITLEMENTS="${DEFAULT_HOME_ENTITLEMENTS}"
 RUNTIME_DIR=""
 RUNTIME_DYLIB=""
+RUNTIME_HELPER=""
 RUNTIME_MANIFEST=""
 RUNTIME_CONFIG=""
 ARCHIVE_DIR="${DEFAULT_ARCHIVE_DIR}"
@@ -31,6 +32,10 @@ BUILD_RUNTIME=0
 BUILD_HOME=0
 NOTARIZE=0
 STAPLE=1
+ARCHITECTURES="universal"
+CMAKE_ARCHITECTURES=""
+XCODE_ARCHITECTURES=""
+EXPECTED_ARCHITECTURES=()
 
 TEMP_DIRS=()
 
@@ -39,10 +44,11 @@ usage() {
 Usage:
   ${SCRIPT_NAME} [options]
 
-Signs the macOS runtime dylib and OXRSys Home app, then creates a single zip archive containing:
+Signs the macOS runtime dylib, its encoder helper and OXRSys Home app, then creates a single zip archive containing:
   OXRSys-macOS/
     OXRSys Home.app
     runtime/liboxrsys-runtime.dylib
+    runtime/oxrsys-encoder-helper
     runtime/oxrsys-runtime.json
     runtime/oxrsys-runtime.toml
 
@@ -58,12 +64,14 @@ Options:
 Build options:
   --build-runtime         Configure and build the runtime target before signing.
   --build-home            Build the Release OXRSys Home app before signing.
+  --architectures VALUE   native, arm64, x86_64, or universal. Default: universal
   --cmake-build-dir DIR   CMake build directory. Default: build
   --home-derived-data DIR DerivedData path used by --build-home. Default: build/xcode/OXRSysHome
 
 Path options:
   --runtime-dir DIR       Runtime output directory. Default: <cmake-build-dir>/runtime
   --runtime-dylib PATH    Runtime dylib path. Default: <runtime-dir>/liboxrsys-runtime.dylib
+  --runtime-helper PATH   Native-arm64 encoder helper. Default: <runtime-dir>/oxrsys-encoder-helper
   --runtime-manifest PATH Runtime manifest path. Default: <runtime-dir>/oxrsys-runtime.json
   --runtime-config PATH   Runtime TOML path. Default: <runtime-dir>/oxrsys-runtime.toml
   --home-app PATH         OXRSys Home.app path. Default: <home-derived-data>/Build/Products/Release/OXRSys Home.app
@@ -121,11 +129,10 @@ require_tool() {
 
 absolute_path() {
     local path="$1"
-    if [[ "${path}" == /* ]]; then
-        print -r -- "${path}"
-    else
-        print -r -- "$(pwd)/${path}"
+    if [[ "${path}" != /* ]]; then
+        path="$(pwd)/${path}"
     fi
+    print -r -- "${path:A}"
 }
 
 run() {
@@ -174,6 +181,11 @@ parse_args() {
                 BUILD_HOME=1
                 shift
                 ;;
+            --architectures)
+                [[ $# -ge 2 ]] || fail "--architectures requires a value"
+                ARCHITECTURES="$2"
+                shift 2
+                ;;
             --cmake-build-dir)
                 [[ $# -ge 2 ]] || fail "--cmake-build-dir requires a value"
                 CMAKE_BUILD_DIR="$(absolute_path "$2")"
@@ -192,6 +204,11 @@ parse_args() {
             --runtime-dylib)
                 [[ $# -ge 2 ]] || fail "--runtime-dylib requires a value"
                 RUNTIME_DYLIB="$(absolute_path "$2")"
+                shift 2
+                ;;
+            --runtime-helper)
+                [[ $# -ge 2 ]] || fail "--runtime-helper requires a value"
+                RUNTIME_HELPER="$(absolute_path "$2")"
                 shift 2
                 ;;
             --runtime-manifest)
@@ -242,6 +259,9 @@ apply_defaults() {
     if [[ -z "${RUNTIME_DYLIB}" ]]; then
         RUNTIME_DYLIB="${RUNTIME_DIR}/liboxrsys-runtime.dylib"
     fi
+    if [[ -z "${RUNTIME_HELPER}" ]]; then
+        RUNTIME_HELPER="${RUNTIME_DIR}/oxrsys-encoder-helper"
+    fi
     if [[ -z "${RUNTIME_MANIFEST}" ]]; then
         RUNTIME_MANIFEST="${RUNTIME_DIR}/oxrsys-runtime.json"
     fi
@@ -256,6 +276,43 @@ apply_defaults() {
         timestamp="$(/bin/date +%Y%m%d-%H%M%S)"
         ARCHIVE_PATH="${ARCHIVE_DIR}/OXRSys-macOS-${timestamp}.zip"
     fi
+}
+
+configure_architectures() {
+    case "${ARCHITECTURES}" in
+        native)
+            local native_arch
+            native_arch="$(/usr/bin/uname -m)"
+            case "${native_arch}" in
+                arm64|x86_64)
+                    ;;
+                *)
+                    fail "Unsupported native macOS architecture: ${native_arch}"
+                    ;;
+            esac
+            CMAKE_ARCHITECTURES="${native_arch}"
+            XCODE_ARCHITECTURES="${native_arch}"
+            EXPECTED_ARCHITECTURES=("${native_arch}")
+            ;;
+        arm64)
+            CMAKE_ARCHITECTURES="arm64"
+            XCODE_ARCHITECTURES="arm64"
+            EXPECTED_ARCHITECTURES=(arm64)
+            ;;
+        x86_64)
+            CMAKE_ARCHITECTURES="x86_64"
+            XCODE_ARCHITECTURES="x86_64"
+            EXPECTED_ARCHITECTURES=(x86_64)
+            ;;
+        universal)
+            CMAKE_ARCHITECTURES="arm64;x86_64"
+            XCODE_ARCHITECTURES="arm64 x86_64"
+            EXPECTED_ARCHITECTURES=(arm64 x86_64)
+            ;;
+        *)
+            fail "--architectures must be native, arm64, x86_64, or universal"
+            ;;
+    esac
 }
 
 resolve_sign_identity() {
@@ -292,7 +349,13 @@ resolve_sign_identity() {
 validate_inputs() {
     [[ -f "${RUNTIME_DYLIB}" ]] || fail "Runtime dylib not found: ${RUNTIME_DYLIB}"
     [[ -f "${RUNTIME_MANIFEST}" ]] || fail "Runtime manifest not found: ${RUNTIME_MANIFEST}"
+    [[ -x "${RUNTIME_HELPER}" ]] || fail "Encoder helper not found: ${RUNTIME_HELPER}"
     [[ -d "${HOME_APP}" ]] || fail "Home app not found: ${HOME_APP}"
+    [[ -f "$(home_executable_path)" ]] || fail "Home executable not found: $(home_executable_path)"
+
+    validate_binary_architectures "${RUNTIME_DYLIB}" "Runtime dylib"
+    validate_helper_architecture "${RUNTIME_HELPER}"
+    validate_binary_architectures "$(home_executable_path)" "Home executable"
 
     if [[ -n "${HOME_ENTITLEMENTS}" && ! -f "${HOME_ENTITLEMENTS}" ]]; then
         fail "Home entitlements file not found: ${HOME_ENTITLEMENTS}"
@@ -310,18 +373,62 @@ validate_inputs() {
 build_runtime() {
     require_tool cmake
 
-    run cmake -B "${CMAKE_BUILD_DIR}" -G Ninja -DCMAKE_BUILD_TYPE=Release
+    run cmake \
+        -S "${REPO_ROOT}" \
+        -B "${CMAKE_BUILD_DIR}" \
+        -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_OSX_ARCHITECTURES="${CMAKE_ARCHITECTURES}"
     run cmake --build "${CMAKE_BUILD_DIR}" --target oxrsys_runtime
 }
 
 build_home() {
     run /usr/bin/xcodebuild \
-        -project "${REPO_ROOT}/clients/Apple/oxrsys-home/OXRSys Home.xcodeproj" \
+        -project "${REPO_ROOT}/clients/home/OXRSys Home.xcodeproj" \
         -scheme "OXRSys Home" \
         -configuration Release \
+        -destination "platform=macOS" \
         -derivedDataPath "${HOME_DERIVED_DATA}" \
+        ARCHS="${XCODE_ARCHITECTURES}" \
+        ONLY_ACTIVE_ARCH=NO \
         CODE_SIGNING_ALLOWED=NO \
         build
+}
+
+validate_binary_architectures() {
+    local binary_path="$1"
+    local label="$2"
+    local actual_architectures
+    actual_architectures="$(/usr/bin/lipo -archs "${binary_path}")" \
+        || fail "Could not inspect ${label}: ${binary_path}"
+
+    local expected_arch
+    for expected_arch in "${EXPECTED_ARCHITECTURES[@]}"; do
+        if [[ " ${actual_architectures} " != *" ${expected_arch} "* ]]; then
+            fail "${label} is missing ${expected_arch}; found: ${actual_architectures}"
+        fi
+    done
+}
+
+# The helper must be arm64 and only arm64, for every package architecture: its
+# whole purpose is to be a native process when the runtime runs under Rosetta.
+validate_helper_architecture() {
+    local binary_path="$1"
+    local actual_architectures
+    actual_architectures="$(/usr/bin/lipo -archs "${binary_path}")" \
+        || fail "Could not inspect encoder helper: ${binary_path}"
+    if [[ "${actual_architectures}" != "arm64" ]]; then
+        fail "Encoder helper must be arm64 only; found: ${actual_architectures}"
+    fi
+}
+
+home_executable_path() {
+    local executable_name
+    executable_name="$(/usr/libexec/PlistBuddy \
+        -c 'Print :CFBundleExecutable' \
+        "${HOME_APP}/Contents/Info.plist")" \
+        || fail "Could not read CFBundleExecutable from ${HOME_APP}"
+    print -r -- "${HOME_APP}/Contents/MacOS/${executable_name}"
 }
 
 sign_runtime() {
@@ -336,6 +443,20 @@ sign_runtime() {
         "${RUNTIME_DYLIB}"
 
     run /usr/bin/codesign --verify --strict --verbose=2 "${RUNTIME_DYLIB}"
+
+    # The helper is a separate executable the runtime spawns, so notarization
+    # needs it signed with the hardened runtime like everything else shipped.
+    echo "Signing encoder helper:"
+    echo "  ${RUNTIME_HELPER}"
+
+    run /usr/bin/codesign \
+        --force \
+        --timestamp \
+        --options runtime \
+        --sign "${SIGN_IDENTITY}" \
+        "${RUNTIME_HELPER}"
+
+    run /usr/bin/codesign --verify --strict --verbose=2 "${RUNTIME_HELPER}"
 }
 
 sign_home() {
@@ -386,6 +507,8 @@ create_archive() {
 
     run /usr/bin/ditto "${HOME_APP}" "${package_root}/OXRSys Home.app"
     run /usr/bin/ditto "${RUNTIME_DYLIB}" "${package_runtime_dir}/$(basename "${RUNTIME_DYLIB}")"
+    # Beside the dylib, under the name the runtime looks for by default.
+    run /usr/bin/ditto "${RUNTIME_HELPER}" "${package_runtime_dir}/oxrsys-encoder-helper"
 
     local packaged_manifest="${package_runtime_dir}/$(basename "${RUNTIME_MANIFEST}")"
     run /usr/bin/ditto "${RUNTIME_MANIFEST}" "${packaged_manifest}"
@@ -447,12 +570,15 @@ main() {
     require_tool /usr/bin/ditto
     require_tool /usr/bin/plutil
     require_tool /usr/bin/security
+    require_tool /usr/bin/lipo
+    require_tool /usr/libexec/PlistBuddy
 
     if [[ "${NOTARIZE}" -eq 1 ]]; then
         require_tool /usr/bin/xcrun
     fi
 
     apply_defaults
+    configure_architectures
 
     if [[ "${BUILD_RUNTIME}" -eq 1 ]]; then
         build_runtime

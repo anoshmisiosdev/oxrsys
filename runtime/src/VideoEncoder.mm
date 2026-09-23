@@ -2,7 +2,10 @@
 
 #import "VideoEncoder.h"
 #import "Config.h"
-#import "HevcEncoderHelperClient.h"
+#import "EncoderHelperClient.h"
+#import "EncoderPathPolicy.h"
+#import "EncoderSessionColor.h"
+#import "VideoTextureFormat.h"
 
 #import <CoreVideo/CoreVideo.h>
 #import <Foundation/Foundation.h>
@@ -14,32 +17,20 @@
 
 #import <spdlog/spdlog.h>
 
+#include "RuntimePlatform.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
-#include <thread>
+#include <exception>
 #include <utility>
 #include <vector>
-
-#include <pthread/qos.h>
 
 namespace
 {
 
 using Clock = std::chrono::steady_clock;
-
-// Pin the calling thread to USER_INTERACTIVE. Called at the top of the Metal
-// command-buffer completion handler (which submits the frame to VideoToolbox)
-// and the VideoToolbox compression completion callback (which drains NAL units
-// onto the send path). Both run on framework-managed threads that default to a
-// lower QoS; under CPU contention that starvation — not the sub-millisecond
-// hardware encode — is what drives the multi-hundred-ms completion-callback
-// latency and dropped-frame cascades seen in the runtime logs.
-void PinThreadToRealtimeQoS()
-{
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-}
 
 double ToMilliseconds(Clock::duration duration)
 {
@@ -51,11 +42,36 @@ struct EncodeFrameContext
     VideoEncoder::OnNalUnitCallback nalCallback;
     VideoEncoder::OnFrameEncodedCallback frameCallback;
     std::function<void(size_t)> releaseSlot;
+    BoundedDrain* callbackDrain = nullptr;
     FrameSource frameSource;
     VideoEncoder::FrameMetrics metrics;
+    oxr::protocol::VideoCodec codec = oxr::protocol::VideoCodec::H265;
     size_t slotIndex = 0;
     Clock::time_point encodeStart;
     Clock::time_point encodeSubmitFinished;
+};
+
+class ScopedDrainLease
+{
+public:
+    explicit ScopedDrainLease(BoundedDrain& drain)
+        : drain_(drain.TryAcquire() ? &drain : nullptr)
+    {
+    }
+
+    ~ScopedDrainLease()
+    {
+        if (drain_ != nullptr)
+        {
+            drain_->Release();
+        }
+    }
+
+    explicit operator bool() const { return drain_ != nullptr; }
+    void TransferToCallback() { drain_ = nullptr; }
+
+private:
+    BoundedDrain* drain_ = nullptr;
 };
 
 struct MetalFoveationUniforms
@@ -64,13 +80,62 @@ struct MetalFoveationUniforms
     vector_float2 centerShift;
     vector_float2 edgeRatio;
     vector_float2 eyeSizeRatio;
-    // XrSwapchainSubImage::imageRect of each eye, as a normalized remap of the
-    // source texture. Identity-shaped (scale 1, offset 0) for a full-image rect.
-    vector_float2 leftUvScale;
-    vector_float2 leftUvOffset;
-    vector_float2 rightUvScale;
-    vector_float2 rightUvOffset;
+    vector_uint2 sourceSrgb;
 };
+
+struct MetalVideoCopyUniforms
+{
+    vector_uint2 destinationOrigin;
+    vector_uint2 destinationSize;
+    uint32_t sourceSrgb;
+    uint32_t padding[3];
+};
+
+constexpr const char* kVideoCopyMetalSource = R"METAL(
+#include <metal_stdlib>
+using namespace metal;
+
+struct VideoCopyUniforms
+{
+    uint2 destinationOrigin;
+    uint2 destinationSize;
+    uint sourceSrgb;
+    uint padding0;
+    uint padding1;
+    uint padding2;
+};
+
+static float3 linear_to_srgb(float3 value)
+{
+    value = clamp(value, float3(0.0), float3(1.0));
+    float3 linearSegment = value * 12.92;
+    float3 powerSegment = 1.055 * pow(value, float3(1.0 / 2.4)) - 0.055;
+    return select(powerSegment, linearSegment, value <= float3(0.0031308));
+}
+
+kernel void video_copy_kernel(texture2d<float, access::sample> sourceTexture [[texture(0)]],
+                              texture2d<float, access::write> outputTexture [[texture(1)]],
+                              sampler linearSampler [[sampler(0)]],
+                              constant VideoCopyUniforms& params [[buffer(0)]],
+                              uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= params.destinationSize.x || gid.y >= params.destinationSize.y)
+    {
+        return;
+    }
+
+    float2 uv = (float2(gid) + float2(0.5)) / float2(params.destinationSize);
+    float4 color = sourceTexture.sample(linearSampler, uv);
+    if (params.sourceSrgb != 0)
+    {
+        // Sampling an sRGB texture decodes it to linear. Re-encode before
+        // writing the unorm VideoToolbox surface so the source code values and
+        // the runtime's BT.709 transfer contract are preserved.
+        color.rgb = linear_to_srgb(color.rgb);
+    }
+    outputTexture.write(color, params.destinationOrigin + gid);
+}
+)METAL";
 
 // Axis-aligned foveated encoding shader logic adapted from ALVR's AADT
 // compression shader (MIT licensed).
@@ -84,11 +149,16 @@ struct FoveationUniforms
     float2 centerShift;
     float2 edgeRatio;
     float2 eyeSizeRatio;
-    float2 leftUvScale;
-    float2 leftUvOffset;
-    float2 rightUvScale;
-    float2 rightUvOffset;
+    uint2 sourceSrgb;
 };
+
+static float3 linear_to_srgb(float3 value)
+{
+    value = clamp(value, float3(0.0), float3(1.0));
+    float3 linearSegment = value * 12.92;
+    float3 powerSegment = 1.055 * pow(value, float3(1.0 / 2.4)) - 0.055;
+    return select(powerSegment, linearSegment, value <= float3(0.0031308));
+}
 
 static float compress_axis(float eyeUv, float centerSize, float centerShift, float edgeRatio)
 {
@@ -141,13 +211,13 @@ kernel void foveation_kernel(texture2d<float, access::sample> leftTexture [[text
     compressedUv.y = compress_axis(eyeUv.y, params.centerSize.y, params.centerShift.y, params.edgeRatio.y);
     compressedUv = clamp(compressedUv, float2(0.0), float2(1.0));
 
-    float2 uvScale = rightEye ? params.rightUvScale : params.leftUvScale;
-    float2 uvOffset = rightEye ? params.rightUvOffset : params.leftUvOffset;
-    float2 srcUv = uvOffset + compressedUv * uvScale;
-
     float4 color = rightEye
-        ? rightTexture.sample(linearSampler, srcUv)
-        : leftTexture.sample(linearSampler, srcUv);
+        ? rightTexture.sample(linearSampler, compressedUv)
+        : leftTexture.sample(linearSampler, compressedUv);
+    if (params.sourceSrgb[rightEye ? 1 : 0] != 0)
+    {
+        color.rgb = linear_to_srgb(color.rgb);
+    }
     outputTexture.write(color, gid);
 }
 )METAL";
@@ -166,12 +236,37 @@ void FinalizeEncodeFrame(EncodeFrameContext* context, bool frameDropped)
 
     if (context->frameCallback)
     {
-        context->frameCallback(context->metrics);
+        try
+        {
+            context->frameCallback(context->metrics);
+        }
+        catch (const std::exception& error)
+        {
+            spdlog::warn("VideoEncoder: frame callback threw: {}", error.what());
+        }
+        catch (...)
+        {
+            spdlog::warn("VideoEncoder: frame callback threw an unknown exception");
+        }
     }
 
     if (context->releaseSlot)
     {
         context->releaseSlot(context->slotIndex);
+    }
+
+    // Drop every callback capture and FrameSource lease before publishing the
+    // drain decrement. A successful Shutdown therefore means no context can
+    // still own the encoder or an exported swapchain texture.
+    context->frameSource = {};
+    context->nalCallback = {};
+    context->frameCallback = {};
+    context->releaseSlot = {};
+    BoundedDrain* callbackDrain = context->callbackDrain;
+    context->callbackDrain = nullptr;
+    if (callbackDrain != nullptr)
+    {
+        callbackDrain->Release();
     }
 
     delete context;
@@ -195,7 +290,145 @@ bool IsKeyframeSample(CMSampleBufferRef sampleBuffer)
     return !CFBooleanGetValue(notSync);
 }
 
+const char* VideoCodecName(oxr::protocol::VideoCodec codec)
+{
+    switch (codec)
+    {
+        case oxr::protocol::VideoCodec::H264:
+            return "H.264";
+        case oxr::protocol::VideoCodec::AV1:
+            return "AV1";
+        case oxr::protocol::VideoCodec::H265:
+        default:
+            return "H.265";
+    }
+}
+
+CMVideoCodecType VideoToolboxCodecType(oxr::protocol::VideoCodec codec)
+{
+    switch (codec)
+    {
+        case oxr::protocol::VideoCodec::H264:
+            return kCMVideoCodecType_H264;
+        case oxr::protocol::VideoCodec::H265:
+        default:
+            return kCMVideoCodecType_HEVC;
+    }
+}
+
+// Does THIS process actually get a hardware encoder for `codecType`?
+//
+// The answer is not a property of the machine: VideoToolbox grants an x86_64
+// (Rosetta) process the hardware H.264 encoder but not the hardware HEVC one,
+// and that grant is Apple's to change. So ask VideoToolbox rather than reading
+// the architecture: VTCopyVideoEncoderList reports, per codec, whether a
+// hardware encoder is visible here. If the list cannot be had, fall back to the
+// definitive test — try to create a RequireHardware=YES session and see.
+bool ProbeHardwareSession(CMVideoCodecType codecType, uint32_t width, uint32_t height)
+{
+    NSDictionary* spec = @{
+        (NSString*)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @YES,
+        (NSString*)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES,
+    };
+    VTCompressionSessionRef probe = nullptr;
+    const OSStatus status = VTCompressionSessionCreate(
+        kCFAllocatorDefault, (int32_t)std::max(width, 16u), (int32_t)std::max(height, 16u),
+        codecType, (__bridge CFDictionaryRef)spec, nullptr, kCFAllocatorDefault, nullptr, nullptr,
+        &probe);
+    if (status != noErr || probe == nullptr)
+    {
+        spdlog::info("VideoEncoder: RequireHardware=YES probe failed ({}) - no hardware encoder in "
+                     "this process",
+                     status);
+        return false;
+    }
+    VTCompressionSessionInvalidate(probe);
+    CFRelease(probe);
+    return true;
+}
+
+bool HardwareEncoderAvailableInProcess(CMVideoCodecType codecType, uint32_t width, uint32_t height)
+{
+    CFArrayRef encoderList = nullptr;
+    if (VTCopyVideoEncoderList(nullptr, &encoderList) == noErr && encoderList != nullptr)
+    {
+        bool sawCodec = false;
+        bool hardware = false;
+        const CFIndex count = CFArrayGetCount(encoderList);
+        for (CFIndex i = 0; i < count; i++)
+        {
+            NSDictionary* entry = (__bridge NSDictionary*)(CFDictionaryRef)CFArrayGetValueAtIndex(
+                encoderList, i);
+            NSNumber* entryCodec = entry[(NSString*)kVTVideoEncoderList_CodecType];
+            if (entryCodec == nil || (CMVideoCodecType)[entryCodec intValue] != codecType)
+            {
+                continue;
+            }
+            sawCodec = true;
+            NSNumber* isHardware = entry[(NSString*)kVTVideoEncoderList_IsHardwareAccelerated];
+            if (isHardware != nil && [isHardware boolValue])
+            {
+                hardware = true;
+                break;
+            }
+        }
+        CFRelease(encoderList);
+        if (sawCodec)
+        {
+            return hardware;
+        }
+    }
+    return ProbeHardwareSession(codecType, width, height);
+}
+
+CFStringRef VideoToolboxProfileLevel(oxr::protocol::VideoCodec codec, bool tenBit)
+{
+    switch (codec)
+    {
+        case oxr::protocol::VideoCodec::H264:
+            return kVTProfileLevel_H264_Main_AutoLevel;
+        case oxr::protocol::VideoCodec::H265:
+        default:
+            return tenBit ? kVTProfileLevel_HEVC_Main10_AutoLevel : kVTProfileLevel_HEVC_Main_AutoLevel;
+    }
+}
+
+bool EmitParameterSetNalUnit(CMFormatDescriptionRef formatDesc,
+                             oxr::protocol::VideoCodec codec,
+                             size_t index,
+                             int64_t timestampNs,
+                             const VideoEncoder::OnNalUnitCallback& callback)
+{
+    const uint8_t* paramSet = nullptr;
+    size_t paramSetSize = 0;
+    OSStatus status = noErr;
+    if (codec == oxr::protocol::VideoCodec::H264)
+    {
+        status = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+            formatDesc, index, &paramSet, &paramSetSize, nullptr, nullptr);
+    }
+    else
+    {
+        status = CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
+            formatDesc, index, &paramSet, &paramSetSize, nullptr, nullptr);
+    }
+    if (status != noErr || paramSet == nullptr || paramSetSize == 0)
+    {
+        return false;
+    }
+
+    std::vector<uint8_t> nalUnit(4 + paramSetSize);
+    nalUnit[0] = 0x00;
+    nalUnit[1] = 0x00;
+    nalUnit[2] = 0x00;
+    nalUnit[3] = 0x01;
+    memcpy(nalUnit.data() + 4, paramSet, paramSetSize);
+    callback(nalUnit.data(), nalUnit.size(), true, timestampNs);
+    return true;
+}
+
 void EmitSampleNalUnits(CMSampleBufferRef sampleBuffer, bool isKeyframe,
+                        oxr::protocol::VideoCodec codec,
                         const VideoEncoder::OnNalUnitCallback& callback)
 {
     if (!callback)
@@ -212,27 +445,20 @@ void EmitSampleNalUnits(CMSampleBufferRef sampleBuffer, bool isKeyframe,
         if (formatDesc != nullptr)
         {
             size_t paramSetCount = 0;
-            CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
-                formatDesc, 0, nullptr, nullptr, &paramSetCount, nullptr);
+            if (codec == oxr::protocol::VideoCodec::H264)
+            {
+                CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                    formatDesc, 0, nullptr, nullptr, &paramSetCount, nullptr);
+            }
+            else
+            {
+                CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
+                    formatDesc, 0, nullptr, nullptr, &paramSetCount, nullptr);
+            }
 
             for (size_t i = 0; i < paramSetCount; i++)
             {
-                const uint8_t* paramSet = nullptr;
-                size_t paramSetSize = 0;
-                OSStatus status = CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
-                    formatDesc, i, &paramSet, &paramSetSize, nullptr, nullptr);
-                if (status != noErr || paramSet == nullptr || paramSetSize == 0)
-                {
-                    continue;
-                }
-
-                std::vector<uint8_t> nalUnit(4 + paramSetSize);
-                nalUnit[0] = 0x00;
-                nalUnit[1] = 0x00;
-                nalUnit[2] = 0x00;
-                nalUnit[3] = 0x01;
-                memcpy(nalUnit.data() + 4, paramSet, paramSetSize);
-                callback(nalUnit.data(), nalUnit.size(), true, timestampNs);
+                EmitParameterSetNalUnit(formatDesc, codec, i, timestampNs, callback);
             }
         }
     }
@@ -279,7 +505,7 @@ void EmitSampleNalUnits(CMSampleBufferRef sampleBuffer, bool isKeyframe,
 void EncodeWaitForFrameImage(id<MTLCommandBuffer> commandBuffer, const FrameImageSource& source)
 {
     if (commandBuffer == nil ||
-        source.sync.api != GraphicsApi::Metal ||
+        source.sync.kind != FrameSyncKind::MetalSharedEvent ||
         !source.sync.IsValid())
     {
         return;
@@ -290,6 +516,11 @@ void EncodeWaitForFrameImage(id<MTLCommandBuffer> commandBuffer, const FrameImag
     {
         [commandBuffer encodeWaitForEvent:event value:source.sync.waitValue];
     }
+}
+
+bool WaitForHostFrameImage(const FrameImageSource& source, uint64_t timeoutNs)
+{
+    return source.sync.WaitForHostReady(timeoutNs);
 }
 
 bool IsFiniteRatio(float value)
@@ -332,38 +563,37 @@ bool TextureAllowsUsage(id<MTLTexture> texture, MTLTextureUsage requiredUsage)
            (declaredUsage & requiredUsage) == requiredUsage;
 }
 
-// Encode a crop-and-scale of `rect` out of `src` into the whole of `dst`.
-// A rect that covers the full source image keeps the original code path
-// (no scale transform), so the common full-image case is unchanged.
-void EncodeScaledCrop(MPSImageBilinearScale* scaler,
-                      id<MTLCommandBuffer> cmdBuf,
-                      id<MTLTexture> src,
-                      const FrameImageRect& rect,
-                      id<MTLTexture> dst)
+id<MTLComputePipelineState> CreateVideoCopyPipeline(id<MTLDevice> device)
 {
-    if (rect.CoversFullImage((uint32_t)src.width, (uint32_t)src.height))
+    NSError* error = nil;
+    NSString* source = [NSString stringWithUTF8String:kVideoCopyMetalSource];
+    id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&error];
+    if (library == nil)
     {
-        scaler.scaleTransform = nullptr;
-        scaler.clipRect = MPSRectNoClip;
-        [scaler encodeToCommandBuffer:cmdBuf sourceTexture:src destinationTexture:dst];
-        return;
+        spdlog::error("VideoEncoder: Failed to compile texture conversion shader: {}",
+                      error != nil ? error.localizedDescription.UTF8String : "unknown error");
+        return nil;
     }
 
-    const FrameImageScaleTransform mapping =
-        MakeFrameImageScaleTransform(rect, (uint32_t)dst.width, (uint32_t)dst.height);
-    MPSScaleTransform transform = {};
-    transform.scaleX = mapping.scaleX;
-    transform.scaleY = mapping.scaleY;
-    transform.translateX = mapping.translateX;
-    transform.translateY = mapping.translateY;
+    id<MTLFunction> kernelFunction = [library newFunctionWithName:@"video_copy_kernel"];
+    if (kernelFunction == nil)
+    {
+        spdlog::error("VideoEncoder: Failed to load texture conversion entry point");
+        [library release];
+        return nil;
+    }
 
-    scaler.scaleTransform = &transform;
-    scaler.clipRect = MTLRegionMake2D(0, 0, dst.width, dst.height);
-    [scaler encodeToCommandBuffer:cmdBuf sourceTexture:src destinationTexture:dst];
-    // MPS reads the transform while encoding, so it is safe to clear it here;
-    // leaving it set would leak the crop into the next frame's full-image scale.
-    scaler.scaleTransform = nullptr;
-    scaler.clipRect = MPSRectNoClip;
+    error = nil;
+    id<MTLComputePipelineState> pipeline =
+        [device newComputePipelineStateWithFunction:kernelFunction error:&error];
+    if (pipeline == nil)
+    {
+        spdlog::error("VideoEncoder: Failed to create texture conversion pipeline: {}",
+                      error != nil ? error.localizedDescription.UTF8String : "unknown error");
+    }
+    [kernelFunction release];
+    [library release];
+    return pipeline;
 }
 
 id<MTLComputePipelineState> CreateFoveationPipeline(id<MTLDevice> device)
@@ -412,6 +642,62 @@ id<MTLSamplerState> CreateLinearClampSampler(id<MTLDevice> device)
     return sampler;
 }
 
+bool EncodeVideoTextureCopy(id<MTLCommandBuffer> commandBuffer,
+                            id<MTLComputePipelineState> pipeline,
+                            id<MTLSamplerState> sampler,
+                            id<MTLTexture> source,
+                            id<MTLTexture> destination,
+                            MTLOrigin destinationOrigin,
+                            MTLSize destinationSize,
+                            bool sourceSrgb)
+{
+    if (commandBuffer == nil || pipeline == nil || sampler == nil ||
+        source == nil || destination == nil ||
+        destinationSize.width == 0 || destinationSize.height == 0 ||
+        destinationOrigin.x + destinationSize.width > destination.width ||
+        destinationOrigin.y + destinationSize.height > destination.height ||
+        !TextureAllowsUsage(source, MTLTextureUsageShaderRead) ||
+        !TextureAllowsUsage(destination, MTLTextureUsageShaderWrite))
+    {
+        return false;
+    }
+
+    MetalVideoCopyUniforms uniforms = {};
+    uniforms.destinationOrigin = {
+        static_cast<uint32_t>(destinationOrigin.x),
+        static_cast<uint32_t>(destinationOrigin.y),
+    };
+    uniforms.destinationSize = {
+        static_cast<uint32_t>(destinationSize.width),
+        static_cast<uint32_t>(destinationSize.height),
+    };
+    uniforms.sourceSrgb = sourceSrgb ? 1u : 0u;
+
+    id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+    if (encoder == nil)
+    {
+        return false;
+    }
+    [encoder setComputePipelineState:pipeline];
+    [encoder setTexture:source atIndex:0];
+    [encoder setTexture:destination atIndex:1];
+    [encoder setSamplerState:sampler atIndex:0];
+    [encoder setBytes:&uniforms length:sizeof(uniforms) atIndex:0];
+
+    const NSUInteger threadsX =
+        std::max<NSUInteger>(1, std::min<NSUInteger>(pipeline.threadExecutionWidth, 16));
+    const NSUInteger threadsY = std::max<NSUInteger>(
+        1, std::min<NSUInteger>(pipeline.maxTotalThreadsPerThreadgroup / threadsX, 16));
+    const MTLSize threadsPerGroup = MTLSizeMake(threadsX, threadsY, 1);
+    const MTLSize threadgroups = MTLSizeMake(
+        (destinationSize.width + threadsX - 1) / threadsX,
+        (destinationSize.height + threadsY - 1) / threadsY,
+        1);
+    [encoder dispatchThreadgroups:threadgroups threadsPerThreadgroup:threadsPerGroup];
+    [encoder endEncoding];
+    return true;
+}
+
 } // namespace
 
 static void CompressionOutputCallback(void* /*outputCallbackRefCon*/,
@@ -420,7 +706,10 @@ static void CompressionOutputCallback(void* /*outputCallbackRefCon*/,
                                        VTEncodeInfoFlags infoFlags,
                                        CMSampleBufferRef sampleBuffer)
 {
-    PinThreadToRealtimeQoS();
+    // VideoToolbox delivers this on a framework thread at default QoS; under
+    // CPU contention that starvation, not the encode itself, drove
+    // multi-hundred-ms callback latency and drop cascades.
+    oxrsys::runtime_platform::SetCurrentThreadTimeSensitive();
 
     auto* context = static_cast<EncodeFrameContext*>(sourceFrameRefCon);
     if (context == nullptr)
@@ -436,7 +725,22 @@ static void CompressionOutputCallback(void* /*outputCallbackRefCon*/,
 
     bool isKeyframe = IsKeyframeSample(sampleBuffer);
     context->metrics.keyframe = isKeyframe;
-    EmitSampleNalUnits(sampleBuffer, isKeyframe, context->nalCallback);
+    try
+    {
+        EmitSampleNalUnits(sampleBuffer, isKeyframe, context->codec, context->nalCallback);
+    }
+    catch (const std::exception& error)
+    {
+        spdlog::warn("VideoEncoder: NAL callback threw: {}", error.what());
+        FinalizeEncodeFrame(context, true);
+        return;
+    }
+    catch (...)
+    {
+        spdlog::warn("VideoEncoder: NAL callback threw an unknown exception");
+        FinalizeEncodeFrame(context, true);
+        return;
+    }
     FinalizeEncodeFrame(context, false);
 }
 
@@ -444,7 +748,13 @@ VideoEncoder::VideoEncoder() = default;
 
 VideoEncoder::~VideoEncoder()
 {
-    Shutdown();
+    if (!Shutdown())
+    {
+        // A timed-out public shutdown retains this object for retry. Reaching
+        // the destructor would otherwise free memory still captured by Metal
+        // or VideoToolbox callbacks, which is never a recoverable state.
+        std::terminate();
+    }
 }
 
 bool VideoEncoder::SupportsFoveatedEncoding(const GraphicsContext& graphicsContext)
@@ -463,16 +773,57 @@ bool VideoEncoder::SupportsFoveatedEncoding(const GraphicsContext& graphicsConte
     return supported;
 }
 
-bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
-                               uint32_t bitrateMbps, const GraphicsContext& graphicsContext)
+VideoEncoder::BackendCapabilities VideoEncoder::QueryBackendCapabilities(
+    const GraphicsContext* graphicsContext)
 {
-    Shutdown();
+    BackendCapabilities capabilities = {};
+    capabilities.backendName = "VideoToolbox";
+    capabilities.hardwareEncoder = true;
+    capabilities.supportsH264 = true;
+    capabilities.supportsH265 = true;
+    capabilities.supportsTenBitH265 = true;
+    capabilities.supportsFoveatedEncoding =
+        graphicsContext != nullptr && SupportsFoveatedEncoding(*graphicsContext);
+    return capabilities;
+}
+
+bool VideoEncoder::SupportsCodec(oxr::protocol::VideoCodec codec)
+{
+    return QueryBackendCapabilities(nullptr).SupportsCodec(codec);
+}
+
+bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
+                               uint32_t bitrateMbps, const GraphicsContext& graphicsContext,
+                               oxr::protocol::VideoCodec codec)
+{
+    if (!Shutdown())
+    {
+        spdlog::error("VideoEncoder: Previous encoder generation did not drain");
+        return false;
+    }
+    if (!callbackDrain_.Reset())
+    {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(shutdownMutex_);
+        sessionShutdownStarted_ = false;
+        sessionShutdownComplete_ = true;
+        resourcesDestroyed_ = false;
+    }
+
+    if (codec == oxr::protocol::VideoCodec::AV1)
+    {
+        spdlog::error("VideoEncoder: AV1 is not implemented in the VideoToolbox path");
+        return false;
+    }
 
     width_ = width;
     height_ = height;
     eyeWidth_ = width / 2;
     fps_ = fps;
     bitrateMbps_ = bitrateMbps;
+    codec_ = codec;
     graphicsContext_ = graphicsContext;
     videoToolbox_.metalDevice = graphicsContext.metalDevice;
     shuttingDown_.store(false);
@@ -491,6 +842,15 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
 
     videoToolbox_.commandQueue = (void*)[device newCommandQueue];
     videoToolbox_.scaler = (void*)[[MPSImageBilinearScale alloc] initWithDevice:device];
+    videoToolbox_.copyPipeline = (void*)CreateVideoCopyPipeline(device);
+    videoToolbox_.copySampler = (void*)CreateLinearClampSampler(device);
+    if (videoToolbox_.commandQueue == nullptr || videoToolbox_.scaler == nullptr ||
+        videoToolbox_.copyPipeline == nullptr || videoToolbox_.copySampler == nullptr)
+    {
+        spdlog::error("VideoEncoder: Required Metal copy resources are unavailable");
+        Shutdown();
+        return false;
+    }
     if (foveationSettings_.enabled)
     {
         videoToolbox_.foveationPipeline = (void*)CreateFoveationPipeline(device);
@@ -607,9 +967,37 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
         slots_[i].inUse = false;
     }
 
+    const ConfigValues initialConfig = Config::Get().GetValues();
+
+    // Which process encodes this codec, and why. Decided from what VideoToolbox
+    // will actually grant this process — not from its architecture — so the
+    // logic survives Apple changing what Rosetta is allowed.
+    const bool hardwareInProcess =
+        HardwareEncoderAvailableInProcess(VideoToolboxCodecType(codec_), width, height);
+    {
+        oxrsys::encoder::EncodePathInputs pathInputs;
+        pathInputs.codec = codec_;
+        pathInputs.tenBit = tenBit_ && codec_ == oxr::protocol::VideoCodec::H265;
+        pathInputs.inProcessHardwareAvailable = hardwareInProcess;
+        pathInputs.override_ =
+            oxrsys::encoder::ParseHelperOverride(initialConfig.encoderHelperMode);
+        encodePath_ = oxrsys::encoder::ChooseEncodePath(pathInputs);
+        spdlog::info("VideoEncoder: {} encode path for {} - {} (in-process hardware encoder: {})",
+                     encodePath_.useHelper ? "out-of-process native-arm64 helper" : "in-process",
+                     VideoCodecName(codec_),
+                     oxrsys::encoder::DescribeEncodePathReason(encodePath_.reason),
+                     hardwareInProcess ? "yes" : "no");
+    }
+
+    // RequireHardware is an assertion, not a wish: we only demand it when the
+    // query above says this process can have it. The @NO that used to be
+    // unconditional is what made a Rosetta host silently get the ~27-40ms/frame
+    // software HEVC encoder; now that path is entered knowingly, logged, and
+    // (when the helper covers the codec) only as the fallback behind it.
     NSDictionary* encoderSpec = @{
         (NSString*)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @YES,
-        (NSString*)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @NO,
+        (NSString*)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder:
+            hardwareInProcess ? @YES : @NO,
     };
 
     VTCompressionSessionRef compressionSession = nullptr;
@@ -617,13 +1005,30 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
         kCFAllocatorDefault,
         width,
         height,
-        kCMVideoCodecType_HEVC,
+        VideoToolboxCodecType(codec_),
         (__bridge CFDictionaryRef)encoderSpec,
         nullptr,
         kCFAllocatorDefault,
         CompressionOutputCallback,
         nullptr,
         &compressionSession);
+    if (status != noErr && hardwareInProcess)
+    {
+        // The query promised a hardware encoder and the create still refused it.
+        // Retry without the requirement rather than failing the session: a slow
+        // encoder beats no video. Loudly, because it should not happen.
+        spdlog::warn("VideoEncoder: hardware-required compression session failed ({}) although a "
+                     "hardware {} encoder was reported - retrying without the requirement",
+                     status, VideoCodecName(codec_));
+        NSDictionary* relaxedSpec = @{
+            (NSString*)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @YES,
+            (NSString*)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @NO,
+        };
+        status = VTCompressionSessionCreate(
+            kCFAllocatorDefault, width, height, VideoToolboxCodecType(codec_),
+            (__bridge CFDictionaryRef)relaxedSpec, nullptr, kCFAllocatorDefault,
+            CompressionOutputCallback, nullptr, &compressionSession);
+    }
     if (status != noErr)
     {
         spdlog::error("VideoEncoder: Failed to create compression session: {}", status);
@@ -636,11 +1041,35 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
     VTSessionSetProperty(compressionSession,
         kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
 
-    const ConfigValues config = Config::Get().GetValues();
+    // Define one deterministic SDR color contract for every encoded stream. VideoToolbox embeds
+    // these values in H.264/H.265 metadata and uses the matching matrix for RGB-to-YCbCr conversion.
+    // The contract lives in EncoderSessionColor.h, shared with the out-of-process helper's session,
+    // so the two encode paths cannot drift apart.
+    const oxrsys::encoder_color::ApplyResult colorStatus =
+        oxrsys::encoder_color::ApplySessionColorProperties(compressionSession);
+    if (!colorStatus.ok())
+    {
+        spdlog::warn("VideoEncoder: failed to apply complete BT.709 color metadata (primaries={} transfer={} matrix={})",
+                     colorStatus.primaries, colorStatus.transferFunction, colorStatus.yCbCrMatrix);
+    }
+
+    const ConfigValues& config = initialConfig;
     const std::string& preset = config.encoderPreset;
-    VTSessionSetProperty(compressionSession,
+    const OSStatus profileStatus = VTSessionSetProperty(compressionSession,
         kVTCompressionPropertyKey_ProfileLevel,
-        kVTProfileLevel_HEVC_Main_AutoLevel);
+        VideoToolboxProfileLevel(codec_, tenBit_ && codec_ == oxr::protocol::VideoCodec::H265));
+    if (tenBit_ && codec_ == oxr::protocol::VideoCodec::H265)
+    {
+        if (profileStatus == noErr)
+        {
+            spdlog::info("VideoEncoder: Using HEVC Main10 (10-bit) profile");
+        }
+        else
+        {
+            spdlog::warn("VideoEncoder: HEVC Main10 profile unavailable ({}); falling back to encoder default",
+                         profileStatus);
+        }
+    }
     if (preset == "speed")
     {
         VTSessionSetProperty(compressionSession,
@@ -695,62 +1124,73 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
     CFRelease(delayRef);
 
     VTCompressionSessionPrepareToEncodeFrames(compressionSession);
-    videoToolbox_.session = compressionSession;
-
-    // Definitively report whether VideoToolbox selected the hardware encoder.
-    // The specification requests hardware (Enable=YES) but does not require it
-    // (Require=NO), so on a platform where hardware HEVC is unavailable this
-    // silently falls back to the software encoder. This query removes the
-    // guesswork: the log states plainly which path is live.
-    bool usingHardware = false;
-    CFBooleanRef hwRef = nullptr;
-    OSStatus hwStatus = VTSessionCopyProperty(
-        compressionSession,
-        kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,
-        kCFAllocatorDefault,
-        &hwRef);
-    if (hwStatus == noErr && hwRef != nullptr)
     {
-        usingHardware = CFBooleanGetValue(hwRef);
-        CFRelease(hwRef);
+        std::lock_guard<std::mutex> sessionLock(videoToolboxSessionMutex_);
+        videoToolbox_.session = compressionSession;
     }
-    usingHardwareEncoder_ = usingHardware;
 
-    spdlog::info("VideoEncoder: Initialized H.265 encoder {}x{} @ {}fps, {}Mbps (slots={}, keyframe={}s, preset={}) hardware={}",
-                  width, height, fps, bitrateMbps, SlotCount, keyframeIntervalSec, preset,
-                  usingHardware ? "YES" : "NO (SOFTWARE fallback)");
-    if (!usingHardware)
+    // Say out loud what this session actually is. The old unconditional
+    // RequireHardware=NO meant a Rosetta host ran the software HEVC encoder with
+    // nothing in the log to say so; a line here makes that impossible.
     {
-        spdlog::warn("VideoEncoder: HEVC is running on the SOFTWARE encoder - "
-                     "expect high encode latency. Hardware HEVC was requested but not granted.");
-
-        // The in-process session is software-only (x86_64/Rosetta cannot reach
-        // the hardware HEVC encoder). Try to bring up the native-arm64 helper,
-        // which can. On success, per-frame encoding is delegated out-of-process
-        // and this software session becomes the fallback path only.
-        if (TryStartHelper())
+        bool sessionUsesHardware = false;
+        CFBooleanRef hardwareRef = nullptr;
+        if (VTSessionCopyProperty(compressionSession,
+                                  kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,
+                                  kCFAllocatorDefault, &hardwareRef) == noErr &&
+            hardwareRef != nullptr)
         {
-            usingHardwareEncoder_ = true;
-            spdlog::info("VideoEncoder: hardware={} (via native-arm64 out-of-process helper)", "YES");
+            sessionUsesHardware = CFBooleanGetValue(hardwareRef);
+            CFRelease(hardwareRef);
+        }
+        if (sessionUsesHardware)
+        {
+            spdlog::info("VideoEncoder: in-process {} session is hardware-accelerated",
+                         VideoCodecName(codec_));
+        }
+        else if (encodePath_.useHelper)
+        {
+            spdlog::info("VideoEncoder: in-process {} session is SOFTWARE - kept only as the "
+                         "fallback behind the native-arm64 hardware helper",
+                         VideoCodecName(codec_));
+        }
+        else
+        {
+            spdlog::warn("VideoEncoder: in-process {} session is SOFTWARE ({}) - expect high "
+                         "per-frame encode cost",
+                         VideoCodecName(codec_),
+                         oxrsys::encoder::DescribeEncodePathReason(encodePath_.reason));
         }
     }
+
+    // VideoToolbox refuses the hardware HEVC encoder to an x86_64/Rosetta
+    // process and silently returns a software session instead. When the policy
+    // above chose the helper, delegate the per-frame encode to a native-arm64
+    // child process that is granted the hardware encoder; this session stays
+    // live as the fallback. See runtime/encoder_helper/README.md.
+    if (encodePath_.useHelper && TryStartHelper())
+    {
+        spdlog::info("VideoEncoder: hardware {} via the native-arm64 out-of-process helper",
+                     VideoCodecName(codec_));
+    }
+
+    initialized_ = true;
+
+    spdlog::info("VideoEncoder: Initialized {} encoder {}x{} @ {}fps, {}Mbps (slots={}, keyframe={}s, preset={})",
+                  VideoCodecName(codec_), width, height, fps, bitrateMbps, SlotCount, keyframeIntervalSec, preset);
     return true;
 }
 
 bool VideoEncoder::TryStartHelper()
 {
     const ConfigValues config = Config::Get().GetValues();
-    if (!config.encoderHelperEnabled)
-    {
-        return false;
-    }
 
-    // Resolve the helper binary path: explicit config, then env override, then
-    // a sibling of the runtime dylib.
+    // Resolve the helper binary: explicit config, then environment override,
+    // then a sibling of the runtime dylib.
     std::string helperPath = config.encoderHelperPath;
-    if (const char* env = std::getenv("OXRSYS_ENCODER_HELPER_PATH"))
+    if (const char* environmentPath = std::getenv("OXRSYS_ENCODER_HELPER_PATH"))
     {
-        helperPath = env;
+        helperPath = environmentPath;
     }
     if (helperPath.empty())
     {
@@ -758,78 +1198,156 @@ bool VideoEncoder::TryStartHelper()
         helperPath = (dylibDir.empty() ? std::string(".") : dylibDir) + "/oxrsys-encoder-helper";
     }
 
-    // Gather the IOSurface backing each preallocated slot; these are what the
-    // helper encodes from (zero-copy, shared via mach send rights).
+    // The IOSurface behind each preallocated slot is what the helper encodes
+    // from; it is shared zero-copy as a mach send right, never copied.
     std::vector<void*> surfaces(SlotCount, nullptr);
     for (size_t i = 0; i < SlotCount; i++)
     {
-        CVPixelBufferRef pb = (CVPixelBufferRef)slots_[i].pixelBuffer;
-        if (pb == nullptr)
+        CVPixelBufferRef pixelBuffer = (CVPixelBufferRef)slots_[i].pixelBuffer;
+        IOSurfaceRef surface =
+            pixelBuffer != nullptr ? CVPixelBufferGetIOSurface(pixelBuffer) : nullptr;
+        if (surface == nullptr)
         {
-            spdlog::warn("VideoEncoder: helper disabled - slot {} has no pixel buffer", i);
-            return false;
-        }
-        IOSurfaceRef surf = CVPixelBufferGetIOSurface(pb);
-        if (surf == nullptr)
-        {
-            spdlog::warn("VideoEncoder: helper disabled - slot {} pixel buffer is not "
-                         "IOSurface-backed",
+            spdlog::warn("VideoEncoder: encoder helper disabled - slot {} is not IOSurface-backed",
                          i);
             return false;
         }
-        surfaces[i] = (void*)surf;
+        surfaces[i] = (void*)surface;
     }
 
-    HevcEncoderHelperClient::Config helperCfg;
-    helperCfg.width = width_;
-    helperCfg.height = height_;
-    helperCfg.fps = fps_;
-    helperCfg.bitrateMbps = bitrateMbps_;
-    helperCfg.keyframeIntervalSec = config.keyframeIntervalSec;
-    helperCfg.preset = config.encoderPreset == "speed"    ? 1u
-                       : config.encoderPreset == "quality" ? 2u
-                                                           : 0u;
-    helperCfg.helperPath = helperPath;
+    EncoderHelperClient::Config helperConfig;
+    helperConfig.width = width_;
+    helperConfig.height = height_;
+    helperConfig.fps = fps_;
+    helperConfig.bitrateMbps = bitrateMbps_;
+    helperConfig.keyframeIntervalSec = config.keyframeIntervalSec;
+    helperConfig.preset = config.encoderPreset == "speed"      ? 1u
+                          : config.encoderPreset == "quality"  ? 2u
+                                                               : 0u;
+    // The helper encodes what the client and runtime negotiated, nothing else.
+    helperConfig.codec = codec_ == oxr::protocol::VideoCodec::H264
+                             ? EncoderHelperClient::Codec::H264
+                             : EncoderHelperClient::Codec::H265;
+    helperConfig.profile = (tenBit_ && codec_ == oxr::protocol::VideoCodec::H265)
+                               ? EncoderHelperClient::Profile::Main10
+                               : EncoderHelperClient::Profile::Main;
+    helperConfig.helperPath = helperPath;
 
-    helperClient_ = std::make_unique<HevcEncoderHelperClient>();
-    helperClient_->SetDiedCallback([this]() { OnHelperDied(); });
-    bool ok = helperClient_->Start(
-        helperCfg, surfaces.data(), surfaces.size(),
-        [this](uint64_t cookie, const uint8_t* data, size_t size, bool key, int64_t pts) {
-            OnHelperNal(cookie, data, size, key, pts);
+    auto client = std::make_shared<EncoderHelperClient>();
+    client->SetDiedCallback([this]() { OnHelperDied(); });
+    const bool started = client->Start(
+        helperConfig, surfaces.data(), surfaces.size(),
+        [this](uint64_t cookie, const uint8_t* data, size_t size, bool keyframe, int64_t ptsNs) {
+            OnHelperNal(cookie, data, size, keyframe, ptsNs);
         },
-        [this](uint64_t cookie, bool dropped, double encodeMs, bool key) {
-            OnHelperFrameDone(cookie, dropped, encodeMs, key);
+        [this](uint64_t cookie, bool dropped, double encodeMs, bool keyframe) {
+            OnHelperFrameDone(cookie, dropped, encodeMs, keyframe);
         });
-
-    if (!ok)
+    if (!started)
     {
-        helperClient_.reset();
-        useHelper_.store(false);
         spdlog::warn("VideoEncoder: native-arm64 hardware helper unavailable - continuing on the "
-                     "in-process software encoder");
+                     "in-process encoder");
         return false;
     }
 
+    {
+        std::lock_guard<std::mutex> lock(helperClientMutex_);
+        helperClient_ = std::move(client);
+    }
     useHelper_.store(true);
     return true;
+}
+
+int VideoEncoder::EncoderHelperPid() const
+{
+    if (!useHelper_.load())
+    {
+        return -1;
+    }
+    std::shared_ptr<EncoderHelperClient> client = AcquireHelperClient();
+    return client != nullptr && client->IsAlive() ? client->HelperPid() : -1;
+}
+
+std::shared_ptr<EncoderHelperClient> VideoEncoder::AcquireHelperClient() const
+{
+    // Only the pointer copy is guarded: callers keep the client alive for the
+    // duration of their use, so teardown never frees it underneath them.
+    std::lock_guard<std::mutex> lock(helperClientMutex_);
+    return helperClient_;
+}
+
+void VideoEncoder::StopHelper()
+{
+    useHelper_.store(false);
+    if (std::shared_ptr<EncoderHelperClient> client = AcquireHelperClient())
+    {
+        client->Stop();
+    }
+    // The helper will send no further completions, so reclaim whatever is still
+    // in flight: each context owns a slot and a callback-drain lease that
+    // Shutdown waits on.
+    ReclaimHelperFrames(nullptr);
+}
+
+void VideoEncoder::ReleaseHelperClient()
+{
+    std::lock_guard<std::mutex> lock(helperClientMutex_);
+    helperClient_.reset();
+}
+
+void VideoEncoder::ReclaimHelperFrames(const char* reason)
+{
+    std::vector<EncodeFrameContext*> pending;
+    {
+        std::lock_guard<std::mutex> lock(helperContextMutex_);
+        pending.reserve(helperContexts_.size());
+        for (const auto& entry : helperContexts_)
+        {
+            pending.push_back(static_cast<EncodeFrameContext*>(entry.second));
+        }
+        helperContexts_.clear();
+    }
+    if (!pending.empty() && reason != nullptr)
+    {
+        spdlog::warn("VideoEncoder: {} with {} frame(s) in flight - reclaiming their slots",
+                     reason, pending.size());
+    }
+    for (EncodeFrameContext* context : pending)
+    {
+        FinalizeEncodeFrame(context, true);
+    }
 }
 
 void VideoEncoder::OnHelperNal(uint64_t cookie, const uint8_t* data, size_t size, bool keyframe,
                                int64_t ptsNs)
 {
+    // The context stays owned by helperContexts_ until FrameDone, and the helper
+    // client delivers NAL and FrameDone from one reader thread in order, so the
+    // pointer cannot be finalized underneath this call.
     EncodeFrameContext* context = nullptr;
     {
-        std::lock_guard<std::mutex> lock(helperCtxMutex_);
+        std::lock_guard<std::mutex> lock(helperContextMutex_);
         auto it = helperContexts_.find(cookie);
         if (it != helperContexts_.end())
         {
             context = static_cast<EncodeFrameContext*>(it->second);
         }
     }
-    if (context != nullptr && context->nalCallback)
+    if (context == nullptr || !context->nalCallback)
+    {
+        return;
+    }
+    try
     {
         context->nalCallback(data, size, keyframe, ptsNs);
+    }
+    catch (const std::exception& error)
+    {
+        spdlog::warn("VideoEncoder: helper NAL callback threw: {}", error.what());
+    }
+    catch (...)
+    {
+        spdlog::warn("VideoEncoder: helper NAL callback threw an unknown exception");
     }
 }
 
@@ -837,7 +1355,7 @@ void VideoEncoder::OnHelperFrameDone(uint64_t cookie, bool dropped, double encod
 {
     EncodeFrameContext* context = nullptr;
     {
-        std::lock_guard<std::mutex> lock(helperCtxMutex_);
+        std::lock_guard<std::mutex> lock(helperContextMutex_);
         auto it = helperContexts_.find(cookie);
         if (it != helperContexts_.end())
         {
@@ -849,98 +1367,101 @@ void VideoEncoder::OnHelperFrameDone(uint64_t cookie, bool dropped, double encod
     {
         return;
     }
-
-    auto now = Clock::now();
-    context->metrics.frameDropped = dropped;
     context->metrics.keyframe = keyframe;
-    // encodeMs is the helper-side hardware VideoToolbox encode time (the
-    // single-digit-ms figure). Surface it both as the submit metric and as the
-    // callback latency the QoS telemetry reports.
+    // The helper measures the hardware VideoToolbox encode entirely within its
+    // own process and reports it in milliseconds; mach clocks are not comparable
+    // across the Rosetta boundary, so nothing else it sends is a timestamp.
     context->metrics.encodeSubmitMs = encodeMs;
-    context->metrics.callbackLatencyMs = encodeMs;
-    context->metrics.totalLatencyMs = ToMilliseconds(now - context->encodeStart);
-    if (dropped)
-    {
-        droppedFrameCount_.fetch_add(1);
-    }
-    if (context->frameCallback)
-    {
-        context->frameCallback(context->metrics);
-    }
-    if (context->releaseSlot)
-    {
-        context->releaseSlot(context->slotIndex);
-    }
-    delete context;
+    FinalizeEncodeFrame(context, dropped);
 }
 
 void VideoEncoder::OnHelperDied()
 {
-    // The helper's completions will never arrive; finalize every outstanding
-    // frame as dropped so slots are released. useHelper_ stays true but the
-    // client now reports not-alive, so EncodeInternal takes the software path.
-    std::vector<EncodeFrameContext*> pending;
-    {
-        std::lock_guard<std::mutex> lock(helperCtxMutex_);
-        for (auto& kv : helperContexts_)
-        {
-            pending.push_back(static_cast<EncodeFrameContext*>(kv.second));
-        }
-        helperContexts_.clear();
-    }
-    if (!pending.empty())
-    {
-        spdlog::warn("VideoEncoder: helper died with {} frame(s) in flight - reclaiming slots and "
-                     "reverting to the in-process software encoder",
-                     pending.size());
-    }
-    for (EncodeFrameContext* ctx : pending)
-    {
-        FinalizeEncodeFrame(ctx, true);
-    }
+    // No completion will ever arrive for these. useHelper_ stays set, but the
+    // client now reports not-alive, so EncodeInternal takes the in-process path.
+    ReclaimHelperFrames("encoder helper died");
 }
 
-void VideoEncoder::Shutdown()
+bool VideoEncoder::Shutdown(std::chrono::nanoseconds timeout)
 {
+    const auto deadline = Clock::now() + timeout;
     shuttingDown_.store(true);
+    initialized_.store(false, std::memory_order_release);
+    // Close admission before starting the VT drain. Existing EncodeInternal
+    // calls retain a lease until they either return or transfer it to their
+    // Metal/VideoToolbox callback context.
+    callbackDrain_.Stop();
+    // Stop the helper before the VideoToolbox drain so no new frame is submitted
+    // to it, and so frames in flight to it release their slots and drain leases.
+    StopHelper();
 
-    // Stop the native-arm64 helper first so no new frames are submitted to it,
-    // then reclaim any frames still in flight (the helper will send no further
-    // completions) so their slots are released and inFlightFrameCount_ drains.
-    useHelper_.store(false);
-    if (helperClient_ != nullptr)
     {
-        helperClient_->Stop();
-        helperClient_.reset();
-    }
-    {
-        std::vector<EncodeFrameContext*> pending;
+        std::lock_guard<std::mutex> lock(shutdownMutex_);
+        if (!sessionShutdownStarted_)
         {
-            std::lock_guard<std::mutex> lock(helperCtxMutex_);
-            for (auto& kv : helperContexts_)
-            {
-                pending.push_back(static_cast<EncodeFrameContext*>(kv.second));
-            }
-            helperContexts_.clear();
+            sessionShutdownStarted_ = true;
+            sessionShutdownComplete_ = false;
+            shutdownThread_ = std::thread([this] {
+                // CompleteFrames can block in VideoToolbox. Keep it off the
+                // OpenXR teardown thread and expose only a bounded retryable
+                // wait to xrDestroySwapchain/xrDestroySession. Taking the
+                // session lock first also lets an EncodeFrame call that
+                // already entered finish before invalidation.
+                VTCompressionSessionRef compressionSession = nullptr;
+                {
+                    std::lock_guard<std::mutex> sessionLock(videoToolboxSessionMutex_);
+                    compressionSession =
+                        (VTCompressionSessionRef)videoToolbox_.session;
+                    videoToolbox_.session = nullptr;
+                }
+                if (compressionSession != nullptr)
+                {
+                    VTCompressionSessionCompleteFrames(compressionSession, kCMTimeInvalid);
+                    VTCompressionSessionInvalidate(compressionSession);
+                    CFRelease(compressionSession);
+                }
+                {
+                    std::lock_guard<std::mutex> completionLock(shutdownMutex_);
+                    sessionShutdownComplete_ = true;
+                }
+                shutdownCondition_.notify_all();
+            });
         }
-        for (EncodeFrameContext* ctx : pending)
+    }
+
+    {
+        std::unique_lock<std::mutex> lock(shutdownMutex_);
+        if (!shutdownCondition_.wait_until(lock, deadline, [this] {
+                return sessionShutdownComplete_;
+            }))
         {
-            FinalizeEncodeFrame(ctx, true);
+            spdlog::warn("VideoEncoder: VideoToolbox session drain timed out");
+            return false;
         }
     }
-
-    if (videoToolbox_.session != nullptr)
+    if (shutdownThread_.joinable())
     {
-        VTCompressionSessionRef compressionSession = (VTCompressionSessionRef)videoToolbox_.session;
-        VTCompressionSessionCompleteFrames(compressionSession, kCMTimeInvalid);
-        VTCompressionSessionInvalidate(compressionSession);
-        CFRelease(compressionSession);
-        videoToolbox_.session = nullptr;
+        shutdownThread_.join();
     }
 
-    for (int i = 0; i < 200 && inFlightFrameCount_.load() > 0; i++)
+    const auto now = Clock::now();
+    if (now >= deadline ||
+        !callbackDrain_.StopAndWait(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now)))
     {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        spdlog::warn("VideoEncoder: asynchronous callback drain timed out");
+        return false;
+    }
+    // Every Metal completion handler has returned, so nothing can still be
+    // holding the helper client.
+    ReleaseHelperClient();
+
+    {
+        std::lock_guard<std::mutex> lock(shutdownMutex_);
+        if (resourcesDestroyed_)
+        {
+            return true;
+        }
     }
 
     DestroySlots();
@@ -949,6 +1470,16 @@ void VideoEncoder::Shutdown()
     {
         [(MPSImageBilinearScale*)videoToolbox_.scaler release];
         videoToolbox_.scaler = nullptr;
+    }
+    if (videoToolbox_.copyPipeline != nullptr)
+    {
+        [(id<MTLComputePipelineState>)videoToolbox_.copyPipeline release];
+        videoToolbox_.copyPipeline = nullptr;
+    }
+    if (videoToolbox_.copySampler != nullptr)
+    {
+        [(id<MTLSamplerState>)videoToolbox_.copySampler release];
+        videoToolbox_.copySampler = nullptr;
     }
     if (videoToolbox_.foveationPipeline != nullptr)
     {
@@ -976,8 +1507,14 @@ void VideoEncoder::Shutdown()
         videoToolbox_.textureCache = nullptr;
     }
 
+    {
+        std::lock_guard<std::mutex> lock(shutdownMutex_);
+        resourcesDestroyed_ = true;
+    }
+
     spdlog::info("VideoEncoder: Shut down (submitted={} dropped={})",
                   frameCount_, droppedFrameCount_.load());
+    return true;
 }
 
 bool VideoEncoder::Encode(FrameImageSource imageSource, int64_t timestampNs, OnNalUnitCallback callback,
@@ -1000,14 +1537,69 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
                                    int64_t timestampNs, OnNalUnitCallback callback,
                                    OnFrameEncodedCallback frameCallback)
 {
-    if (videoToolbox_.session == nullptr ||
-        !frameSource.left.IsValid() ||
+    if (!frameSource.left.IsValid() ||
         (stereo && !frameSource.right.IsValid()))
     {
         return false;
     }
     if (shuttingDown_.load())
     {
+        return false;
+    }
+    ScopedDrainLease drainLease(callbackDrain_);
+    if (!drainLease || shuttingDown_.load())
+    {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> sessionLock(videoToolboxSessionMutex_);
+        if (videoToolbox_.session == nullptr)
+        {
+            return false;
+        }
+    }
+
+
+    // Vulkan/MoltenVK snapshots are submitted from xrReleaseSwapchainImage on
+    // the application's queue. Wait for those copies only on this encoder
+    // worker, never from Session::EndFrame(). A stalled GPU drops the streaming
+    // frame instead of accumulating latency.
+    const uint64_t framePeriodNs = 1'000'000'000ull / std::max(fps_, 1u);
+    const uint64_t snapshotWaitNs = std::min<uint64_t>(framePeriodNs, 16'666'667ull);
+    // Quad layers come from their own swapchains with their own snapshot
+    // fences. A quad whose copy is not ready yet is dropped for this frame
+    // rather than stalling or dropping the whole eye image behind it.
+    if (!frameSource.quads.empty())
+    {
+        const size_t submittedQuads = frameSource.quads.size();
+        frameSource.quads.erase(
+            std::remove_if(frameSource.quads.begin(), frameSource.quads.end(),
+                           [&](const FrameQuadLayer& quad) {
+                               return !WaitForHostFrameImage(quad.image, snapshotWaitNs);
+                           }),
+            frameSource.quads.end());
+        if (frameSource.quads.size() != submittedQuads)
+        {
+            static std::atomic_bool loggedQuadSnapshotTimeout{false};
+            if (!loggedQuadSnapshotTimeout.exchange(true))
+            {
+                spdlog::warn("VideoEncoder: dropping quad layer(s) whose swapchain snapshot "
+                             "was not ready in time");
+            }
+        }
+    }
+    if (!WaitForHostFrameImage(frameSource.left, snapshotWaitNs) ||
+        (stereo && !WaitForHostFrameImage(frameSource.right, snapshotWaitNs)))
+    {
+        droppedFrameCount_.fetch_add(1);
+        if (frameCallback)
+        {
+            FrameMetrics metrics = {};
+            metrics.frameNumber = frameNumberCounter_.fetch_add(1);
+            metrics.timestampNs = timestampNs;
+            metrics.frameDropped = true;
+            frameCallback(metrics);
+        }
         return false;
     }
 
@@ -1059,20 +1651,6 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
         return dropAcquiredSlot("missing source texture");
     }
 
-    // XrSwapchainSubImage::imageRect: the sub-region of each swapchain image the
-    // app asked to present. Apps that submit the whole image resolve to the full
-    // texture here, which every path below treats exactly as it did before.
-    const FrameImageRect leftRect =
-        frameSource.left.GetRect((uint32_t)leftTex.width, (uint32_t)leftTex.height);
-    FrameImageRect rightRect = {};
-    if (stereo)
-    {
-        rightRect = frameSource.right.GetRect((uint32_t)rightTex.width, (uint32_t)rightTex.height);
-    }
-    const bool croppedSource =
-        !leftRect.CoversFullImage((uint32_t)leftTex.width, (uint32_t)leftTex.height) ||
-        (stereo && !rightRect.CoversFullImage((uint32_t)rightTex.width, (uint32_t)rightTex.height));
-
     id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)videoToolbox_.commandQueue;
     if (queue == nil)
     {
@@ -1091,6 +1669,113 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
     {
         EncodeWaitForFrameImage(cmdBuf, frameSource.right);
     }
+    for (const FrameQuadLayer& quad : frameSource.quads)
+    {
+        EncodeWaitForFrameImage(cmdBuf, quad.image);
+    }
+
+    // Crop each eye out of its swapchain sub-rectangle (subImage.imageRect). UE packs both eyes
+    // side-by-side in one swapchain, so without this both eyes would receive the full [L|R] frame.
+    // The crop target is cached per-eye and only reallocated when size/format actually changes
+    // (session start, or a resolution/foveation reconfigure) -- not on every single frame.
+    {
+        id<MTLDevice> cropDev = queue.device;
+        auto cropEye = [&](id<MTLTexture> tex, const FrameImageSource& src, void** cachedTexture) -> id<MTLTexture> {
+            if (tex == nil || !src.HasSourceRect()) return tex;
+            if (src.sourceX == 0 && src.sourceY == 0 &&
+                src.sourceWidth == (uint32_t)tex.width &&
+                src.sourceHeight == (uint32_t)tex.height) return tex;
+
+            id<MTLTexture> eye = (__bridge id<MTLTexture>)*cachedTexture;
+            if (eye == nil || eye.pixelFormat != tex.pixelFormat ||
+                eye.width != (NSUInteger)src.sourceWidth ||
+                eye.height != (NSUInteger)src.sourceHeight)
+            {
+                MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:tex.pixelFormat
+                                                                                              width:src.sourceWidth
+                                                                                             height:src.sourceHeight
+                                                                                          mipmapped:NO];
+                d.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+                d.storageMode = MTLStorageModePrivate;
+                id<MTLTexture> newEye = [cropDev newTextureWithDescriptor:d];
+                if (newEye == nil)
+                {
+                    return nil;
+                }
+                if (eye != nil)
+                {
+                    [eye release];
+                }
+                eye = newEye;
+                *cachedTexture = (void*)eye;
+            }
+
+            id<MTLBlitCommandEncoder> cb = [cmdBuf blitCommandEncoder];
+            if (cb == nil)
+            {
+                return nil;
+            }
+            [cb copyFromTexture:tex sourceSlice:0 sourceLevel:0
+                   sourceOrigin:MTLOriginMake(src.sourceX, src.sourceY, 0)
+                     sourceSize:MTLSizeMake(src.sourceWidth, src.sourceHeight, 1)
+                      toTexture:eye destinationSlice:0 destinationLevel:0
+              destinationOrigin:MTLOriginMake(0, 0, 0)];
+            [cb endEncoding];
+            return eye;
+        };
+        leftTex = cropEye(leftTex, frameSource.left, &slot.leftCropTexture);
+        if (leftTex == nil)
+        {
+            return dropAcquiredSlot("failed to crop left eye texture");
+        }
+        if (stereo)
+        {
+            rightTex = cropEye(rightTex, frameSource.right, &slot.rightCropTexture);
+            if (rightTex == nil)
+            {
+                return dropAcquiredSlot("failed to crop right eye texture");
+            }
+        }
+    }
+
+    // Composite XrCompositionLayerQuad layers over each eye *here*, on the
+    // cropped eye image, so everything downstream -- direct blit, MPS
+    // downscale, compute conversion and the foveated compute path -- picks the
+    // quads up without knowing they exist. Quad projection is defined per eye,
+    // so it only applies to a stereo submission.
+    if (stereo && oxrsys::quad::QuadLayerRenderer::HasWorkForEye(frameSource, true))
+    {
+        id<MTLTexture> composed = (__bridge id<MTLTexture>)quadRenderer_.ComposeEye(
+            (__bridge void*)cmdBuf, (__bridge void*)leftTex, frameSource, true,
+            &slot.leftQuadTexture);
+        if (composed == nil)
+        {
+            return dropAcquiredSlot("failed to composite left eye quad layers");
+        }
+        leftTex = composed;
+    }
+    if (stereo && oxrsys::quad::QuadLayerRenderer::HasWorkForEye(frameSource, false))
+    {
+        id<MTLTexture> composed = (__bridge id<MTLTexture>)quadRenderer_.ComposeEye(
+            (__bridge void*)cmdBuf, (__bridge void*)rightTex, frameSource, false,
+            &slot.rightQuadTexture);
+        if (composed == nil)
+        {
+            return dropAcquiredSlot("failed to composite right eye quad layers");
+        }
+        rightTex = composed;
+    }
+
+    const auto leftCopyMode = oxrsys::video::SelectTextureCopyMode(
+        static_cast<uint64_t>(leftTex.pixelFormat));
+    const auto rightCopyMode = stereo
+        ? oxrsys::video::SelectTextureCopyMode(static_cast<uint64_t>(rightTex.pixelFormat))
+        : oxrsys::video::TextureCopyMode::DirectBgra;
+    if (leftCopyMode == oxrsys::video::TextureCopyMode::Unsupported ||
+        rightCopyMode == oxrsys::video::TextureCopyMode::Unsupported)
+    {
+        return dropAcquiredSlot("unsupported Metal source texture format");
+    }
 
     bool forceKeyframe = forceKeyframe_.exchange(false);
     const bool useFoveatedEncoding = stereo &&
@@ -1099,25 +1784,23 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
         videoToolbox_.foveationSampler != nullptr &&
         slot.foveatedScratchTexture != nullptr;
     bool needsDownscale = stereo
-        ? (leftRect.width != (int32_t)eyeWidth_ || leftRect.height != (int32_t)height_ ||
-           rightRect.width != (int32_t)eyeWidth_ || rightRect.height != (int32_t)height_)
-        : (leftRect.width != (int32_t)width_ || leftRect.height != (int32_t)height_);
+        ? (leftTex.width != (NSUInteger)eyeWidth_ || leftTex.height != (NSUInteger)height_ ||
+           rightTex.width != (NSUInteger)eyeWidth_ || rightTex.height != (NSUInteger)height_)
+        : (leftTex.width != (NSUInteger)width_ || leftTex.height != (NSUInteger)height_);
+    const bool needsExplicitConversion =
+        leftCopyMode == oxrsys::video::TextureCopyMode::ComputeConversion ||
+        rightCopyMode == oxrsys::video::TextureCopyMode::ComputeConversion;
 
     if (frameCount_ == 0)
     {
-        spdlog::info("VideoEncoder: submit {} frame srcL={}x{} srcR={}x{} dst={}x{} downscale={}",
+        spdlog::info("VideoEncoder: submit {} frame srcL={}x{} srcR={}x{} dst={}x{} downscale={} conversion={}",
                       stereo ? "stereo" : "mono",
                       (uint32_t)leftTex.width, (uint32_t)leftTex.height,
                       stereo ? (uint32_t)rightTex.width : 0,
                       stereo ? (uint32_t)rightTex.height : 0,
                       (uint32_t)dstTexture.width, (uint32_t)dstTexture.height,
-                      useFoveatedEncoding ? true : needsDownscale);
-        if (croppedSource)
-        {
-            spdlog::info("VideoEncoder: honouring imageRect L=({},{} {}x{}) R=({},{} {}x{})",
-                          leftRect.offsetX, leftRect.offsetY, leftRect.width, leftRect.height,
-                          rightRect.offsetX, rightRect.offsetY, rightRect.width, rightRect.height);
-        }
+                      useFoveatedEncoding ? true : needsDownscale,
+                      needsExplicitConversion);
         if (useFoveatedEncoding)
         {
             spdlog::info("VideoEncoder: foveated path targetEye={}x{} encoded={}x{} ratio={:.4f}x{:.4f} via compute scratch texture",
@@ -1136,8 +1819,8 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
         if (foveatedDstTexture == nil ||
             foveatedDstTexture.width != (NSUInteger)width_ ||
             foveatedDstTexture.height != (NSUInteger)height_ ||
-            rightRect.width != leftRect.width ||
-            rightRect.height != leftRect.height ||
+            rightTex.width != leftTex.width ||
+            rightTex.height != leftTex.height ||
             !TextureAllowsUsage(leftTex, MTLTextureUsageShaderRead) ||
             !TextureAllowsUsage(rightTex, MTLTextureUsageShaderRead) ||
             !TextureAllowsUsage(foveatedDstTexture, MTLTextureUsageShaderWrite) ||
@@ -1145,8 +1828,8 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
             eyeWidth_ == 0 ||
             height_ == 0 ||
             !IsFoveationSettingsValid(foveationSettings_,
-                                      (uint32_t)leftRect.width,
-                                      (uint32_t)leftRect.height))
+                                      (uint32_t)leftTex.width,
+                                      (uint32_t)leftTex.height))
         {
             return dropAcquiredSlot("invalid foveated texture, dimensions, usage, or settings");
         }
@@ -1156,15 +1839,10 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
         uniforms.centerShift = {foveationSettings_.centerShiftX, foveationSettings_.centerShiftY};
         uniforms.edgeRatio = {foveationSettings_.edgeRatioX, foveationSettings_.edgeRatioY};
         uniforms.eyeSizeRatio = {foveationSettings_.eyeWidthRatio, foveationSettings_.eyeHeightRatio};
-
-        const FrameImageUvTransform leftUv = MakeFrameImageUvTransform(
-            leftRect, (uint32_t)leftTex.width, (uint32_t)leftTex.height);
-        const FrameImageUvTransform rightUv = MakeFrameImageUvTransform(
-            rightRect, (uint32_t)rightTex.width, (uint32_t)rightTex.height);
-        uniforms.leftUvScale = {leftUv.scaleX, leftUv.scaleY};
-        uniforms.leftUvOffset = {leftUv.offsetX, leftUv.offsetY};
-        uniforms.rightUvScale = {rightUv.scaleX, rightUv.scaleY};
-        uniforms.rightUvOffset = {rightUv.offsetX, rightUv.offsetY};
+        uniforms.sourceSrgb = {
+            oxrsys::video::IsSrgbTextureFormat(static_cast<uint64_t>(leftTex.pixelFormat)) ? 1u : 0u,
+            oxrsys::video::IsSrgbTextureFormat(static_cast<uint64_t>(rightTex.pixelFormat)) ? 1u : 0u,
+        };
 
         id<MTLComputeCommandEncoder> computeEncoder = [cmdBuf computeCommandEncoder];
         if (computeEncoder == nil)
@@ -1209,13 +1887,36 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
             destinationOrigin:MTLOriginMake(0, 0, 0)];
         [blit endEncoding];
     }
+    else if (needsExplicitConversion)
+    {
+        id<MTLComputePipelineState> pipeline =
+            (id<MTLComputePipelineState>)videoToolbox_.copyPipeline;
+        id<MTLSamplerState> sampler =
+            (id<MTLSamplerState>)videoToolbox_.copySampler;
+        const bool leftCopied = EncodeVideoTextureCopy(
+            cmdBuf, pipeline, sampler, leftTex, dstTexture,
+            MTLOriginMake(0, 0, 0),
+            MTLSizeMake(stereo ? eyeWidth_ : width_, height_, 1),
+            oxrsys::video::IsSrgbTextureFormat(
+                static_cast<uint64_t>(leftTex.pixelFormat)));
+        const bool rightCopied = !stereo || EncodeVideoTextureCopy(
+            cmdBuf, pipeline, sampler, rightTex, dstTexture,
+            MTLOriginMake(eyeWidth_, 0, 0),
+            MTLSizeMake(eyeWidth_, height_, 1),
+            oxrsys::video::IsSrgbTextureFormat(
+                static_cast<uint64_t>(rightTex.pixelFormat)));
+        if (!leftCopied || !rightCopied)
+        {
+            return dropAcquiredSlot("failed explicit Metal texture conversion");
+        }
+    }
     else if (stereo && needsDownscale)
     {
         id<MTLTexture> tmpLeft = (id<MTLTexture>)slot.tmpLeftTexture;
         id<MTLTexture> tmpRight = (id<MTLTexture>)slot.tmpRightTexture;
         MPSImageBilinearScale* scaler = (MPSImageBilinearScale*)videoToolbox_.scaler;
-        EncodeScaledCrop(scaler, cmdBuf, leftTex, leftRect, tmpLeft);
-        EncodeScaledCrop(scaler, cmdBuf, rightTex, rightRect, tmpRight);
+        [scaler encodeToCommandBuffer:cmdBuf sourceTexture:leftTex destinationTexture:tmpLeft];
+        [scaler encodeToCommandBuffer:cmdBuf sourceTexture:rightTex destinationTexture:tmpRight];
 
         id<MTLBlitCommandEncoder> blit = [cmdBuf blitCommandEncoder];
         [blit copyFromTexture:tmpLeft
@@ -1241,24 +1942,24 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
     else if (stereo)
     {
         id<MTLBlitCommandEncoder> blit = [cmdBuf blitCommandEncoder];
-        NSUInteger leftCopyW = MIN((NSUInteger)leftRect.width, (NSUInteger)eyeWidth_);
-        NSUInteger leftCopyH = MIN((NSUInteger)leftRect.height, (NSUInteger)height_);
+        NSUInteger leftCopyW = MIN(leftTex.width, (NSUInteger)eyeWidth_);
+        NSUInteger leftCopyH = MIN(leftTex.height, (NSUInteger)height_);
         [blit copyFromTexture:leftTex
                   sourceSlice:0
                   sourceLevel:0
-                 sourceOrigin:MTLOriginMake(leftRect.offsetX, leftRect.offsetY, 0)
+                 sourceOrigin:MTLOriginMake(0, 0, 0)
                    sourceSize:MTLSizeMake(leftCopyW, leftCopyH, 1)
                     toTexture:dstTexture
              destinationSlice:0
              destinationLevel:0
             destinationOrigin:MTLOriginMake(0, 0, 0)];
 
-        NSUInteger rightCopyW = MIN((NSUInteger)rightRect.width, (NSUInteger)eyeWidth_);
-        NSUInteger rightCopyH = MIN((NSUInteger)rightRect.height, (NSUInteger)height_);
+        NSUInteger rightCopyW = MIN(rightTex.width, (NSUInteger)eyeWidth_);
+        NSUInteger rightCopyH = MIN(rightTex.height, (NSUInteger)height_);
         [blit copyFromTexture:rightTex
                   sourceSlice:0
                   sourceLevel:0
-                 sourceOrigin:MTLOriginMake(rightRect.offsetX, rightRect.offsetY, 0)
+                 sourceOrigin:MTLOriginMake(0, 0, 0)
                    sourceSize:MTLSizeMake(rightCopyW, rightCopyH, 1)
                     toTexture:dstTexture
              destinationSlice:0
@@ -1269,17 +1970,17 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
     else if (needsDownscale)
     {
         MPSImageBilinearScale* scaler = (MPSImageBilinearScale*)videoToolbox_.scaler;
-        EncodeScaledCrop(scaler, cmdBuf, leftTex, leftRect, dstTexture);
+        [scaler encodeToCommandBuffer:cmdBuf sourceTexture:leftTex destinationTexture:dstTexture];
     }
     else
     {
         id<MTLBlitCommandEncoder> blit = [cmdBuf blitCommandEncoder];
-        NSUInteger copyW = MIN((NSUInteger)leftRect.width, dstTexture.width);
-        NSUInteger copyH = MIN((NSUInteger)leftRect.height, dstTexture.height);
+        NSUInteger copyW = MIN(leftTex.width, dstTexture.width);
+        NSUInteger copyH = MIN(leftTex.height, dstTexture.height);
         [blit copyFromTexture:leftTex
                   sourceSlice:0
                   sourceLevel:0
-                 sourceOrigin:MTLOriginMake(leftRect.offsetX, leftRect.offsetY, 0)
+                 sourceOrigin:MTLOriginMake(0, 0, 0)
                    sourceSize:MTLSizeMake(copyW, copyH, 1)
                     toTexture:dstTexture
              destinationSlice:0
@@ -1294,18 +1995,21 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
     context->releaseSlot = [this](size_t releasedSlotIndex) {
         ReleaseSlot(releasedSlotIndex);
     };
+    context->callbackDrain = &callbackDrain_;
     context->frameSource = std::move(frameSource);
     context->slotIndex = slotIndex;
     context->metrics.frameNumber = frameNumberCounter_.fetch_add(1);
     context->metrics.timestampNs = timestampNs;
     context->metrics.keyframe = forceKeyframe;
+    context->codec = codec_;
     context->encodeStart = Clock::now();
     context->encodeSubmitFinished = context->encodeStart;
 
-    VTCompressionSessionRef compressionSession = (VTCompressionSessionRef)videoToolbox_.session;
     [cmdBuf addCompletedHandler:^(id<MTLCommandBuffer> commandBuffer)
     {
-        PinThreadToRealtimeQoS();
+        // Same starvation risk as the VideoToolbox callback: this handler
+        // submits the frame to the encoder (or the helper).
+        oxrsys::runtime_platform::SetCurrentThreadTimeSensitive();
 
         if (commandBuffer.status != MTLCommandBufferStatusCompleted || this->shuttingDown_.load())
         {
@@ -1316,38 +2020,56 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
         context->metrics.gpuCopyMs = ToMilliseconds(Clock::now() - context->encodeStart);
 
         // Preferred path: delegate the VideoToolbox encode to the native-arm64
-        // helper (hardware HEVC). The GPU composition into this slot's IOSurface
-        // has completed (we are in the command-buffer completion handler), so the
-        // helper reads finished pixels. If the helper has died since startup, fall
-        // through to the in-process software session below.
-        if (this->useHelper_.load() && this->helperClient_ != nullptr &&
-            this->helperClient_->IsAlive())
+        // helper, which is granted the hardware HEVC encoder. Composition into
+        // this slot's IOSurface has completed (this is the command buffer's
+        // completion handler), so the helper reads finished pixels.
+        //
+        // Publishing the context (inserting it into helperContexts_) hands its
+        // ownership away: from that instant the helper's reader thread may
+        // finalize and delete it - on FrameDone, or on helper death via
+        // OnHelperDied -> ReclaimHelperFrames, which reclaims every published
+        // context whether or not it was ever submitted. So everything the
+        // submit needs is read out of `context` BEFORE publishing, and
+        // `context` is not dereferenced again on this thread afterwards.
+        std::shared_ptr<EncoderHelperClient> helperClient =
+            this->useHelper_.load() ? this->AcquireHelperClient() : nullptr;
+        if (helperClient != nullptr && helperClient->IsAlive())
         {
-            uint64_t cookie = (uint64_t)context;
+            // A per-encoder sequence number, not the context's address: an
+            // address can be reused by the next frame's context as soon as this
+            // one is freed, and the orphan lookup below must never find (and
+            // finalize) a different frame than the one it published.
+            const uint64_t cookie = this->nextHelperCookie_.fetch_add(1) + 1;
+            const uint32_t slot = (uint32_t)context->slotIndex;
+            context->metrics.encodeSubmitMs = 0.0;
             context->encodeSubmitFinished = Clock::now();
             {
-                std::lock_guard<std::mutex> lock(this->helperCtxMutex_);
+                std::lock_guard<std::mutex> lock(this->helperContextMutex_);
                 this->helperContexts_[cookie] = context;
             }
-            this->helperClient_->SubmitFrame(cookie, (uint32_t)context->slotIndex, timestampNs,
-                                             forceKeyframe);
-            if (!this->helperClient_->IsAlive())
+            // `context` is published: only `cookie` identifies it from here on.
+            if (!helperClient->SubmitFrame(cookie, slot, timestampNs, forceKeyframe))
             {
-                // Helper died during this submit; reclaim and finalize as dropped
-                // so the slot is released and the frame is not lost silently.
-                EncodeFrameContext* dead = nullptr;
+                // Never sent: the helper was already gone, or died under this
+                // write (EPIPE; the client has marked it dead). No completion
+                // will come for this frame. OnHelperDied may already have
+                // reclaimed it; otherwise take it back here. Looked up by
+                // cookie, never through the `context` pointer, which may
+                // already have been finalized. A frame that WAS sent is left to
+                // the helper: FrameDone, or OnHelperDied if it never answers.
+                EncodeFrameContext* orphan = nullptr;
                 {
-                    std::lock_guard<std::mutex> lock(this->helperCtxMutex_);
+                    std::lock_guard<std::mutex> lock(this->helperContextMutex_);
                     auto it = this->helperContexts_.find(cookie);
                     if (it != this->helperContexts_.end())
                     {
-                        dead = static_cast<EncodeFrameContext*>(it->second);
+                        orphan = static_cast<EncodeFrameContext*>(it->second);
                         this->helperContexts_.erase(it);
                     }
                 }
-                if (dead != nullptr)
+                if (orphan != nullptr)
                 {
-                    FinalizeEncodeFrame(dead, true);
+                    FinalizeEncodeFrame(orphan, true);
                 }
             }
             return;
@@ -1364,14 +2086,32 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
 
         CMTime presentationTime = CMTimeMake(timestampNs, 1000000000);
         auto submitStart = Clock::now();
-        OSStatus status = VTCompressionSessionEncodeFrame(
-            compressionSession,
-            pixelBuffer,
-            presentationTime,
-            kCMTimeInvalid,
-            frameProps,
-            context,
-            nullptr);
+        OSStatus status = noErr;
+        {
+            // Shutdown detaches and invalidates the VT session under the same
+            // lock. Recheck after locking so a Metal completion racing teardown
+            // cannot submit through a released VTCompressionSessionRef.
+            std::lock_guard<std::mutex> sessionLock(this->videoToolboxSessionMutex_);
+            VTCompressionSessionRef compressionSession =
+                (VTCompressionSessionRef)this->videoToolbox_.session;
+            if (this->shuttingDown_.load() || compressionSession == nullptr)
+            {
+                if (frameProps != nullptr)
+                {
+                    CFRelease(frameProps);
+                }
+                FinalizeEncodeFrame(context, true);
+                return;
+            }
+            status = VTCompressionSessionEncodeFrame(
+                compressionSession,
+                pixelBuffer,
+                presentationTime,
+                kCMTimeInvalid,
+                frameProps,
+                context,
+                nullptr);
+        }
         context->metrics.encodeSubmitMs = ToMilliseconds(Clock::now() - submitStart);
         context->encodeSubmitFinished = Clock::now();
 
@@ -1387,6 +2127,7 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
         }
     }];
 
+    drainLease.TransferToCallback();
     [cmdBuf commit];
 
     frameCount_++;
@@ -1430,6 +2171,7 @@ void VideoEncoder::ReleaseSlot(size_t slotIndex)
 void VideoEncoder::DestroySlots()
 {
     std::lock_guard<std::mutex> lock(slotMutex_);
+    quadRenderer_.Shutdown();
     for (BufferSlot& slot : slots_)
     {
         slot.inUse = false;
@@ -1448,6 +2190,26 @@ void VideoEncoder::DestroySlots()
         {
             [(id<MTLTexture>)slot.foveatedScratchTexture release];
             slot.foveatedScratchTexture = nullptr;
+        }
+        if (slot.leftCropTexture != nullptr)
+        {
+            [(id<MTLTexture>)slot.leftCropTexture release];
+            slot.leftCropTexture = nullptr;
+        }
+        if (slot.rightCropTexture != nullptr)
+        {
+            [(id<MTLTexture>)slot.rightCropTexture release];
+            slot.rightCropTexture = nullptr;
+        }
+        if (slot.leftQuadTexture != nullptr)
+        {
+            [(id<MTLTexture>)slot.leftQuadTexture release];
+            slot.leftQuadTexture = nullptr;
+        }
+        if (slot.rightQuadTexture != nullptr)
+        {
+            [(id<MTLTexture>)slot.rightQuadTexture release];
+            slot.rightQuadTexture = nullptr;
         }
         if (slot.metalTexture != nullptr)
         {
@@ -1476,11 +2238,15 @@ void VideoEncoder::SetBitrate(uint32_t bitrateMbps)
         return;
     }
 
-    // Keep the out-of-process hardware helper's bitrate in lockstep with the
-    // in-process fallback session.
-    if (useHelper_.load() && helperClient_ != nullptr && helperClient_->IsAlive())
+    // Keep the out-of-process helper's bitrate in lockstep with the in-process
+    // fallback session.
+    if (useHelper_.load())
     {
-        helperClient_->SetBitrate(bitrateMbps);
+        if (std::shared_ptr<EncoderHelperClient> client = AcquireHelperClient();
+            client != nullptr && client->IsAlive())
+        {
+            client->SetBitrate(bitrateMbps);
+        }
     }
 
     VTCompressionSessionRef compressionSession = (VTCompressionSessionRef)videoToolbox_.session;

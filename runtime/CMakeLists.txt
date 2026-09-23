@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: MPL-2.0
 
-set(OXRSYS_RUNTIME_SOURCES
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    message(FATAL_ERROR "OXRSys is a macOS-only OpenXR runtime")
+endif()
+
+add_library(oxrsys_runtime SHARED
     src/Config.cpp
     src/EntryPoint.cpp
     src/Runtime.cpp
@@ -8,6 +12,7 @@ set(OXRSYS_RUNTIME_SOURCES
     src/RuntimePlatform.cpp
     src/RuntimeSockets.cpp
     src/StreamingFrameQueue.cpp
+    src/VideoCodecSelection.cpp
     src/Instance.cpp
     src/Session.cpp
     src/Space.cpp
@@ -17,54 +22,22 @@ set(OXRSYS_RUNTIME_SOURCES
     src/StreamingServer.cpp
     src/TrackingReceiver.cpp
     src/VulkanDispatch.cpp
+    src/SwapchainCommon.cpp
+    src/SwapchainVulkan.cpp
+    src/SwapchainMetal.mm
+    src/QuadLayerRenderer.mm
+    src/VideoEncoder.mm
+    src/EncoderHelperClient.mm
+    src/EncoderPathPolicy.cpp
 )
 
-if(APPLE)
-    list(APPEND OXRSYS_RUNTIME_SOURCES
-        src/Swapchain.mm
-        src/VideoEncoder.mm
-        src/HevcEncoderHelperClient.mm
-        src/AudioCapture.mm
-    )
-    # Client of oxrsys-headset-helper; pure Metal/IOSurface/Mach, no driver.
-    list(APPEND OXRSYS_RUNTIME_SOURCES src/WiredHeadset.mm)
-    set_source_files_properties(src/WiredHeadset.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
-elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    list(APPEND OXRSYS_RUNTIME_SOURCES src/WiredHeadsetStub.cpp)
-    list(APPEND OXRSYS_RUNTIME_SOURCES
-        src/SwapchainVulkan.cpp
-        src/FfmpegVideoEncoder.cpp
-    )
-else()
-    message(FATAL_ERROR
-        "The ${CMAKE_SYSTEM_NAME} runtime backend is scaffold-only in this pass. "
-        "Use macOS or Linux for runtime builds."
-    )
-endif()
-
-add_library(oxrsys_runtime SHARED
-    ${OXRSYS_RUNTIME_SOURCES}
+# Wired-headset (WMR) client of oxrsys-headset-helper; pure Metal/IOSurface/Mach,
+# no driver linked into the runtime. Headset audio capture for the streaming path.
+target_sources(oxrsys_runtime PRIVATE
+    src/AudioCapture.mm
+    src/WiredHeadset.mm
 )
-
-find_package(Vulkan REQUIRED)
-
-set(OXRSYS_RUNTIME_LINK_LIBRARIES
-    spdlog::spdlog
-    glm::glm
-    ${CMAKE_DL_LIBS}
-)
-
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    find_package(PkgConfig REQUIRED)
-    pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
-        libavcodec
-        libavutil
-        libswscale
-    )
-    list(APPEND OXRSYS_RUNTIME_LINK_LIBRARIES
-        PkgConfig::FFMPEG
-    )
-endif()
+set_source_files_properties(src/WiredHeadset.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
 
 target_include_directories(oxrsys_runtime PRIVATE
     src
@@ -72,61 +45,48 @@ target_include_directories(oxrsys_runtime PRIVATE
     ${CMAKE_SOURCE_DIR}/common/protocol/include
     ${openxr_SOURCE_DIR}/include
     ${openxr_SOURCE_DIR}/src/common
-    ${Vulkan_INCLUDE_DIRS}
 )
 
 target_compile_definitions(oxrsys_runtime PRIVATE
+    XR_USE_GRAPHICS_API_METAL
     XR_USE_GRAPHICS_API_VULKAN
+    OXRSYS_USE_METAL
+    OXRSYS_USE_VULKAN
     OXRSYS_VERSION_MAJOR=${OXRSYS_VERSION_MAJOR}
     OXRSYS_VERSION_MINOR=${OXRSYS_VERSION_MINOR}
     OXRSYS_VERSION_PATCH=${OXRSYS_VERSION_PATCH}
 )
 
-if(APPLE)
-    target_compile_definitions(oxrsys_runtime PRIVATE
-        XR_USE_GRAPHICS_API_METAL
-    )
-endif()
-
-# NOTE: We intentionally do NOT link against Vulkan::Vulkan.
-# Linking the Vulkan loader would load the system MoltenVK ICD, which conflicts
-# with app-embedded MoltenVK (e.g. Godot). Instead, all Vulkan functions are
-# resolved dynamically through the app's pfnGetInstanceProcAddr.
+# Vulkan is intentionally headers-only here. The runtime resolves every Vulkan
+# function through the application-provided loader dispatch (with the existing
+# process-local vkGetInstanceProcAddr fallback) and never links a Vulkan loader.
 target_link_libraries(oxrsys_runtime PRIVATE
-    ${OXRSYS_RUNTIME_LINK_LIBRARIES}
+    spdlog::spdlog
+    glm::glm
+    OXRSYS::VulkanHeaders
+    ${CMAKE_DL_LIBS}
+    "-framework Metal"
+    "-framework MetalPerformanceShaders"
+    "-framework Foundation"
+    "-framework QuartzCore"
+    "-framework AppKit"
+    "-framework VideoToolbox"
+    "-framework CoreMedia"
+    "-framework CoreVideo"
+    "-framework IOSurface"
+    "-framework CoreAudio"
+    "-framework AudioToolbox"
 )
 
-
-if(APPLE)
-    target_link_libraries(oxrsys_runtime PRIVATE
-        "-framework Metal"
-        "-framework MetalPerformanceShaders"
-        "-framework Foundation"
-        "-framework QuartzCore"
-        "-framework AppKit"
-        "-framework VideoToolbox"
-        "-framework CoreMedia"
-        "-framework CoreVideo"
-        "-framework CoreAudio"
-        "-framework AudioToolbox"
-        "-framework IOSurface"
-    )
-endif()
-
-# Only export the negotiation entry point
+# Only export the negotiation entry point.
 set_target_properties(oxrsys_runtime PROPERTIES
     CXX_VISIBILITY_PRESET hidden
+    OBJCXX_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN ON
     OUTPUT_NAME oxrsys-runtime
     PREFIX "lib"
+    SUFFIX ".dylib"
 )
-
-if(APPLE)
-    set_target_properties(oxrsys_runtime PROPERTIES
-        OBJCXX_VISIBILITY_PRESET hidden
-        SUFFIX ".dylib"
-    )
-endif()
 
 set(OXRSYS_RUNTIME_LIBRARY_FILENAME "$<TARGET_FILE_NAME:oxrsys_runtime>")
 configure_file(
@@ -135,16 +95,26 @@ configure_file(
     @ONLY
 )
 
-# Copy manifest JSON next to the dylib
 file(GENERATE
-    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/oxrsys-runtime.json
+    OUTPUT $<TARGET_FILE_DIR:oxrsys_runtime>/oxrsys-runtime.json
     INPUT ${CMAKE_CURRENT_BINARY_DIR}/oxrsys-runtime.json.in.configured
 )
 
-# Copy default config file next to the dylib (if not already present)
 add_custom_command(TARGET oxrsys_runtime POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         ${CMAKE_CURRENT_SOURCE_DIR}/oxrsys-runtime.toml
         ${CMAKE_CURRENT_BINARY_DIR}/oxrsys-runtime.toml
     COMMENT "Copying oxrsys-runtime.toml to build directory"
 )
+
+# --- Native-arm64 encoder helper ---
+# Always built arm64, even when this runtime is x86_64 or universal (see
+# encoder_helper/CMakeLists.txt). It is placed next to liboxrsys-runtime.dylib,
+# which is where VideoEncoder looks for it when encoder_helper_path is empty,
+# and oxrsys_runtime depends on it so building the runtime target alone (as the
+# packaging scripts do) always produces a matching helper.
+add_subdirectory(encoder_helper)
+set_target_properties(oxrsys-encoder-helper PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "$<TARGET_FILE_DIR:oxrsys_runtime>"
+)
+add_dependencies(oxrsys_runtime oxrsys-encoder-helper)

@@ -1,83 +1,100 @@
 # Testing And Conformance
 
-## Scope
+## Automated Runtime Tests
 
-This document covers the runtime test suite, Home support tests, and the optional OpenXR-CTS lane.
-
-## Runtime Tests
-
-Build and run host-native runtime checks with:
+Run the native macOS build first:
 
 ```bash
-cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
+cmake --preset default
 cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-The default test layers are:
+Before merging host-runtime changes, repeat the explicit `macos-arm64` and `macos-x64` lanes. Tests
+cover configuration, platform helpers, input/actions, protocol layout, status, frame-queue resource
+release, codec selection, Vulkan dispatch, and loader-backed OpenXR behavior.
 
-- `oxrsys_runtime_tests`
-- `oxrsys_runtime_status_tests`
-- `oxrsys_runtime_api_tests`
+Graphics-extension tests must verify that Metal and Vulkan are exposed and that unsupported host
+graphics bindings are not advertised.
 
-`oxrsys_runtime_api_tests` is Apple-only in this pass because it exercises the loader-backed Metal path. Linux builds still run the runtime, config, input, protocol, and status tests.
+Vulkan automation currently covers compilation, loader/dispatch behavior, and the generic bounded
+`HostFence` wait contract. It does not execute MoltenVK image export, real fence completion, or a
+stream from a Vulkan OpenXR application; those remain manual qualification gates.
 
-## Home Tests
-
-The macOS Home has a small Swift test runner for bundle inspection, launcher persistence
-merging, server config serialization, preference persistence, and Terminal command
-quoting:
+## Apple Client Tests
 
 ```bash
-swiftc -parse-as-library \
-  "clients/Apple/oxrsys-home/OXRSys Home/HomeSupport.swift" \
-  "clients/Apple/oxrsys-home/OXRSys Home/OXRSysServerConfig.swift" \
-  "clients/Apple/oxrsys-home/OXRSys Home/HomeLauncher.swift" \
-  "clients/Apple/oxrsys-home/OXRSys Home/HomePreferences.swift" \
-  "clients/Apple/oxrsys-home/OXRSys Home/WmrControllerSupport.swift" \
-  tests/HomeLauncherTests.swift \
-  -o /tmp/oxrsys_home_launcher_tests && /tmp/oxrsys_home_launcher_tests
+swift test --package-path clients/shared/OXRSysStreaming
+swift build --package-path clients/shared/OXRSysSimulator
+xcodebuild -project "clients/home/OXRSys Home.xcodeproj" \
+  -scheme "OXRSys Home" -configuration Debug \
+  -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO test
 ```
 
-The Qt Home core tests are part of the top-level CTest run when `OXRSYS_BUILD_QT_FRONTENDS` is enabled and Qt6 is available.
+The Home tests cover launcher and support behavior through the Xcode test target. Protocol changes
+must update and pass both C++ and Swift layout tests.
+
+CI also builds Home and the standalone simulator on native arm64 and Intel runners, builds the
+simulator for generic iOS Simulator and iOS device destinations, and builds the visionOS viewer for
+visionOS Simulator and the generic visionOS device destination with code signing disabled.
+
+## Android Client Tests
+
+```bash
+(cd clients/android-vr && ./gradlew assembleDebug assembleRelease)
+```
+
+Keep C++ policy tests for Quest/Pico shell interaction and passthrough in the top-level CTest suite.
+Use `assembleOptimizedRelease` as an additional diagnostic, not as the stable sideload gate.
+
+## Packaging Tests
+
+```bash
+./scripts/macos_build_package.sh \
+  --configuration Release \
+  --architectures universal
+```
+
+The helper validates both `arm64` and `x86_64` slices in the runtime and Home executable, and that
+`runtime/oxrsys-encoder-helper` is arm64 only. Also check
+that the package manifest contains the relative `./liboxrsys-runtime.dylib` path. A package build is
+not evidence that signing, notarization, launch, or streaming succeeds.
 
 ## CTS Lane
 
-Enable and run the optional OpenXR-CTS lane with:
+Install the Xcode Metal Toolchain, then run the pinned non-interactive CTS lane:
 
 ```bash
-cmake -B build_cts -G Ninja -DCMAKE_BUILD_TYPE=Debug -DOXRSYS_ENABLE_CTS=ON
+xcodebuild -downloadComponent MetalToolchain
+cmake -B build_cts -G Ninja \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DOXRSYS_ENABLE_CTS=ON
 cmake --build build_cts --target openxr_cts_run
 ```
 
-Reports:
+The CTS sub-build receives the resolved `metal` and `metallib` paths. As of March 17, 2026, the
+pinned local baseline is 63 passed, 36 skipped, and 0 failed. Record a new date and exact counts
+whenever the pin or result changes.
 
-- `build_cts/reports/openxr-cts/baseline.txt`
-- `build_cts/reports/openxr-cts/automated_metal.xml`
+## Physical Qualification
 
-## Current Baseline
+Automated checks do not replace these release gates:
 
-As of March 17, 2026, the pinned non-interactive baseline is:
+- launch and register OXRSys on a real Apple Silicon Mac and real Intel Mac
+- stream an actual Metal application and an actual Vulkan/MoltenVK application
+- test WiFi and native ADB reverse USB on affected Quest 1/2/3/Pro and Pico devices
+- validate controller, hand, codec, refresh-rate, passthrough, ABR, and reprojection changes
+- validate immersive presentation, tracking, reconnect, and latency on a physical Vision Pro
+- validate Cardboard stereo presentation and ARKit tracking on a physical iPhone
+- sign, notarize, staple, unpack, register, and launch the distribution archive
 
-- 63 passed
-- 36 skipped
-- 0 failed
+Report each gate independently. Do not collapse a successful build into a claim of runtime, visual,
+or device success.
 
 ## Merge Expectations
 
-Before considering a change ready:
-
-- run the macOS build and tests
-- run the Linux/Qt build on a Linux host when touching Linux runtime or Qt frontend code
-- run the Home Swift test runner when changing the Home launcher, preferences, or server config helpers
-- run the Android build if Android code changed
-- run the CTS lane when runtime API, extension behavior, swapchain handling, action handling, or conformance-sensitive behavior changed
-
-## Documentation Updates
-
-Update this file when:
-
-- test commands change
-- test targets change
-- CTS reports move
-- the tracked CTS baseline changes
+- Keep mechanical moves separate from semantic changes.
+- Run `git diff --check` and the lanes affected by the patch.
+- Add tests for behavior changes or state the exact manual gate when automation is impossible.
+- Update `README.md`, `AGENTS.md`, `CHANGES.md`, and the single owning documentation page for
+  significant changes.

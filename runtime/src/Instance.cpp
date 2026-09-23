@@ -9,7 +9,12 @@
 #include <spdlog/spdlog.h>
 
 Instance::Instance(XrVersion apiVersion, const std::vector<std::string>& enabledExtensions)
-    : apiVersion_(apiVersion), enabledExtensions_(enabledExtensions)
+    : apiVersion_(apiVersion),
+      enabledExtensions_(enabledExtensions),
+      passthroughBlendModeEnabled_([] {
+          const ConfigValues values = Config::Get().GetValues();
+          return values.passthroughEnabled && values.appAlphaBlendPassthrough;
+      }())
 {
     Runtime::Get().RegisterHandle(handle_, this);
     Runtime::Get().SetInstance(this);
@@ -42,11 +47,14 @@ XrResult Instance::GetSystem(const XrSystemGetInfo* getInfo, XrSystemId* systemI
         WiredHeadset& wired = WiredHeadset::Shared();
         if (wired.GetEyeWidth() > 0 && wired.GetEyeHeight() > 0)
         {
-            EyeWidth = wired.GetEyeWidth();
-            EyeHeight = wired.GetEyeHeight();
+            WiredEyeWidth = wired.GetEyeWidth();
+            WiredEyeHeight = wired.GetEyeHeight();
         }
+        uint32_t eyeWidth = 0;
+        uint32_t eyeHeight = 0;
+        GetRecommendedEyeResolution(eyeWidth, eyeHeight);
         spdlog::info("OXRSys: wired headset '{}' active, recommending {}x{} per eye",
-                     wired.GetName(), EyeWidth, EyeHeight);
+                     wired.GetName(), eyeWidth, eyeHeight);
     }
 
     systemRequested_ = true;
@@ -187,13 +195,17 @@ XrResult Instance::EnumerateViewConfigurationViews(XrSystemId systemId,
         return XR_ERROR_SIZE_INSUFFICIENT;
     }
 
+    uint32_t recommendedWidth = 0;
+    uint32_t recommendedHeight = 0;
+    GetRecommendedEyeResolution(recommendedWidth, recommendedHeight);
+
     for (uint32_t i = 0; i < 2; i++)
     {
         views[i].type = XR_TYPE_VIEW_CONFIGURATION_VIEW;
         views[i].next = nullptr;
-        views[i].recommendedImageRectWidth = EyeWidth;
+        views[i].recommendedImageRectWidth = recommendedWidth;
         views[i].maxImageRectWidth = 4096;
-        views[i].recommendedImageRectHeight = EyeHeight;
+        views[i].recommendedImageRectHeight = recommendedHeight;
         views[i].maxImageRectHeight = 4096;
         views[i].recommendedSwapchainSampleCount = 1;
         views[i].maxSwapchainSampleCount = 1;
@@ -221,17 +233,24 @@ XrResult Instance::EnumerateEnvironmentBlendModes(XrSystemId systemId,
         return XR_ERROR_VALIDATION_FAILURE;
     }
 
-    *environmentBlendModeCountOutput = 1;
+    const bool alphaBlendEnabled = SupportsPassthroughBlendMode();
+    const uint32_t supportedModeCount = alphaBlendEnabled ? 2u : 1u;
+
+    *environmentBlendModeCountOutput = supportedModeCount;
     if (environmentBlendModeCapacityInput == 0)
     {
         return XR_SUCCESS;
     }
-    if (environmentBlendModeCapacityInput < 1)
+    if (environmentBlendModeCapacityInput < supportedModeCount)
     {
         return XR_ERROR_SIZE_INSUFFICIENT;
     }
 
     environmentBlendModes[0] = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+    if (alphaBlendEnabled)
+    {
+        environmentBlendModes[1] = XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND;
+    }
     return XR_SUCCESS;
 }
 

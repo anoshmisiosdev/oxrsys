@@ -1,23 +1,33 @@
 // SPDX-License-Identifier: MPL-2.0
 
 #include "Session.h"
+#include "QuadLayerProjection.h"
+#include "CompositionLayerAlpha.h"
+#include "CompositionLayerQuad.h"
 #include "Config.h"
 #include "Instance.h"
 #include "Runtime.h"
 #include "Swapchain.h"
-#include "SwapchainRect.h"
+#include "SwapchainCreateValidation.h"
 #include "Space.h"
 #include "InputManager.h"
 #include "StreamingServer.h"
 #include "RuntimeStatus.h"
 #include "WiredHeadset.h"
+#include "Config.h"
 #include <spdlog/spdlog.h>
+#include <glm/glm.hpp>
+#include <glm/gtc/quaternion.hpp>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
+#include <ctime>
+#include <exception>
 #include <numeric>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include <openxr/openxr_platform.h>
 
@@ -68,6 +78,38 @@ namespace
 
 using Clock = std::chrono::steady_clock;
 
+// CLOCK_MONOTONIC in nanoseconds — the clock XR_KHR_convert_timespec_time
+// converts against.
+int64_t MonotonicNowNs()
+{
+    struct timespec ts{};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<int64_t>(ts.tv_sec) * 1000000000LL + ts.tv_nsec;
+}
+
+FramePose ToFramePose(const XrPosef& pose)
+{
+    FramePose result = {};
+    result.orientation[0] = pose.orientation.x;
+    result.orientation[1] = pose.orientation.y;
+    result.orientation[2] = pose.orientation.z;
+    result.orientation[3] = pose.orientation.w;
+    result.position[0] = pose.position.x;
+    result.position[1] = pose.position.y;
+    result.position[2] = pose.position.z;
+    return result;
+}
+
+FrameFov ToFrameFov(const XrFovf& fov)
+{
+    FrameFov result = {};
+    result.angleLeft = fov.angleLeft;
+    result.angleRight = fov.angleRight;
+    result.angleUp = fov.angleUp;
+    result.angleDown = fov.angleDown;
+    return result;
+}
+
 struct SessionMetricSummary
 {
     double average = 0.0;
@@ -91,9 +133,15 @@ SessionMetricSummary SummarizeSessionSamples(std::vector<double>& samples)
     return summary;
 }
 
-bool IsSupportedEnvironmentBlendMode(XrEnvironmentBlendMode blendMode)
+bool IsSupportedEnvironmentBlendMode(XrEnvironmentBlendMode blendMode, const Instance* instance)
 {
-    return blendMode == XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+    if (blendMode == XR_ENVIRONMENT_BLEND_MODE_OPAQUE)
+    {
+        return true;
+    }
+    return blendMode == XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND &&
+           instance != nullptr &&
+           instance->SupportsPassthroughBlendMode();
 }
 
 constexpr uint32_t kMaxSupportedCompositionLayers = XR_MIN_COMPOSITION_LAYERS_SUPPORTED;
@@ -142,6 +190,7 @@ Session::Session(Instance* instance, void* metalDevice, void* metalCommandQueue)
     inputManager_ = std::make_unique<InputManager>();
 
     startTime_ = std::chrono::steady_clock::now();
+    monoStartNs_ = MonotonicNowNs();
     lastFrameTime_ = startTime_;
 
     Runtime::Get().RegisterHandle(handle_, this);
@@ -159,6 +208,7 @@ Session::Session(Instance* instance, const GraphicsContext& graphicsContext)
     inputManager_ = std::make_unique<InputManager>();
 
     startTime_ = std::chrono::steady_clock::now();
+    monoStartNs_ = MonotonicNowNs();
     lastFrameTime_ = startTime_;
 
     Runtime::Get().RegisterHandle(handle_, this);
@@ -167,12 +217,27 @@ Session::Session(Instance* instance, const GraphicsContext& graphicsContext)
     TransitionState(XR_SESSION_STATE_IDLE);
     TransitionState(XR_SESSION_STATE_READY);
 
-    spdlog::info("OXRSys: Vulkan session created");
+    const char* apiName = "unknown";
+    switch (graphicsContext_.api)
+    {
+        case GraphicsApi::Metal:
+            apiName = "Metal";
+            break;
+        case GraphicsApi::Vulkan:
+            apiName = "Vulkan";
+            break;
+    }
+    spdlog::info("OXRSys: {} session created", apiName);
 }
 
 Session::~Session()
 {
-    Shutdown();
+    if (Shutdown() != XR_SUCCESS)
+    {
+        // xrDestroySession retains the Session on a bounded drain timeout.
+        // Freeing it here would invalidate callbacks and app-device resources.
+        std::terminate();
+    }
     instance_->RemoveEventsForSession(reinterpret_cast<XrSession>(handle_));
     instance_->SetSession(nullptr);
     Runtime::Get().RemoveHandle(handle_);
@@ -185,6 +250,21 @@ XrTime Session::GetCurrentTime() const
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - startTime_)
             .count());
+}
+
+XrTime Session::TimespecToXrTime(const struct timespec& ts) const
+{
+    const int64_t monoNs = static_cast<int64_t>(ts.tv_sec) * 1000000000LL + ts.tv_nsec;
+    // XrTime == steady_clock::now() - startTime_, and CLOCK_MONOTONIC advances in
+    // lockstep with steady_clock (both real-time ns), so XrTime == monoNs - monoStartNs_.
+    return static_cast<XrTime>(monoNs - monoStartNs_);
+}
+
+void Session::XrTimeToTimespec(XrTime time, struct timespec& ts) const
+{
+    const int64_t monoNs = static_cast<int64_t>(time) + monoStartNs_;
+    ts.tv_sec = static_cast<time_t>(monoNs / 1000000000LL);
+    ts.tv_nsec = static_cast<long>(monoNs % 1000000000LL);
 }
 
 void Session::TransitionState(XrSessionState newState)
@@ -251,7 +331,10 @@ XrResult Session::EndSession()
     running_ = false;
 
     // Stop streaming so it can be restarted on next BeginSession
-    StopStreaming();
+    if (!StopStreaming())
+    {
+        return XR_ERROR_RUNTIME_FAILURE;
+    }
 
     {
         std::scoped_lock lock(frameStateMutex_);
@@ -278,8 +361,10 @@ XrResult Session::RequestExitSession()
     return XR_SUCCESS;
 }
 
-void Session::Shutdown()
+XrResult Session::Shutdown()
 {
+    std::lock_guard<std::mutex> shutdownLock(shutdownMutex_);
+    teardownStarted_.store(true, std::memory_order_release);
     running_ = false;
     exitRequested_ = true;
     state_ = XR_SESSION_STATE_IDLE;
@@ -290,33 +375,64 @@ void Session::Shutdown()
         waitedFrameCount_ = 0;
     }
 
+    if (!StopStreaming())
+    {
+        // Keep the server, encoder, swapchains and public session handle
+        // alive. xrDestroySession/Instance can retry after callbacks exit.
+        return XR_ERROR_RUNTIME_FAILURE;
+    }
     if (inputManager_)
     {
-        StopStreaming();
+        inputManager_->SetTrackingReceiver(nullptr);
     }
 
+    std::lock_guard<std::mutex> swapchainsLock(swapchainsMutex_);
+    for (const auto& swapchain : swapchains_)
+    {
+        const XrResult result = swapchain->PrepareForDestroy();
+        if (result != XR_SUCCESS)
+        {
+            return result;
+        }
+    }
     spaces_.clear();
     swapchains_.clear();
+    return XR_SUCCESS;
 }
 
-void Session::StopStreaming()
+// Detaches the wired headset or stops the streaming server. Returns false,
+// leaving the server in place, only when the server refuses to stop (its
+// callbacks are still running); callers surface that as a runtime failure so
+// the session can be torn down again later.
+bool Session::StopStreaming()
 {
+    streamingSnapshotDemand_->store(false, std::memory_order_release);
     if (wiredActive_)
     {
         WiredHeadset::Shared().DetachGraphics();
         wiredActive_ = false;
         streamingStarted_ = false;
-        inputManager_->SetTrackingReceiver(nullptr);
+        if (inputManager_)
+        {
+            inputManager_->SetTrackingReceiver(nullptr);
+        }
         spdlog::info("OXRSys: Wired headset detached for session end");
     }
     if (streamingServer_)
     {
-        streamingServer_->Stop();
+        if (!streamingServer_->Stop())
+        {
+            return false;
+        }
         streamingServer_.reset();
         streamingStarted_ = false;
-        inputManager_->SetTrackingReceiver(nullptr);
+        if (inputManager_)
+        {
+            inputManager_->SetTrackingReceiver(nullptr);
+        }
         spdlog::info("OXRSys: Streaming server stopped for session end");
     }
+    return true;
 }
 
 void Session::BeginDebugUtilsLabelRegion(const XrDebugUtilsLabelEXT& labelInfo)
@@ -402,6 +518,10 @@ XrResult Session::WaitFrame(const XrFrameWaitInfo* frameWaitInfo, XrFrameState* 
             return XR_ERROR_SESSION_NOT_RUNNING;
         }
     }
+
+    streamingSnapshotDemand_->store(
+        streamingServer_ != nullptr && streamingServer_->IsClientConnected(),
+        std::memory_order_release);
 
     uint32_t targetRefreshHz = 90;
     if (wiredActive_)
@@ -556,7 +676,7 @@ XrResult Session::EndFrame(const XrFrameEndInfo* frameEndInfo)
     {
         return XR_ERROR_TIME_INVALID;
     }
-    if (!IsSupportedEnvironmentBlendMode(frameEndInfo->environmentBlendMode))
+    if (!IsSupportedEnvironmentBlendMode(frameEndInfo->environmentBlendMode, instance_))
     {
         return XR_ERROR_ENVIRONMENT_BLEND_MODE_UNSUPPORTED;
     }
@@ -571,7 +691,23 @@ XrResult Session::EndFrame(const XrFrameEndInfo* frameEndInfo)
 
     // Extract submitted eye sources for streaming. Missing streaming sources do
     // not invalidate the OpenXR frame; they only skip this frame's video encode.
+    const bool passthroughEnabled = instance_ != nullptr &&
+                                    instance_->SupportsPassthroughBlendMode();
+    const bool environmentAlphaBlend =
+        frameEndInfo->environmentBlendMode == XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND;
+    bool sourceAlphaProjectionLayer = false;
+
     FrameSource frameSource = {};
+    // The space the surviving projection layer's views are expressed in. Quad
+    // poses are relocated into it so the compositor can project them against
+    // the very views the application rendered.
+    Space* projectionSpace = nullptr;
+    // OpenXR composites layers in array order, so a quad submitted *before* the
+    // projection layer is drawn underneath it. The projection layer is opaque
+    // here, so those quads are fully occluded; collect only the ones that come
+    // after it rather than wrongly drawing them on top.
+    std::vector<FrameQuadLayer> pendingQuads;
+    size_t quadsBeforeProjection = 0;
 
     for (uint32_t i = 0; i < frameEndInfo->layerCount; i++)
     {
@@ -585,25 +721,77 @@ XrResult Session::EndFrame(const XrFrameEndInfo* frameEndInfo)
         {
             case XR_TYPE_COMPOSITION_LAYER_PROJECTION:
             {
-                XrResult result = ValidateProjectionLayer(
-                    *reinterpret_cast<const XrCompositionLayerProjection*>(layer), frameSource);
+                const auto& projectionLayer =
+                    *reinterpret_cast<const XrCompositionLayerProjection*>(layer);
+                if (oxrsys::runtime::IsSourceAlphaProjectionLayerForStreaming(
+                        projectionLayer.layerFlags, passthroughEnabled))
+                {
+                    sourceAlphaProjectionLayer = true;
+                }
+
+                XrResult result = ValidateProjectionLayer(projectionLayer, frameSource);
                 if (result != XR_SUCCESS)
                 {
                     return result;
                 }
+                projectionSpace = Runtime::Get().FromHandle<Space>(
+                    reinterpret_cast<uint64_t>(projectionLayer.space));
+                // A second projection layer replaces the first, and anything
+                // stacked on the first is now underneath it.
+                quadsBeforeProjection += pendingQuads.size();
+                pendingQuads.clear();
                 break;
             }
             case XR_TYPE_COMPOSITION_LAYER_QUAD:
             {
-                XrResult result = ValidateQuadLayer(*reinterpret_cast<const XrCompositionLayerQuad*>(layer));
+                FrameQuadLayer quad = {};
+                XrResult result = ValidateQuadLayer(
+                    *reinterpret_cast<const XrCompositionLayerQuad*>(layer),
+                    frameEndInfo->displayTime, projectionSpace, frameSource, quad);
                 if (result != XR_SUCCESS)
                 {
                     return result;
+                }
+                if (projectionSpace == nullptr)
+                {
+                    // Nothing to project against yet, so this quad is either
+                    // underneath a projection layer still to come or in a frame
+                    // with no projection layer at all. Either way it is not
+                    // drawn; ValidateQuadLayer leaves it empty.
+                    ++quadsBeforeProjection;
+                }
+                else if (quad.IsValid())
+                {
+                    pendingQuads.push_back(std::move(quad));
                 }
                 break;
             }
             default:
                 return XR_ERROR_LAYER_INVALID;
+        }
+    }
+
+    frameSource.quads = std::move(pendingQuads);
+    if (quadsBeforeProjection > 0)
+    {
+        static std::atomic_bool loggedOccludedQuads{false};
+        if (!loggedOccludedQuads.exchange(true))
+        {
+            spdlog::info("OXRSys: ignoring {} quad layer(s) not stacked above a projection layer; "
+                         "an opaque projection layer submitted after them hides them entirely",
+                         quadsBeforeProjection);
+        }
+    }
+
+    frameSource.alphaBlend = oxrsys::runtime::IsAlphaFrameForStreaming(
+        frameEndInfo->environmentBlendMode, sourceAlphaProjectionLayer);
+
+    if (!environmentAlphaBlend && sourceAlphaProjectionLayer)
+    {
+        static std::atomic_bool loggedSourceAlphaProjection{false};
+        if (!loggedSourceAlphaProjection.exchange(true))
+        {
+            spdlog::info("OXRSys: using projection layer source-alpha flags for passthrough streaming");
         }
     }
 
@@ -616,7 +804,21 @@ XrResult Session::EndFrame(const XrFrameEndInfo* frameEndInfo)
     else if (streamingServer_ && streamingServer_->IsClientConnected())
     {
         auto sendStart = Clock::now();
-        streamingServer_->SendFrame(std::move(frameSource));
+        if (lastRenderHasPose_)
+        {
+            const float renderHeadOrientation[4] = {
+                lastRenderHeadPose_.orientation.x, lastRenderHeadPose_.orientation.y,
+                lastRenderHeadPose_.orientation.z, lastRenderHeadPose_.orientation.w};
+            const float renderHeadPosition[3] = {
+                lastRenderHeadPose_.position.x, lastRenderHeadPose_.position.y,
+                lastRenderHeadPose_.position.z};
+            streamingServer_->SendFrame(std::move(frameSource), renderHeadOrientation,
+                                        renderHeadPosition);
+        }
+        else
+        {
+            streamingServer_->SendFrame(std::move(frameSource));
+        }
         double enqueueMs = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
             Clock::now() - sendStart).count();
 
@@ -644,6 +846,7 @@ XrResult Session::EndFrame(const XrFrameEndInfo* frameEndInfo)
 
 bool Session::OwnsSwapchain(const Swapchain* swapchain) const
 {
+    std::lock_guard<std::mutex> lock(swapchainsMutex_);
     return std::any_of(swapchains_.begin(), swapchains_.end(),
                        [swapchain](const std::unique_ptr<Swapchain>& candidate)
                        {
@@ -722,11 +925,18 @@ XrResult Session::ValidateProjectionLayer(const XrCompositionLayerProjection& la
         auto* swapchain = Runtime::Get().FromHandle<Swapchain>(reinterpret_cast<uint64_t>(view.subImage.swapchain));
         FrameImageSource imageSource =
             swapchain->GetLastReleasedFrameImageSource(view.subImage.imageArrayIndex);
-        // Carry the sub-region the app asked for through to the compositor;
-        // ValidateSwapchainSubImage above already checked it against the
-        // swapchain bounds. Apps that submit the full image get a rect that
-        // covers it, which the consumers treat exactly as before.
-        imageSource.rect = FrameImageRectFromSubImage(view.subImage);
+        // Honor the per-view sub-rectangle: UE packs both eyes into one swapchain side-by-side.
+        imageSource.sourceX = static_cast<uint32_t>(view.subImage.imageRect.offset.x);
+        imageSource.sourceY = static_cast<uint32_t>(view.subImage.imageRect.offset.y);
+        imageSource.sourceWidth = static_cast<uint32_t>(view.subImage.imageRect.extent.width);
+        imageSource.sourceHeight = static_cast<uint32_t>(view.subImage.imageRect.extent.height);
+        // The compositor needs the exact pose and frustum the eye was rendered
+        // with to place quad layers in the same image.
+        FrameEyeView& eyeView = frameSource.views[viewIndex == 0 ? 0 : 1];
+        eyeView.pose = ToFramePose(view.pose);
+        eyeView.fov = ToFrameFov(view.fov);
+        eyeView.valid = true;
+
         if (viewIndex == 0)
         {
             frameSource.left = std::move(imageSource);
@@ -740,7 +950,75 @@ XrResult Session::ValidateProjectionLayer(const XrCompositionLayerProjection& la
     return XR_SUCCESS;
 }
 
-XrResult Session::ValidateQuadLayer(const XrCompositionLayerQuad& layer) const
+bool Session::RelocateQuadPose(Space* quadSpace, const XrPosef& quadPose, Space* projectionSpace,
+                               XrTime displayTime, const FrameSource& frameSource,
+                               FramePose& outPose)
+{
+    if (quadSpace == nullptr || projectionSpace == nullptr)
+    {
+        return false;
+    }
+    if (quadSpace == projectionSpace)
+    {
+        outPose = ToFramePose(quadPose);
+        return true;
+    }
+
+    // Head-locked quads are pinned to the *submitted* view poses rather than
+    // located through the tracker, so they share an instant with the eye images
+    // they sit on. Going through LocateSpace here would use a head pose one
+    // prediction newer than the pixels and the quad would swim.
+    if (quadSpace->GetType() == Space::Type::Reference &&
+        quadSpace->GetReferenceSpaceType() == XR_REFERENCE_SPACE_TYPE_VIEW)
+    {
+        FramePose renderViewPose = {};
+        if (oxrsys::quad::MakeRenderViewPose(frameSource.views, renderViewPose))
+        {
+            const FramePose spaceOffset = ToFramePose(quadSpace->GetPoseInSpace());
+            outPose = oxrsys::quad::ComposePose(
+                oxrsys::quad::ComposePose(renderViewPose, spaceOffset), ToFramePose(quadPose));
+            return true;
+        }
+    }
+
+    XrSpaceLocation location = {};
+    location.type = XR_TYPE_SPACE_LOCATION;
+    if (quadSpace->LocateSpace(projectionSpace, displayTime, &location) != XR_SUCCESS)
+    {
+        return false;
+    }
+    const XrSpaceLocationFlags required =
+        XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+    if ((location.locationFlags & required) != required)
+    {
+        return false;
+    }
+
+    // Compose the layer's own offset pose on top of where its space sits.
+    const glm::quat spaceRotation(location.pose.orientation.w, location.pose.orientation.x,
+                                  location.pose.orientation.y, location.pose.orientation.z);
+    const glm::vec3 spacePosition(location.pose.position.x, location.pose.position.y,
+                                  location.pose.position.z);
+    const glm::quat layerRotation(quadPose.orientation.w, quadPose.orientation.x,
+                                  quadPose.orientation.y, quadPose.orientation.z);
+    const glm::vec3 layerPosition(quadPose.position.x, quadPose.position.y, quadPose.position.z);
+
+    const glm::quat finalRotation = spaceRotation * layerRotation;
+    const glm::vec3 finalPosition = spacePosition + spaceRotation * layerPosition;
+
+    outPose.orientation[0] = finalRotation.x;
+    outPose.orientation[1] = finalRotation.y;
+    outPose.orientation[2] = finalRotation.z;
+    outPose.orientation[3] = finalRotation.w;
+    outPose.position[0] = finalPosition.x;
+    outPose.position[1] = finalPosition.y;
+    outPose.position[2] = finalPosition.z;
+    return true;
+}
+
+XrResult Session::ValidateQuadLayer(const XrCompositionLayerQuad& layer, XrTime displayTime,
+                                    Space* projectionSpace, const FrameSource& frameSource,
+                                    FrameQuadLayer& outQuad) const
 {
     auto* space = Runtime::Get().FromHandle<Space>(reinterpret_cast<uint64_t>(layer.space));
     if (space == nullptr || space->GetSession() != this)
@@ -757,7 +1035,50 @@ XrResult Session::ValidateQuadLayer(const XrCompositionLayerQuad& layer) const
         return XR_ERROR_VALIDATION_FAILURE;
     }
 
-    return ValidateSwapchainSubImage(layer.subImage);
+    XrResult subImageResult = ValidateSwapchainSubImage(layer.subImage);
+    if (subImageResult != XR_SUCCESS)
+    {
+        return subImageResult;
+    }
+
+    // Validation passed; everything below only decides whether this frame can
+    // actually draw the quad. A quad that cannot be composited is dropped
+    // silently rather than failing the application's xrEndFrame.
+    if (projectionSpace == nullptr || layer.size.width <= 0.0f || layer.size.height <= 0.0f)
+    {
+        return XR_SUCCESS;
+    }
+
+    FramePose quadPose = {};
+    if (!RelocateQuadPose(space, layer.pose, projectionSpace, displayTime, frameSource, quadPose))
+    {
+        return XR_SUCCESS;
+    }
+
+    auto* swapchain =
+        Runtime::Get().FromHandle<Swapchain>(reinterpret_cast<uint64_t>(layer.subImage.swapchain));
+    FrameImageSource imageSource =
+        swapchain->GetLastReleasedFrameImageSource(layer.subImage.imageArrayIndex);
+    if (!imageSource.IsValid())
+    {
+        return XR_SUCCESS;
+    }
+    // Sample only the sub-rectangle the application submitted, not the whole
+    // swapchain image.
+    imageSource.sourceX = static_cast<uint32_t>(layer.subImage.imageRect.offset.x);
+    imageSource.sourceY = static_cast<uint32_t>(layer.subImage.imageRect.offset.y);
+    imageSource.sourceWidth = static_cast<uint32_t>(layer.subImage.imageRect.extent.width);
+    imageSource.sourceHeight = static_cast<uint32_t>(layer.subImage.imageRect.extent.height);
+    imageSource.imageWidth = swapchain->GetWidth();
+    imageSource.imageHeight = swapchain->GetHeight();
+
+    outQuad.image = std::move(imageSource);
+    outQuad.pose = quadPose;
+    outQuad.widthMeters = layer.size.width;
+    outQuad.heightMeters = layer.size.height;
+    outQuad.eyeVisibility = oxrsys::runtime::ToFrameEyeVisibility(layer.eyeVisibility);
+    outQuad.blend = oxrsys::runtime::ToFrameQuadBlend(layer.layerFlags);
+    return XR_SUCCESS;
 }
 
 bool Session::IsFrameLoopRunningState() const
@@ -825,6 +1146,8 @@ XrResult Session::LocateViews(const XrViewLocateInfo* viewLocateInfo, XrViewStat
     // zero offset the transform is identity, so STAGE behaviour is unchanged.
     inputManager_->GetEyeViews(views, 2);
 
+    // Express the STAGE-absolute eye poses relative to the requested base space
+    // (identity for a STAGE base at the default zero offset).
     const XrPosef basePose = ReferenceSpaceWorldPose(baseSpace, *inputManager_);
     const glm::quat baseRotInv = glm::inverse(ToGlmQuat(basePose.orientation));
     const glm::vec3 basePos = ToGlmVec(basePose.position);
@@ -835,6 +1158,11 @@ XrResult Session::LocateViews(const XrViewLocateInfo* viewLocateInfo, XrViewStat
         views[i].pose.orientation = ToXrQuat(baseRotInv * viewRot);
         views[i].pose.position = ToXrVec(baseRotInv * (viewPos - basePos));
     }
+
+    // Remember the exact head pose this frame is being rendered for, so the streamed frame can be
+    // tagged with it at submission instead of a later re-prediction.
+    lastRenderHeadPose_ = inputManager_->GetHeadPose();
+    lastRenderHasPose_ = true;
 
     return XR_SUCCESS;
 }
@@ -897,19 +1225,69 @@ XrResult Session::CreateSwapchain(const XrSwapchainCreateInfo* createInfo, XrSwa
     {
         return XR_ERROR_VALIDATION_FAILURE;
     }
+    if (createInfo->type != XR_TYPE_SWAPCHAIN_CREATE_INFO ||
+        createInfo->width == 0 ||
+        createInfo->height == 0 ||
+        createInfo->faceCount != 1 ||
+        createInfo->arraySize == 0 ||
+        createInfo->sampleCount != 1)
+    {
+        *swapchain = XR_NULL_HANDLE;
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+    if (createInfo->mipCount != 1)
+    {
+        *swapchain = XR_NULL_HANDLE;
+        return XR_ERROR_FEATURE_UNSUPPORTED;
+    }
 
+    if (teardownStarted_.load(std::memory_order_acquire))
+    {
+        *swapchain = XR_NULL_HANDLE;
+        return XR_ERROR_SESSION_LOST;
+    }
+
+    const XrResult supportResult =
+        oxrsys::swapchain::ValidateCreateInfo(graphicsContext_.api, *createInfo);
+    if (supportResult != XR_SUCCESS)
+    {
+        *swapchain = XR_NULL_HANDLE;
+        return supportResult;
+    }
+
+    *swapchain = XR_NULL_HANDLE;
     auto sc = std::make_unique<Swapchain>(graphicsContext_, createInfo);
+    XrResult initializationResult = sc->InitializationResult();
+    if (initializationResult != XR_SUCCESS)
+    {
+        return initializationResult;
+    }
+    sc->SetStreamingSnapshotDemand(streamingSnapshotDemand_);
     *swapchain = reinterpret_cast<XrSwapchain>(sc->GetHandle());
-    swapchains_.push_back(std::move(sc));
+    {
+        std::lock_guard<std::mutex> lock(swapchainsMutex_);
+        if (teardownStarted_.load(std::memory_order_acquire))
+        {
+            *swapchain = XR_NULL_HANDLE;
+            return XR_ERROR_SESSION_LOST;
+        }
+        swapchains_.push_back(std::move(sc));
+    }
     return XR_SUCCESS;
 }
 
 XrResult Session::DestroySwapchain(Swapchain* swapchain)
 {
+    std::lock_guard<std::mutex> lock(swapchainsMutex_);
     for (auto it = swapchains_.begin(); it != swapchains_.end(); ++it)
     {
         if (it->get() == swapchain)
         {
+            const XrResult result = (*it)->PrepareForDestroy();
+            if (result != XR_SUCCESS)
+            {
+                return result;
+            }
             swapchains_.erase(it);
             return XR_SUCCESS;
         }
@@ -1015,10 +1393,12 @@ void Session::StartStreamingIfNeeded()
     streamingServer_ = std::make_unique<StreamingServer>();
     streamingServer_->SetGraphicsContext(graphicsContext_);
 
-    // Use default resolution until first swapchain is created
-    // Will be updated when we know the actual render resolution
-    uint32_t width = 1512;
-    uint32_t height = 1680;
+    // Per-eye render resolution for the configured render_device — this must match the
+    // recommendedImageRect the app renders into (see RenderBaseEyeResolution), otherwise the
+    // encoder is sized off a stale default and the stream stays at that resolution.
+    uint32_t width = 0;
+    uint32_t height = 0;
+    RenderBaseEyeResolution(width, height);
     uint32_t refreshHz = 90;
 
     if (streamingServer_->Start(width, height, refreshHz))
@@ -1050,8 +1430,12 @@ void Session::CheckStreamingConnection()
 
     if (!streamingServer_)
     {
+        streamingSnapshotDemand_->store(false, std::memory_order_release);
         return;
     }
+
+    streamingSnapshotDemand_->store(
+        streamingServer_->IsClientConnected(), std::memory_order_release);
 
     // When a client connects, wire up the tracking receiver
     if (streamingServer_->IsClientConnected() && !inputManager_->IsStreaming())

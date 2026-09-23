@@ -3,6 +3,7 @@
 #pragma once
 
 #include <openxr/openxr.h>
+#include "Config.h"
 #include <string>
 #include <vector>
 #include <deque>
@@ -65,6 +66,7 @@ public:
     }
     bool IsSystemIdValid(XrSystemId systemId) const;
     bool SupportsLocalFloor() const;
+    bool SupportsPassthroughBlendMode() const { return passthroughBlendModeEnabled_; }
     void MarkMetalGraphicsRequirementsQueried();
     bool HasQueriedMetalGraphicsRequirements() const;
     void MarkVulkanGraphicsRequirementsQueried();
@@ -74,10 +76,27 @@ public:
     void SetDebugUtilsObjectName(XrObjectType objectType, uint64_t objectHandle, const char* objectName);
     std::string GetDebugUtilsObjectName(XrObjectType objectType, uint64_t objectHandle) const;
 
-    // Recommended per-eye swapchain size. The streaming default is overridden
-    // with the panel's eye size when a wired headset opens at xrGetSystem time.
-    static inline uint32_t EyeWidth = 1512;
-    static inline uint32_t EyeHeight = 1680;
+    static constexpr uint32_t EyeWidth = 1512;   // Quest 3 base per-eye (default device)
+    static constexpr uint32_t EyeHeight = 1680;
+
+    // A wired headset opened at xrGetSystem time overrides the recommended
+    // per-eye size with its panel's eye size; 0 means no override, in which
+    // case the configured render_device decides (RenderBaseEyeResolution).
+    static inline uint32_t WiredEyeWidth = 0;
+    static inline uint32_t WiredEyeHeight = 0;
+
+    // The per-eye size apps are told to render at: the wired panel's when a
+    // wired headset is active, else the render_device base resolution.
+    static void GetRecommendedEyeResolution(uint32_t& width, uint32_t& height)
+    {
+        if (WiredEyeWidth > 0 && WiredEyeHeight > 0)
+        {
+            width = WiredEyeWidth;
+            height = WiredEyeHeight;
+            return;
+        }
+        RenderBaseEyeResolution(width, height);
+    }
 
 private:
     struct DebugUtilsObjectKey
@@ -105,6 +124,7 @@ private:
     Session* session_ = nullptr;
     XrVersion apiVersion_ = XR_CURRENT_API_VERSION;
     std::vector<std::string> enabledExtensions_;
+    bool passthroughBlendModeEnabled_ = false;
 
     std::mutex eventMutex_;
     std::deque<XrEventDataBuffer> eventQueue_;

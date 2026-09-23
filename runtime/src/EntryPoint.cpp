@@ -6,12 +6,8 @@
 
 #ifdef XR_USE_GRAPHICS_API_VULKAN
 #include <vulkan/vulkan.h>
-#if defined(__APPLE__)
 #include <vulkan/vulkan_metal.h>
 #endif
-#endif
-
-#include <openxr/openxr_platform.h>
 
 #include "Runtime.h"
 #include "Instance.h"
@@ -24,19 +20,12 @@
 #include "Config.h"
 #include "RuntimeStatus.h"
 #include "VulkanDispatch.h"
-
 #include <spdlog/spdlog.h>
 #include <glm/glm.hpp>
 #include <glm/gtc/quaternion.hpp>
 #include <cstring>
-#if defined(_WIN32)
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#else
 #include <dlfcn.h>
-#endif
+#include <exception>
 #include <memory>
 #include <vector>
 #include <array>
@@ -45,6 +34,8 @@
 #include <unordered_set>
 #include <algorithm>
 #include <cmath>
+
+#include "OpenXRPlatform.h"
 
 // We need to keep ownership of created objects
 static std::unique_ptr<Instance> gInstance;
@@ -152,13 +143,17 @@ static bool EnsureVulkanInstanceDispatch(VkInstance vkInstance, const char* cont
 
 static bool IsAttachedActionSetHandle(uint64_t actionSetHandle);
 
-static void CleanupRuntimeState()
+static XrResult CleanupRuntimeState()
 {
-    gHandTrackers.clear();
     if (gSession)
     {
-        gSession->Shutdown();
+        const XrResult result = gSession->Shutdown();
+        if (result != XR_SUCCESS)
+        {
+            return result;
+        }
     }
+    gHandTrackers.clear();
     gSession.reset();
     gActions.clear();
     gActionSets.clear();
@@ -168,6 +163,7 @@ static void CleanupRuntimeState()
     gAttachedActionSetHandles.clear();
     gDebugUtilsMessengers.clear();
     gInstance.reset();
+    return XR_SUCCESS;
 }
 
 // ============================================================================
@@ -245,6 +241,9 @@ static std::vector<ExtensionInfo> GetSupportedExtensionInfos()
         {XR_KHR_METAL_ENABLE_EXTENSION_NAME, XR_KHR_metal_enable_SPEC_VERSION},
         {UNITY_METAL_ENABLE_EXTENSION_ALIAS, XR_KHR_metal_enable_SPEC_VERSION},
 #endif
+#ifdef XR_USE_TIMESPEC
+        {XR_KHR_CONVERT_TIMESPEC_TIME_EXTENSION_NAME, XR_KHR_convert_timespec_time_SPEC_VERSION},
+#endif
         {XR_EXT_HAND_TRACKING_EXTENSION_NAME, XR_EXT_hand_tracking_SPEC_VERSION},
         {XR_EXT_CONFORMANCE_AUTOMATION_EXTENSION_NAME, XR_EXT_conformance_automation_SPEC_VERSION},
         {XR_EXT_HAND_INTERACTION_EXTENSION_NAME, XR_EXT_hand_interaction_SPEC_VERSION},
@@ -317,6 +316,13 @@ static const char* ExtensionForFunctionName(const char* functionName)
     {
         return XR_EXT_DEBUG_UTILS_EXTENSION_NAME;
     }
+#ifdef XR_USE_TIMESPEC
+    if (std::strcmp(functionName, "xrConvertTimespecTimeToTimeKHR") == 0 ||
+        std::strcmp(functionName, "xrConvertTimeToTimespecTimeKHR") == 0)
+    {
+        return XR_KHR_CONVERT_TIMESPEC_TIME_EXTENSION_NAME;
+    }
+#endif
 #ifdef XR_USE_GRAPHICS_API_METAL
     if (std::strcmp(functionName, "xrGetMetalGraphicsRequirementsKHR") == 0 ||
         std::strcmp(functionName, UNITY_METAL_GRAPHICS_REQUIREMENTS_FUNCTION_ALIAS) == 0)
@@ -653,7 +659,11 @@ static XRAPI_ATTR XrResult XRAPI_CALL OxrDestroyInstance(XrInstance instance)
     {
         return XR_ERROR_HANDLE_INVALID;
     }
-    CleanupRuntimeState();
+    const XrResult cleanupResult = CleanupRuntimeState();
+    if (cleanupResult != XR_SUCCESS)
+    {
+        return cleanupResult;
+    }
     RuntimeStatus::ClearApplicationName();
     return XR_SUCCESS;
 }
@@ -940,6 +950,18 @@ static XRAPI_ATTR XrResult XRAPI_CALL OxrCreateSession(
         vulkanContext.device = reinterpret_cast<void*>(vulkanBinding->device);
         vulkanContext.queueFamilyIndex = vulkanBinding->queueFamilyIndex;
         vulkanContext.queueIndex = vulkanBinding->queueIndex;
+        if (gVulkanDispatch.getDeviceProcAddr != nullptr)
+        {
+            auto getDeviceQueue = reinterpret_cast<PFN_vkGetDeviceQueue>(
+                gVulkanDispatch.getDeviceProcAddr(vulkanBinding->device, "vkGetDeviceQueue"));
+            if (getDeviceQueue != nullptr)
+            {
+                VkQueue queue = VK_NULL_HANDLE;
+                getDeviceQueue(vulkanBinding->device, vulkanBinding->queueFamilyIndex,
+                               vulkanBinding->queueIndex, &queue);
+                vulkanContext.queue = reinterpret_cast<void*>(queue);
+            }
+        }
         gSession = std::make_unique<Session>(
             inst, GraphicsContext::Vulkan(vulkanContext, gMetalDevice));
         *session = reinterpret_cast<XrSession>(gSession->GetHandle());
@@ -970,7 +992,11 @@ static XRAPI_ATTR XrResult XRAPI_CALL OxrDestroySession(XrSession session)
     {
         return XR_ERROR_HANDLE_INVALID;
     }
-    sess->Shutdown();
+    const XrResult shutdownResult = sess->Shutdown();
+    if (shutdownResult != XR_SUCCESS)
+    {
+        return shutdownResult;
+    }
     gHandTrackers.clear();
     gActionSetsAttached = false;
     gAttachedActionSetHandles.clear();
@@ -2066,7 +2092,12 @@ static ActionState::SubactionData GetQueriedActionState(const ActionState* actio
         aggregate.isActive = aggregate.isActive || data.isActive;
         aggregate.boolValue = aggregate.boolValue || data.boolValue;
         aggregate.boolChanged = aggregate.boolChanged || data.boolChanged;
-        aggregate.floatValue = std::max(aggregate.floatValue, data.floatValue);
+        // Magnitude-preserving so bidirectional axes (thumbstick x/y) keep their sign;
+        // identical to max() for one-sided inputs (trigger/grip are always >= 0).
+        if (std::fabs(data.floatValue) > std::fabs(aggregate.floatValue))
+        {
+            aggregate.floatValue = data.floatValue;
+        }
         aggregate.floatChanged = aggregate.floatChanged || data.floatChanged;
         if (std::fabs(data.vector2fValue.x) > std::fabs(aggregate.vector2fValue.x) ||
             std::fabs(data.vector2fValue.y) > std::fabs(aggregate.vector2fValue.y))
@@ -2202,10 +2233,17 @@ static void AccumulateBindingState(const InputManager& inputManager, const Sugge
             break;
 
         case XR_ACTION_TYPE_FLOAT_INPUT:
-            aggregate.floatValue = std::max(aggregate.floatValue,
-                                            inputManager.GetFloatComponentForProfile(
-                                                hand, binding.componentPath, binding.profilePathString));
+        {
+            // Magnitude-preserving so bidirectional axes keep their sign (max() would clamp
+            // negative thumbstick deflection to 0). One-sided inputs are unaffected.
+            const float floatComponent = inputManager.GetFloatComponentForProfile(
+                hand, binding.componentPath, binding.profilePathString);
+            if (std::fabs(floatComponent) > std::fabs(aggregate.floatValue))
+            {
+                aggregate.floatValue = floatComponent;
+            }
             break;
+        }
 
         case XR_ACTION_TYPE_VECTOR2F_INPUT:
         {
@@ -3240,8 +3278,7 @@ static XRAPI_ATTR XrResult XRAPI_CALL OxrSessionInsertDebugUtilsLabelEXT(
 
 #ifdef XR_USE_GRAPHICS_API_VULKAN
 
-// Helper: ensure Metal device is created when the Vulkan path needs Metal interop
-// on macOS. Linux uses pure Vulkan and does not create a Metal device.
+// Helper: ensure Metal device is created when the Vulkan path needs Metal interop.
 static void EnsureMetalDevice()
 {
 #ifdef XR_USE_GRAPHICS_API_METAL
@@ -3306,16 +3343,25 @@ static XRAPI_ATTR XrResult XRAPI_CALL OxrGetVulkanDeviceExtensionsKHR(
         return XR_ERROR_VALIDATION_FAILURE;
     }
 
-    // No additional device extensions required from the runtime
-    // (Godot/apps handle portability subset themselves in the v1 path)
-    *bufferCountOutput = 1;
+    // The v1 path creates the device in the application, so advertise the
+    // MoltenVK extensions required to expose swapchain snapshots to the native
+    // VideoToolbox/Metal streaming pipeline.
+    constexpr const char* requiredExtensions =
+        "VK_KHR_portability_subset " VK_EXT_METAL_OBJECTS_EXTENSION_NAME;
+    const uint32_t requiredSize =
+        static_cast<uint32_t>(std::strlen(requiredExtensions) + 1);
+    *bufferCountOutput = requiredSize;
     if (bufferCapacityInput == 0)
     {
         return XR_SUCCESS;
     }
-    if (buffer)
+    if (bufferCapacityInput < requiredSize)
     {
-        buffer[0] = '\0';
+        return XR_ERROR_SIZE_INSUFFICIENT;
+    }
+    if (buffer != nullptr)
+    {
+        std::memcpy(buffer, requiredExtensions, requiredSize);
     }
     return XR_SUCCESS;
 }
@@ -3514,7 +3560,6 @@ static XRAPI_ATTR XrResult XRAPI_CALL OxrCreateVulkanDeviceKHR(
     std::vector<const char*> deviceExts(appDeviceInfo->ppEnabledExtensionNames,
                                          appDeviceInfo->ppEnabledExtensionNames + appDeviceInfo->enabledExtensionCount);
 
-#if defined(__APPLE__)
     // Inject VK_KHR_portability_subset for MoltenVK on macOS.
     bool hasPortabilitySubset = false;
     for (const auto* ext : deviceExts)
@@ -3530,7 +3575,7 @@ static XRAPI_ATTR XrResult XRAPI_CALL OxrCreateVulkanDeviceKHR(
         deviceExts.push_back("VK_KHR_portability_subset");
     }
 
-    // Add VK_EXT_metal_objects for MTLTexture extraction (debug rendering)
+    // Add VK_EXT_metal_objects for the Vulkan-to-Metal streaming snapshot.
     bool hasMetalObjects = false;
     for (const auto* ext : deviceExts)
     {
@@ -3544,8 +3589,6 @@ static XRAPI_ATTR XrResult XRAPI_CALL OxrCreateVulkanDeviceKHR(
     {
         deviceExts.push_back(VK_EXT_METAL_OBJECTS_EXTENSION_NAME);
     }
-#endif
-
     modifiedDeviceInfo.enabledExtensionCount = static_cast<uint32_t>(deviceExts.size());
     modifiedDeviceInfo.ppEnabledExtensionNames = deviceExts.data();
 
@@ -3631,6 +3674,78 @@ static XRAPI_ATTR XrResult XRAPI_CALL OxrGetMetalGraphicsRequirementsKHR(
 // ============================================================================
 // xrGetInstanceProcAddr — the main dispatch function
 // ============================================================================
+
+#ifdef XR_USE_TIMESPEC
+// ============================================================================
+// XR_KHR_convert_timespec_time — CLOCK_MONOTONIC timespec <-> XrTime. The
+// session owns the exact time base (monoStartNs_); before a session exists we
+// fall back to a process-global monotonic epoch so conversions never hard-fail.
+// ============================================================================
+static int64_t MonotonicFallbackEpochNs()
+{
+    // Function-local static: C++11 guarantees the initializer runs exactly once
+    // even under concurrent conversion calls before any session exists.
+    static const int64_t epochNs = []() -> int64_t {
+        struct timespec ts{};
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        return static_cast<int64_t>(ts.tv_sec) * 1000000000LL + ts.tv_nsec;
+    }();
+    return epochNs;
+}
+
+static XRAPI_ATTR XrResult XRAPI_CALL OxrConvertTimespecTimeToTimeKHR(
+    XrInstance instance, const struct timespec* timespecTime, XrTime* time)
+{
+    Instance* inst = GetInstance(instance);
+    if (inst == nullptr)
+    {
+        return XR_ERROR_HANDLE_INVALID;
+    }
+    if (timespecTime == nullptr || time == nullptr ||
+        timespecTime->tv_nsec < 0 || timespecTime->tv_nsec >= 1000000000L)
+    {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+
+    if (Session* sess = inst->GetSession())
+    {
+        *time = sess->TimespecToXrTime(*timespecTime);
+    }
+    else
+    {
+        const int64_t monoNs =
+            static_cast<int64_t>(timespecTime->tv_sec) * 1000000000LL + timespecTime->tv_nsec;
+        *time = static_cast<XrTime>(monoNs - MonotonicFallbackEpochNs());
+    }
+    return XR_SUCCESS;
+}
+
+static XRAPI_ATTR XrResult XRAPI_CALL OxrConvertTimeToTimespecTimeKHR(
+    XrInstance instance, XrTime time, struct timespec* timespecTime)
+{
+    Instance* inst = GetInstance(instance);
+    if (inst == nullptr)
+    {
+        return XR_ERROR_HANDLE_INVALID;
+    }
+    if (timespecTime == nullptr)
+    {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+
+    if (Session* sess = inst->GetSession())
+    {
+        sess->XrTimeToTimespec(time, *timespecTime);
+    }
+    else
+    {
+        const int64_t monoNs = static_cast<int64_t>(time) + MonotonicFallbackEpochNs();
+        timespecTime->tv_sec = static_cast<time_t>(monoNs / 1000000000LL);
+        timespecTime->tv_nsec = static_cast<long>(monoNs % 1000000000LL);
+    }
+    return XR_SUCCESS;
+}
+#endif
 
 static XRAPI_ATTR XrResult XRAPI_CALL OxrGetInstanceProcAddr(
     XrInstance instance, const char* name, PFN_xrVoidFunction* function);
@@ -3760,6 +3875,12 @@ static XRAPI_ATTR XrResult XRAPI_CALL OxrGetInstanceProcAddr(
     DISPATCH(xrSessionEndDebugUtilsLabelRegionEXT, OxrSessionEndDebugUtilsLabelRegionEXT)
     DISPATCH(xrSessionInsertDebugUtilsLabelEXT, OxrSessionInsertDebugUtilsLabelEXT)
 
+    // Convert timespec time extension
+#ifdef XR_USE_TIMESPEC
+    DISPATCH(xrConvertTimespecTimeToTimeKHR, OxrConvertTimespecTimeToTimeKHR)
+    DISPATCH(xrConvertTimeToTimespecTimeKHR, OxrConvertTimeToTimespecTimeKHR)
+#endif
+
     // Metal extension
 #ifdef XR_USE_GRAPHICS_API_METAL
     DISPATCH(xrGetMetalGraphicsRequirementsKHR, OxrGetMetalGraphicsRequirementsKHR)
@@ -3799,7 +3920,13 @@ extern "C"
     __attribute__((destructor))
     static void CleanupRuntimeOnUnload()
     {
-        CleanupRuntimeState();
+        if (CleanupRuntimeState() != XR_SUCCESS)
+        {
+            // Unlike the public destroy entry points, dylib unload cannot offer
+            // a retry: returning would unmap code still used by the drain worker
+            // or GPU/VideoToolbox callbacks. Fail fast before that can happen.
+            std::terminate();
+        }
     }
 
     __attribute__((visibility("default")))

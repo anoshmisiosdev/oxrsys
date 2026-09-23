@@ -4,12 +4,18 @@
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
 #include <openxr/openxr.h>
-#include <openxr/openxr_platform.h>
+#include "OpenXRPlatform.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 using Catch::Matchers::WithinAbs;
@@ -73,6 +79,47 @@ PFN_xrVoidFunction GetProc(XrInstance instance, const char* name)
     XR_CHECK(xrGetInstanceProcAddr(instance, name, &function));
     REQUIRE(function != nullptr);
     return function;
+}
+
+std::filesystem::path RuntimeConfigPath()
+{
+    const char* home = std::getenv("HOME");
+    REQUIRE(home != nullptr);
+    return std::filesystem::path(home) /
+           "Library/Application Support/OXRSys/oxrsys-runtime.toml";
+}
+
+void WriteRuntimeConfig(bool passthroughEnabled, bool appAlphaBlendPassthrough = false)
+{
+    const std::filesystem::path path = RuntimeConfigPath();
+    std::filesystem::create_directories(path.parent_path());
+    std::ofstream file(path);
+    REQUIRE(file.is_open());
+    file << "[streaming]\n"
+         << "passthrough_enabled = "
+         << (passthroughEnabled ? "true" : "false")
+         << "\n"
+         << "app_alpha_blend_passthrough = "
+         << (appAlphaBlendPassthrough ? "true" : "false")
+         << "\n"
+         << "[logging]\n"
+         << "file_logging = false\n";
+    file.close();
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+}
+
+std::vector<XrEnvironmentBlendMode> EnumerateBlendModes(XrInstance instance,
+                                                        XrSystemId systemId)
+{
+    uint32_t count = 0;
+    XR_CHECK(xrEnumerateEnvironmentBlendModes(
+        instance, systemId, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 0, &count, nullptr));
+    std::vector<XrEnvironmentBlendMode> modes(count);
+    XR_CHECK(xrEnumerateEnvironmentBlendModes(
+        instance, systemId, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
+        count, &count, modes.data()));
+    modes.resize(count);
+    return modes;
 }
 
 int64_t SelectColorSwapchainFormat(XrSession session)
@@ -367,6 +414,68 @@ TEST_CASE("Instance view and blend APIs reject missing output pointers", "[runti
     CHECK(xrEnumerateEnvironmentBlendModes(
               instance, systemId, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 1, &count, nullptr) ==
           XR_ERROR_VALIDATION_FAILURE);
+
+    xrDestroyInstance(instance);
+}
+
+TEST_CASE("Alpha blend modes are stable for an instance after config reload", "[runtime][passthrough]")
+{
+    WriteRuntimeConfig(true, true);
+
+    XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
+    std::strncpy(createInfo.applicationInfo.applicationName, "stable_blend_modes_test",
+                 XR_MAX_APPLICATION_NAME_SIZE);
+    createInfo.applicationInfo.apiVersion = XR_CURRENT_API_VERSION;
+
+    XrInstance instance = XR_NULL_HANDLE;
+    XR_CHECK(xrCreateInstance(&createInfo, &instance));
+
+    XrSystemGetInfo systemGetInfo = {XR_TYPE_SYSTEM_GET_INFO};
+    systemGetInfo.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
+    XrSystemId systemId = XR_NULL_SYSTEM_ID;
+    XR_CHECK(xrGetSystem(instance, &systemGetInfo, &systemId));
+
+    std::vector<XrEnvironmentBlendMode> modes = EnumerateBlendModes(instance, systemId);
+    CHECK(std::find(modes.begin(), modes.end(),
+                    XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND) != modes.end());
+
+    WriteRuntimeConfig(false);
+    modes = EnumerateBlendModes(instance, systemId);
+    CHECK(std::find(modes.begin(), modes.end(),
+                    XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND) != modes.end());
+
+    xrDestroyInstance(instance);
+
+    XrInstance nextInstance = XR_NULL_HANDLE;
+    XR_CHECK(xrCreateInstance(&createInfo, &nextInstance));
+    XR_CHECK(xrGetSystem(nextInstance, &systemGetInfo, &systemId));
+    modes = EnumerateBlendModes(nextInstance, systemId);
+    CHECK(std::find(modes.begin(), modes.end(),
+                    XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND) == modes.end());
+
+    xrDestroyInstance(nextInstance);
+}
+
+TEST_CASE("Passthrough underlay alone does not advertise alpha blend", "[runtime][passthrough]")
+{
+    WriteRuntimeConfig(true, false);
+
+    XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
+    std::strncpy(createInfo.applicationInfo.applicationName, "passthrough_underlay_test",
+                 XR_MAX_APPLICATION_NAME_SIZE);
+    createInfo.applicationInfo.apiVersion = XR_CURRENT_API_VERSION;
+
+    XrInstance instance = XR_NULL_HANDLE;
+    XR_CHECK(xrCreateInstance(&createInfo, &instance));
+
+    XrSystemGetInfo systemGetInfo = {XR_TYPE_SYSTEM_GET_INFO};
+    systemGetInfo.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
+    XrSystemId systemId = XR_NULL_SYSTEM_ID;
+    XR_CHECK(xrGetSystem(instance, &systemGetInfo, &systemId));
+
+    std::vector<XrEnvironmentBlendMode> modes = EnumerateBlendModes(instance, systemId);
+    CHECK(std::find(modes.begin(), modes.end(),
+                    XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND) == modes.end());
 
     xrDestroyInstance(instance);
 }
@@ -2475,6 +2584,85 @@ TEST_CASE("EndFrame rejects invalid projection and quad layers", "[runtime][fram
         XR_ERROR_VALIDATION_FAILURE);
 }
 
+TEST_CASE("XR_KHR_convert_timespec_time bridges CLOCK_MONOTONIC and XrTime", "[runtime][timespec]")
+{
+    // Both conversion directions must be resolvable and must round-trip losslessly.
+    // Exercise the no-session fallback epoch (process-global) and the
+    // active-session time base.
+
+    SECTION("No-session fallback rejects bad input and round-trips losslessly")
+    {
+        const char* extensions[] = {XR_KHR_CONVERT_TIMESPEC_TIME_EXTENSION_NAME};
+        XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
+        std::strncpy(createInfo.applicationInfo.applicationName, "oxrsys_runtime_api_tests",
+                     XR_MAX_APPLICATION_NAME_SIZE);
+        createInfo.applicationInfo.apiVersion = XR_CURRENT_API_VERSION;
+        createInfo.enabledExtensionCount = 1;
+        createInfo.enabledExtensionNames = extensions;
+        XrInstance instance = XR_NULL_HANDLE;
+        XR_CHECK(xrCreateInstance(&createInfo, &instance));
+
+        auto convertTimespecToTime = reinterpret_cast<PFN_xrConvertTimespecTimeToTimeKHR>(
+            GetProc(instance, "xrConvertTimespecTimeToTimeKHR"));
+        auto convertTimeToTimespec = reinterpret_cast<PFN_xrConvertTimeToTimespecTimeKHR>(
+            GetProc(instance, "xrConvertTimeToTimespecTimeKHR"));
+
+        // Out-of-range tv_nsec is rejected in both parameter forms.
+        struct timespec badTimespec{};
+        badTimespec.tv_sec = 100;
+        badTimespec.tv_nsec = 1'000'000'000L; // == 1e9 is out of [0, 1e9)
+        XrTime scratch = 0;
+        CHECK(convertTimespecToTime(instance, &badTimespec, &scratch) ==
+              XR_ERROR_VALIDATION_FAILURE);
+        badTimespec.tv_nsec = -1;
+        CHECK(convertTimespecToTime(instance, &badTimespec, &scratch) ==
+              XR_ERROR_VALIDATION_FAILURE);
+
+        struct timespec now{};
+        REQUIRE(clock_gettime(CLOCK_MONOTONIC, &now) == 0);
+        XrTime xrTime = 0;
+        XR_CHECK(convertTimespecToTime(instance, &now, &xrTime));
+        struct timespec roundTrip{};
+        XR_CHECK(convertTimeToTimespec(instance, xrTime, &roundTrip));
+        CHECK(roundTrip.tv_sec == now.tv_sec);
+        CHECK(roundTrip.tv_nsec == now.tv_nsec);
+
+        XR_CHECK(xrDestroyInstance(instance));
+    }
+
+    SECTION("Active session shares its time base with predicted display time")
+    {
+        RuntimeSessionContext context({
+            XR_KHR_METAL_ENABLE_EXTENSION_NAME,
+            XR_KHR_CONVERT_TIMESPEC_TIME_EXTENSION_NAME,
+        });
+
+        auto convertTimespecToTime = reinterpret_cast<PFN_xrConvertTimespecTimeToTimeKHR>(
+            GetProc(context.instance, "xrConvertTimespecTimeToTimeKHR"));
+        auto convertTimeToTimespec = reinterpret_cast<PFN_xrConvertTimeToTimespecTimeKHR>(
+            GetProc(context.instance, "xrConvertTimeToTimespecTimeKHR"));
+
+        // Round-trip against the session's own time base.
+        struct timespec now{};
+        REQUIRE(clock_gettime(CLOCK_MONOTONIC, &now) == 0);
+        XrTime xrNow = 0;
+        XR_CHECK(convertTimespecToTime(context.instance, &now, &xrNow));
+        struct timespec roundTrip{};
+        XR_CHECK(convertTimeToTimespec(context.instance, xrNow, &roundTrip));
+        CHECK(roundTrip.tv_sec == now.tv_sec);
+        CHECK(roundTrip.tv_nsec == now.tv_nsec);
+
+        // Domain sanity: the XrTime for "now" must sit in the same base as the frame
+        // loop's predicted display time (within a generous few-second bound).
+        XrFrameState frameState = {XR_TYPE_FRAME_STATE};
+        XR_CHECK(xrWaitFrame(context.session, nullptr, &frameState));
+        const int64_t deltaNs =
+            std::llabs(static_cast<int64_t>(frameState.predictedDisplayTime) -
+                       static_cast<int64_t>(xrNow));
+        CHECK(deltaNs < 5'000'000'000LL);
+    }
+}
+
 TEST_CASE("EndFrame accepts a released projection image while another swapchain image is acquired", "[runtime][frame][swapchain]")
 {
     RuntimeSessionContext context({XR_KHR_METAL_ENABLE_EXTENSION_NAME});
@@ -2613,4 +2801,169 @@ TEST_CASE("Swapchain image order follows acquire wait release rules", "[runtime]
     XR_CHECK(xrReleaseSwapchainImage(staticSwapchain, nullptr));
     CHECK(xrAcquireSwapchainImage(staticSwapchain, nullptr, &extraIndex) == XR_ERROR_CALL_ORDER_INVALID);
     XR_CHECK(xrDestroySwapchain(staticSwapchain));
+}
+
+TEST_CASE("Swapchain creation propagates backend initialization failures", "[runtime][swapchain]")
+{
+    RuntimeSessionContext context({XR_KHR_METAL_ENABLE_EXTENSION_NAME});
+
+    XrSwapchainCreateInfo createInfo = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    createInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+    createInfo.format = 0;
+    createInfo.sampleCount = 1;
+    createInfo.width = 16;
+    createInfo.height = 16;
+    createInfo.faceCount = 1;
+    createInfo.arraySize = 1;
+    createInfo.mipCount = 1;
+
+    XrSwapchain swapchain = reinterpret_cast<XrSwapchain>(static_cast<uintptr_t>(0x1));
+    CHECK(xrCreateSwapchain(context.session, &createInfo, &swapchain) ==
+          XR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED);
+    CHECK(swapchain == XR_NULL_HANDLE);
+}
+
+TEST_CASE("Unsupported swapchain mip counts report feature unsupported", "[runtime][swapchain]")
+{
+    RuntimeSessionContext context({XR_KHR_METAL_ENABLE_EXTENSION_NAME});
+
+    XrSwapchainCreateInfo createInfo = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    createInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+    createInfo.format = SelectColorSwapchainFormat(context.session);
+    createInfo.sampleCount = 1;
+    createInfo.width = 16;
+    createInfo.height = 16;
+    createInfo.faceCount = 1;
+    createInfo.arraySize = 1;
+    createInfo.mipCount = 2;
+
+    XrSwapchain swapchain = reinterpret_cast<XrSwapchain>(static_cast<uintptr_t>(0x1));
+    CHECK(xrCreateSwapchain(context.session, &createInfo, &swapchain) ==
+          XR_ERROR_FEATURE_UNSUPPORTED);
+    CHECK(swapchain == XR_NULL_HANDLE);
+}
+
+TEST_CASE("Swapchain creation validates supported flags and compatible usage",
+          "[runtime][swapchain][validation]")
+{
+    RuntimeSessionContext context({XR_KHR_METAL_ENABLE_EXTENSION_NAME});
+
+    XrSwapchainCreateInfo createInfo = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    createInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
+                            XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+    createInfo.format = SelectColorSwapchainFormat(context.session);
+    createInfo.sampleCount = 1;
+    createInfo.width = 16;
+    createInfo.height = 16;
+    createInfo.faceCount = 1;
+    createInfo.arraySize = 1;
+    createInfo.mipCount = 1;
+
+    XrSwapchain swapchain = reinterpret_cast<XrSwapchain>(static_cast<uintptr_t>(0x1));
+    createInfo.usageFlags |= XR_SWAPCHAIN_USAGE_UNORDERED_ACCESS_BIT;
+    CHECK(xrCreateSwapchain(context.session, &createInfo, &swapchain) ==
+          XR_ERROR_FEATURE_UNSUPPORTED);
+    CHECK(swapchain == XR_NULL_HANDLE);
+
+    swapchain = reinterpret_cast<XrSwapchain>(static_cast<uintptr_t>(0x1));
+    createInfo.format = 70; // MTLPixelFormatRGBA8Unorm, Blender's first advertised match.
+    createInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
+                            XR_SWAPCHAIN_USAGE_SAMPLED_BIT |
+                            XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+    XR_CHECK(xrCreateSwapchain(context.session, &createInfo, &swapchain));
+    REQUIRE(swapchain != XR_NULL_HANDLE);
+    XR_CHECK(xrDestroySwapchain(swapchain));
+
+    swapchain = reinterpret_cast<XrSwapchain>(static_cast<uintptr_t>(0x1));
+    createInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+    createInfo.createFlags = XR_SWAPCHAIN_CREATE_PROTECTED_CONTENT_BIT;
+    CHECK(xrCreateSwapchain(context.session, &createInfo, &swapchain) ==
+          XR_ERROR_FEATURE_UNSUPPORTED);
+    CHECK(swapchain == XR_NULL_HANDLE);
+
+    swapchain = reinterpret_cast<XrSwapchain>(static_cast<uintptr_t>(0x1));
+    createInfo.createFlags = 0;
+    createInfo.usageFlags = XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT;
+    CHECK(xrCreateSwapchain(context.session, &createInfo, &swapchain) ==
+          XR_ERROR_FEATURE_UNSUPPORTED);
+    CHECK(swapchain == XR_NULL_HANDLE);
+
+    swapchain = reinterpret_cast<XrSwapchain>(static_cast<uintptr_t>(0x1));
+    createInfo.createFlags = 0;
+    createInfo.usageFlags = XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    CHECK(xrCreateSwapchain(context.session, &createInfo, &swapchain) ==
+          XR_ERROR_FEATURE_UNSUPPORTED);
+    CHECK(swapchain == XR_NULL_HANDLE);
+
+    swapchain = reinterpret_cast<XrSwapchain>(static_cast<uintptr_t>(0x1));
+    createInfo.format = 252; // MTLPixelFormatDepth32Float, advertised by the runtime.
+    createInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+    CHECK(xrCreateSwapchain(context.session, &createInfo, &swapchain) ==
+          XR_ERROR_FEATURE_UNSUPPORTED);
+    CHECK(swapchain == XR_NULL_HANDLE);
+}
+
+TEST_CASE("Distinct swapchains can be created and destroyed concurrently",
+          "[runtime][swapchain][threading]")
+{
+    RuntimeSessionContext context({XR_KHR_METAL_ENABLE_EXTENSION_NAME});
+    const int64_t format = SelectColorSwapchainFormat(context.session);
+    constexpr size_t threadCount = 4;
+    constexpr size_t iterations = 8;
+    std::array<XrResult, threadCount> results{};
+    results.fill(XR_SUCCESS);
+    std::atomic<size_t> ready{0};
+    std::atomic_bool start{false};
+    std::array<std::thread, threadCount> threads;
+
+    for (size_t threadIndex = 0; threadIndex < threadCount; ++threadIndex)
+    {
+        threads[threadIndex] = std::thread([&, threadIndex] {
+            ready.fetch_add(1, std::memory_order_release);
+            while (!start.load(std::memory_order_acquire))
+            {
+                std::this_thread::yield();
+            }
+
+            for (size_t iteration = 0; iteration < iterations; ++iteration)
+            {
+                XrSwapchainCreateInfo createInfo = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
+                createInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
+                                        XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+                createInfo.format = format;
+                createInfo.sampleCount = 1;
+                createInfo.width = 16;
+                createInfo.height = 16;
+                createInfo.faceCount = 1;
+                createInfo.arraySize = 1;
+                createInfo.mipCount = 1;
+                XrSwapchain swapchain = XR_NULL_HANDLE;
+                results[threadIndex] =
+                    xrCreateSwapchain(context.session, &createInfo, &swapchain);
+                if (results[threadIndex] != XR_SUCCESS)
+                {
+                    return;
+                }
+                results[threadIndex] = xrDestroySwapchain(swapchain);
+                if (results[threadIndex] != XR_SUCCESS)
+                {
+                    return;
+                }
+            }
+        });
+    }
+
+    while (ready.load(std::memory_order_acquire) != threadCount)
+    {
+        std::this_thread::yield();
+    }
+    start.store(true, std::memory_order_release);
+    for (auto& thread : threads)
+    {
+        thread.join();
+    }
+    for (const XrResult result : results)
+    {
+        CHECK(result == XR_SUCCESS);
+    }
 }

@@ -17,15 +17,29 @@ runtime_enabled = false
 bitrate_mbps = 85
 fov_degrees = 30
 resolution_scale = 0.8
+dynamic_resolution_min_scale = 0.55
 refresh_rate_hz = 120
 keyframe_interval_sec = 4
+video_codec = "h264"
 encoder_preset = "quality"
+encoder_10bit = true
+encoder_helper = true
+encoder_helper_path = "/opt/oxrsys/oxrsys-encoder-helper"
 foveated_encoding_preset = "medium"
 client_foveation_preset = "high"
 client_upscaling = true
 client_reprojection = "pose_warp"
 abr_mode = "full"
+passthrough_enabled = true
+app_alpha_blend_passthrough = true
+occlusion_mode = "environment_depth"
 headset_audio = true
+
+[spatial]
+enabled = true
+anchors = true
+scene = true
+persistence = true
 
 [logging]
 file_logging = false
@@ -38,15 +52,27 @@ quest_logcat = yes
     CHECK(values.bitrateMbps == 85);
     CHECK(values.fovDegrees == 100);
     CHECK(values.resolutionScale == 0.8f);
+    CHECK(values.dynamicResolutionMinScale == 0.55f);
     CHECK(values.refreshRateHz == 120);
     CHECK(values.keyframeIntervalSec == 4);
+    CHECK(values.videoCodec == "h264");
     CHECK(values.encoderPreset == "quality");
+    CHECK(values.encoder10Bit == true);
+    CHECK(values.encoderHelperMode == "true");
+    CHECK(values.encoderHelperPath == "/opt/oxrsys/oxrsys-encoder-helper");
     CHECK(values.foveatedEncodingPreset == "medium");
     CHECK(values.clientFoveationPreset == "high");
     CHECK(values.clientUpscaling == true);
     CHECK(values.clientReprojectionMode == "pose_warp");
     CHECK(values.abrMode == "full");
+    CHECK(values.passthroughEnabled == true);
+    CHECK(values.appAlphaBlendPassthrough == true);
+    CHECK(values.occlusionMode == "environment_depth");
     CHECK(values.headsetAudio == true);
+    CHECK(values.spatialEnabled == true);
+    CHECK(values.spatialAnchors == true);
+    CHECK(values.spatialScene == true);
+    CHECK(values.spatialPersistence == true);
     CHECK(values.streamingTransport == "auto");
     CHECK(values.fileLogging == false);
     CHECK(values.questLogcat == true);
@@ -58,41 +84,113 @@ TEST_CASE("Config parser preserves provided defaults when values are malformed",
 [streaming]
 bitrate_mbps = nope
 resolution_scale = 2.0
+dynamic_resolution_min_scale = 0.1
 refresh_rate_hz = 144
 keyframe_interval_sec = 0
+video_codec = "vp9"
 encoder_preset = "turbo"
 foveated_encoding_preset = "extreme"
 client_foveation_preset = "ultra"
 client_reprojection = "warp_all_the_time"
 abr_mode = "turbo"
+mixed_reality_mode = "portal"
+occlusion_mode = "magic"
 )TOML");
 
     ConfigValues defaults;
     defaults.runtimeEnabled = false;
     defaults.bitrateMbps = 64;
     defaults.resolutionScale = 0.5f;
+    defaults.dynamicResolutionMinScale = 0.45f;
     defaults.refreshRateHz = 80;
     defaults.keyframeIntervalSec = 3;
+    defaults.videoCodec = "h265";
     defaults.encoderPreset = "speed";
     defaults.foveatedEncodingPreset = "light";
     defaults.clientFoveationPreset = "medium";
     defaults.clientUpscaling = true;
     defaults.clientReprojectionMode = "pose";
     defaults.abrMode = "bitrate";
+    defaults.passthroughEnabled = true;
+    defaults.appAlphaBlendPassthrough = true;
+    defaults.occlusionMode = "scene_mesh";
+    defaults.encoderHelperMode = "true";
+    defaults.encoderHelperPath = "/opt/oxrsys/oxrsys-encoder-helper";
 
     const ConfigValues values = ParseConfigToml(input, defaults);
 
     CHECK(values.runtimeEnabled == false);
     CHECK(values.bitrateMbps == 64);
     CHECK(values.resolutionScale == 0.5f);
+    CHECK(values.dynamicResolutionMinScale == 0.45f);
     CHECK(values.refreshRateHz == 80);
     CHECK(values.keyframeIntervalSec == 3);
+    CHECK(values.videoCodec == "h265");
     CHECK(values.encoderPreset == "speed");
     CHECK(values.foveatedEncodingPreset == "light");
     CHECK(values.clientFoveationPreset == "medium");
     CHECK(values.clientUpscaling == true);
     CHECK(values.clientReprojectionMode == "pose");
     CHECK(values.abrMode == "bitrate");
+    CHECK(values.passthroughEnabled == true);
+    CHECK(values.appAlphaBlendPassthrough == true);
+    CHECK(values.occlusionMode == "scene_mesh");
+    CHECK(values.encoderHelperMode == "true");
+    CHECK(values.encoderHelperPath == "/opt/oxrsys/oxrsys-encoder-helper");
+}
+
+TEST_CASE("Config parser keeps encoder_helper tri-state with an automatic default", "[config]")
+{
+    // Default: the runtime decides from the measured hardware-encoder
+    // availability. The explicit values stay available as debugging overrides.
+    CHECK(ConfigValues{}.encoderHelperMode == "auto");
+
+    std::istringstream automatic(R"TOML(
+[streaming]
+encoder_helper = "auto"
+)TOML");
+    CHECK(ParseConfigToml(automatic).encoderHelperMode == "auto");
+
+    std::istringstream forcedOff(R"TOML(
+[streaming]
+encoder_helper = false
+)TOML");
+    CHECK(ParseConfigToml(forcedOff).encoderHelperMode == "false");
+
+    // A typo must not silently flip the policy - the previous value stands.
+    std::istringstream typo(R"TOML(
+[streaming]
+encoder_helper = "sometimes"
+)TOML");
+    ConfigValues defaults;
+    defaults.encoderHelperMode = "true";
+    CHECK(ParseConfigToml(typo, defaults).encoderHelperMode == "true");
+}
+
+TEST_CASE("Config parser migrates legacy mixed reality mode to passthrough", "[config]")
+{
+    std::istringstream input(R"TOML(
+[streaming]
+mixed_reality_mode = "alpha"
+)TOML");
+
+    const ConfigValues values = ParseConfigToml(input);
+    CHECK(values.passthroughEnabled == true);
+    CHECK(values.appAlphaBlendPassthrough == true);
+}
+
+TEST_CASE("Config parser lets explicit passthrough keys override legacy mixed reality mode", "[config]")
+{
+    std::istringstream input(R"TOML(
+[streaming]
+passthrough_enabled = false
+app_alpha_blend_passthrough = false
+mixed_reality_mode = "alpha"
+)TOML");
+
+    const ConfigValues values = ParseConfigToml(input);
+    CHECK(values.passthroughEnabled == false);
+    CHECK(values.appAlphaBlendPassthrough == false);
 }
 
 TEST_CASE("Config parser accepts streaming transport", "[config]")

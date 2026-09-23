@@ -4,7 +4,7 @@
 
 // -----------------------------------------------------------------------------
 // Wire protocol between the OXRSys runtime (parent, x86_64 under Rosetta) and
-// the native-arm64 HEVC encoder helper (child), spoken over an inherited Unix
+// the native-arm64 video encoder helper (child), spoken over an inherited Unix
 // stream socket. This header is FRAMEWORK-FREE by construction so it compiles
 // unchanged in the x86_64 runtime dylib and the arm64 helper executable.
 //
@@ -27,18 +27,27 @@
 //    process and reports them as already-converted milliseconds.
 // -----------------------------------------------------------------------------
 
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <string>
 #include <vector>
 
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
+
 namespace oxrsys::enc_ipc
 {
 
 // Frame magic on the wire, ASCII "OXH1".
 inline constexpr uint32_t kMagic = 0x4F584831u;
-inline constexpr uint16_t kProtocolVersion = 1;
+// v2 added the negotiated codec + profile to Init. Both peers reject a frame
+// whose version is not theirs: an out-of-date helper binary next to a newer
+// runtime then fails at handshake (and the runtime falls back to the in-process
+// encoder) instead of misreading a payload.
+inline constexpr uint16_t kProtocolVersion = 2;
 
 // Bound the read loop before any allocation. One HEVC access unit for a
 // 2272x1264 stereo frame is far below this.
@@ -70,6 +79,27 @@ enum class PresetCode : uint32_t
     Quality = 2,
 };
 
+// Negotiated codec. Deliberately its own enum rather than oxr::protocol::
+// VideoCodec: this header must not depend on the runtime's protocol headers,
+// and the wire value must not move if that enum is ever reordered. The values
+// happen to match today; CodecFromProtocol on the runtime side is the only
+// place that mapping lives.
+enum class CodecCode : uint32_t
+{
+    H265 = 0,
+    H264 = 1,
+};
+
+// Bitstream profile the parent negotiated. The helper must honour it exactly —
+// it never substitutes a codec or profile the client did not agree to. Main10
+// is encoded from the same 8-bit BGRA compose surface as Main, matching what
+// the in-process path does: 10-bit bitstream precision, 8-bit source.
+enum class ProfileCode : uint32_t
+{
+    Main = 0,   // HEVC Main / H.264 Main, 8-bit
+    Main10 = 1, // HEVC Main10 (HEVC only; ignored for H.264)
+};
+
 // InitAck status codes — reported so the parent log can say exactly where the
 // helper failed rather than a generic "unavailable".
 enum class InitStatus : uint32_t
@@ -78,6 +108,23 @@ enum class InitStatus : uint32_t
     SurfaceTransferFailed = 1,
     SessionCreateFailed = 2,
     HardwareUnavailable = 3, // session created but RequireHardware not honored
+    UnsupportedCodec = 4,    // Init named a codec this helper cannot encode
+    BadProtocolVersion = 5,  // parent speaks a protocol version this helper does not
+};
+
+// The Init payload, in wire order. Shared by both peers so the field order can
+// only be got wrong in one place.
+struct InitPayload
+{
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t fps = 0;
+    uint32_t bitrateMbps = 0;
+    uint32_t keyframeIntervalSec = 2;
+    uint32_t slotCount = 0;
+    PresetCode preset = PresetCode::Balanced;
+    CodecCode codec = CodecCode::H265;    // v2
+    ProfileCode profile = ProfileCode::Main; // v2
 };
 
 // -----------------------------------------------------------------------------
@@ -175,6 +222,157 @@ inline std::vector<uint8_t> Frame(MsgType type, const std::vector<uint8_t>& payl
     PutU32(out, (uint32_t)payload.size());
     out.insert(out.end(), payload.begin(), payload.end());
     return out;
+}
+
+// Parsed frame header. `ok` is false for a foreign magic, a protocol version
+// that is not ours, or an implausible length — all of which must abort the
+// connection rather than be interpreted.
+struct FrameHeader
+{
+    MsgType type = MsgType::Init;
+    uint16_t version = 0;
+    uint32_t payloadLength = 0;
+    bool ok = false;
+};
+
+inline FrameHeader ParseHeader(const uint8_t* header, size_t size)
+{
+    FrameHeader out;
+    if (header == nullptr || size < kHeaderBytes)
+    {
+        return out;
+    }
+    Reader r(header, kHeaderBytes);
+    const uint32_t magic = r.U32();
+    out.type = (MsgType)r.U16();
+    out.version = r.U16();
+    out.payloadLength = r.U32();
+    out.ok = r.ok() && magic == kMagic && out.version == kProtocolVersion &&
+             out.payloadLength <= kMaxPayloadBytes;
+    return out;
+}
+
+// --- Init payload (de)serialization: one definition, both peers ---
+inline std::vector<uint8_t> SerializeInit(const InitPayload& init)
+{
+    std::vector<uint8_t> p;
+    PutU32(p, init.width);
+    PutU32(p, init.height);
+    PutU32(p, init.fps);
+    PutU32(p, init.bitrateMbps);
+    PutU32(p, init.keyframeIntervalSec);
+    PutU32(p, init.slotCount);
+    PutU32(p, (uint32_t)init.preset);
+    PutU32(p, (uint32_t)init.codec);
+    PutU32(p, (uint32_t)init.profile);
+    return p;
+}
+
+inline bool DeserializeInit(const uint8_t* data, size_t size, InitPayload& out)
+{
+    Reader r(data, size);
+    out.width = r.U32();
+    out.height = r.U32();
+    out.fps = r.U32();
+    out.bitrateMbps = r.U32();
+    out.keyframeIntervalSec = r.U32();
+    out.slotCount = r.U32();
+    const uint32_t preset = r.U32();
+    const uint32_t codec = r.U32();
+    const uint32_t profile = r.U32();
+    if (!r.ok())
+    {
+        return false;
+    }
+    if (preset > (uint32_t)PresetCode::Quality || codec > (uint32_t)CodecCode::H264 ||
+        profile > (uint32_t)ProfileCode::Main10)
+    {
+        return false;
+    }
+    if (out.slotCount == 0 || out.slotCount > kMaxSlots || out.width == 0 || out.height == 0)
+    {
+        return false;
+    }
+    out.preset = (PresetCode)preset;
+    out.codec = (CodecCode)codec;
+    out.profile = (ProfileCode)profile;
+    return true;
+}
+
+inline const char* CodecName(CodecCode codec)
+{
+    return codec == CodecCode::H264 ? "H.264" : "H.265";
+}
+
+// -----------------------------------------------------------------------------
+// Control-socket I/O that never raises SIGPIPE.
+//
+// A write to a stream socket whose peer has gone raises SIGPIPE, whose default
+// action terminates the writer. On the runtime side the writer is the game
+// process (the dylib lives inside someone else's process, under Wine), so a
+// helper crash would take the game down with it; on the helper side it would
+// turn "the host went away" into a signal death. Suppressed per socket, never
+// with a process-wide signal(SIGPIPE, SIG_IGN), which a library has no business
+// installing in its host: SO_NOSIGPIPE on the descriptor, plus MSG_NOSIGNAL on
+// every send as a second, per-call guard. A write to a dead peer then just
+// fails with EPIPE, which both peers already treat as "the other side is gone".
+// -----------------------------------------------------------------------------
+
+// Call on every control-socket descriptor as soon as it exists.
+inline bool DisableSigPipe(int fd)
+{
+    int one = 1;
+    return setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one)) == 0;
+}
+
+inline constexpr int kSendFlags =
+#if defined(MSG_NOSIGNAL)
+    MSG_NOSIGNAL;
+#else
+    0;
+#endif
+
+// Writes all of `data`, retrying on EINTR. False on any other error (errno is
+// left as send() set it: EPIPE when the peer is gone).
+inline bool SendAll(int fd, const uint8_t* data, size_t len)
+{
+    size_t off = 0;
+    while (off < len)
+    {
+        const ssize_t n = ::send(fd, data + off, len - off, kSendFlags);
+        if (n > 0)
+        {
+            off += (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR)
+        {
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+// Reads exactly `len` bytes, retrying on EINTR. False on EOF or error.
+inline bool RecvAll(int fd, uint8_t* data, size_t len)
+{
+    size_t off = 0;
+    while (off < len)
+    {
+        const ssize_t n = ::read(fd, data + off, len - off);
+        if (n > 0)
+        {
+            off += (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR)
+        {
+            continue;
+        }
+        return false; // 0 = EOF: the peer is gone
+    }
+    return true;
 }
 
 // -----------------------------------------------------------------------------

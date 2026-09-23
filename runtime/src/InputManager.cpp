@@ -528,8 +528,11 @@ void InputManager::GetEyeViews(XrView* views, uint32_t viewCount) const
             const ConfigValues config = Config::Get().GetValues();
             float fovDeg = static_cast<float>(config.fovDegrees);
             float halfAngleV = fovDeg * 0.5f * 3.14159265f / 180.0f;
-            const float aspect = static_cast<float>(Instance::EyeWidth) /
-                                 static_cast<float>(Instance::EyeHeight);
+            uint32_t baseWidth = 0;
+            uint32_t baseHeight = 0;
+            Instance::GetRecommendedEyeResolution(baseWidth, baseHeight);
+            const float aspect = static_cast<float>(baseWidth) /
+                                 static_cast<float>(baseHeight);
             float halfAngleH = std::atan(std::tan(halfAngleV) * aspect);
             views[i].fov.angleLeft = -halfAngleH;
             views[i].fov.angleRight = halfAngleH;
@@ -567,25 +570,22 @@ XrPosef InputManager::GetControllerPose(Hand hand) const
     return pose;
 }
 
-bool InputManager::GetControllerVelocity(Hand hand, glm::vec3& linearVelocity,
-                                         glm::vec3& angularVelocity) const
-{
-    if (trackingReceiver_ == nullptr)
-    {
-        return false;
-    }
-    return trackingReceiver_->GetRawControllerVelocity(hand == Hand::Left, linearVelocity,
-                                                        angularVelocity);
-}
-
 XrPosef InputManager::GetControllerAimPose(Hand hand) const
 {
     const glm::vec3& pos = (hand == Hand::Left) ? leftControllerAimPos_ : rightControllerAimPos_;
     glm::quat rot = (hand == Hand::Left) ? leftControllerAimRot_ : rightControllerAimRot_;
 
-    // Clients that don't populate the aim pose leave it identity/zero; fall back to the grip pose
-    // so /input/aim/pose is never worse than before this field existed.
-    if (rot.x == 0.0f && rot.y == 0.0f && rot.z == 0.0f && rot.w == 0.0f)
+    // Clients that don't populate the aim pose leave it in one of two "unset" shapes: all-zero
+    // (C++ zero-init on a short/legacy packet) or an identity rotation with a zero position (the
+    // Swift TrackingPacket defaults aim rotation to (0,0,0,1)). Treat both as "not provided" and
+    // fall back to the grip pose, otherwise an identity-defaulted client pins the aim pose at the
+    // world origin and the controller never appears to move.
+    const bool zeroRotation =
+        rot.x == 0.0f && rot.y == 0.0f && rot.z == 0.0f && rot.w == 0.0f;
+    const bool identityAtOrigin =
+        rot.x == 0.0f && rot.y == 0.0f && rot.z == 0.0f && rot.w == 1.0f &&
+        pos.x == 0.0f && pos.y == 0.0f && pos.z == 0.0f;
+    if (zeroRotation || identityAtOrigin)
     {
         return GetControllerPose(hand);
     }
@@ -599,6 +599,17 @@ XrPosef InputManager::GetControllerAimPose(Hand hand) const
     pose.position.y = pos.y;
     pose.position.z = pos.z;
     return pose;
+}
+
+bool InputManager::GetControllerVelocity(Hand hand, glm::vec3& linearVelocity,
+                                         glm::vec3& angularVelocity) const
+{
+    if (trackingReceiver_ == nullptr)
+    {
+        return false;
+    }
+    return trackingReceiver_->GetRawControllerVelocity(hand == Hand::Left, linearVelocity,
+                                                       angularVelocity);
 }
 
 float InputManager::GetGrabValue(Hand hand) const

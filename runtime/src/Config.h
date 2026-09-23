@@ -18,7 +18,10 @@ struct ConfigValues
     uint32_t fovDegrees = 100;      // Legacy fallback FOV when a client omits eyeFov
     uint32_t refreshRateHz = 72;    // Preferred headset refresh rate
     float resolutionScale = 0.75f;  // Encode resolution multiplier (0.25-1.0)
+    float dynamicResolutionMinScale = 0.50f; // Lowest ABR full-mode encode scale
+    std::string renderDevice = "quest3"; // Per-eye render resolution target: "quest2", "quest3", "avp"
     uint32_t keyframeIntervalSec = 2; // Seconds between forced keyframes
+    std::string videoCodec = "h265"; // "h265", "h264", "auto"
     std::string encoderPreset = "balanced"; // "quality", "balanced", "speed"
 
     // Force periodic IDR keyframes on the reliable USB-ADB TCP video path.
@@ -30,20 +33,35 @@ struct ConfigValues
     // RequestKeyframe. Set true to restore the old always-periodic behaviour.
     bool usbPeriodicKeyframes = false;
 
-    // Out-of-process native-arm64 hardware HEVC encoder helper. The runtime
-    // dylib is x86_64 (Rosetta) and cannot reach VideoToolbox's hardware HEVC
-    // encoder; when enabled, the runtime spawns a native-arm64 helper that can,
-    // sharing the compose IOSurfaces zero-copy. Falls back to the in-process
-    // software encoder if the helper is unavailable. Default off (opt-in).
-    bool encoderHelperEnabled = false;
-    std::string encoderHelperPath = ""; // empty = sibling of the runtime dylib
+    bool encoder10Bit = false;      // Encode HEVC Main10 for capable H.265 clients
+
+    // Out-of-process native-arm64 hardware encoder helper. When the runtime
+    // dylib is loaded by an x86_64/Rosetta host it cannot reach VideoToolbox's
+    // hardware HEVC encoder; the runtime then spawns a native-arm64 helper that
+    // can, sharing the compose IOSurfaces zero-copy, and falls back to the
+    // in-process encoder if anything about that fails.
+    //   "auto"  (default) use the helper only when this process is refused a
+    //           hardware encoder for the negotiated codec
+    //   "true"  always use the helper (debugging)
+    //   "false" never use the helper (debugging)
+    std::string encoderHelperMode = "auto";
+    std::string encoderHelperPath; // empty = sibling of the runtime dylib
     std::string streamingTransport = "auto"; // "auto", "wifi", "usb_adb"
     std::string foveatedEncodingPreset = "off"; // "off", "light", "medium", "high"
     std::string clientFoveationPreset = "auto"; // "auto", "off", "light", "medium", "high"
     bool clientUpscaling = false;    // Enable Quest shader upscaling
+    float clientSharpening = 0.0f;   // Headset contrast-adaptive sharpen strength (0.0-1.0); 0 = off
     std::string clientReprojectionMode = "pose"; // "off", "pose", "pose_warp"
     std::string abrMode = "bitrate"; // "off", "bitrate", "full"
+    bool passthroughEnabled = false;  // Keep headset passthrough available for streaming
+    bool appAlphaBlendPassthrough = false; // Advertise OpenXR alpha blend for explicit MR apps
+    std::string occlusionMode = "off"; // "off", "scene_mesh", "environment_depth"
     bool headsetAudio = false;       // Stream server audio to the headset
+
+    bool spatialEnabled = false;
+    bool spatialAnchors = false;
+    bool spatialScene = false;
+    bool spatialPersistence = false;
 
     // Manual calibration for the STAGE (standing/roomscale) floor. Added to the
     // head height a game sees in STAGE and LOCAL_FLOOR spaces. 0 = trust the
@@ -71,9 +89,12 @@ struct ConfigValues
 
 ConfigValues ParseConfigToml(std::istream& input, const ConfigValues& defaults = {});
 
+// Per-eye render resolution for the configured `render_device`, advertised to the app.
+void RenderBaseEyeResolution(uint32_t& width, uint32_t& height);
+
 /**
- * Runtime configuration loaded from the platform config directory
- * (macOS: ~/Library/Application Support/OXRSys, Linux: XDG_CONFIG_HOME/oxrsys)
+ * Runtime configuration loaded from
+ * ~/Library/Application Support/OXRSys on macOS
  * with a fallback to the library-local config file.
  *
  * Singleton initialized once on first access. Configures spdlog sinks

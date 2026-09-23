@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: MPL-2.0
 //
-// oxrsys-encoder-helper — native arm64 out-of-process HEVC encoder.
+// oxrsys-encoder-helper — native arm64 out-of-process video encoder.
 //
 // The OXRSys runtime dylib is loaded in-process by CrossOver's x86_64 Wine host
 // (Rosetta), and VideoToolbox refuses the hardware HEVC encoder to an x86_64
 // process (kVTCouldNotFindVideoEncoderErr / silent software fallback). This
-// helper runs native arm64, so VideoToolbox grants it the hardware HEVC encoder.
+// helper runs native arm64, so VideoToolbox grants it the hardware encoder.
+//
+// It encodes whichever codec and profile the runtime negotiated with the client
+// — H.265 Main, H.265 Main10 or H.264 Main — and never substitutes another: if
+// it cannot honour the request it says so in InitAck and exits, and the runtime
+// keeps using its in-process session.
 //
 // It receives the runtime's compose IOSurfaces once at startup (zero-copy, as
 // mach send rights), then per frame it is told "encode slot N" over a Unix
@@ -16,6 +21,7 @@
 
 #define OXRSYS_ENC_IPC_WANT_MACH 1
 #include "EncoderHelperIpc.h"
+#include "EncoderSessionColor.h"
 
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
@@ -27,6 +33,7 @@
 #include <servers/bootstrap.h>
 
 #include <atomic>
+#include <csignal>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -85,6 +92,8 @@ struct HelperState
     uint32_t keyframeIntervalSec = 2;
     uint32_t slotCount = 0;
     PresetCode preset = PresetCode::Balanced;
+    CodecCode codec = CodecCode::H265;
+    ProfileCode profile = ProfileCode::Main;
 
     IOSurfaceRef surfaces[kMaxSlots] = {};
     CVPixelBufferRef pixelBuffers[kMaxSlots] = {};
@@ -105,38 +114,23 @@ struct FrameCtx
 // --------------------------------------------------------------------------
 // Socket I/O
 // --------------------------------------------------------------------------
-bool WriteAll(int fd, const uint8_t* data, size_t len)
-{
-    size_t off = 0;
-    while (off < len)
-    {
-        ssize_t n = ::write(fd, data + off, len - off);
-        if (n > 0) { off += (size_t)n; continue; }
-        if (n < 0 && (errno == EINTR)) continue;
-        return false;
-    }
-    return true;
-}
-
-bool ReadAll(int fd, uint8_t* data, size_t len)
-{
-    size_t off = 0;
-    while (off < len)
-    {
-        ssize_t n = ::read(fd, data + off, len - off);
-        if (n > 0) { off += (size_t)n; continue; }
-        if (n == 0) return false; // EOF: parent gone
-        if (n < 0 && errno == EINTR) continue;
-        return false;
-    }
-    return true;
-}
-
 bool SendMsg(MsgType type, const std::vector<uint8_t>& payload)
 {
     std::vector<uint8_t> framed = Frame(type, payload);
     std::lock_guard<std::mutex> lock(g.writeMutex);
-    return WriteAll(g.sock, framed.data(), framed.size());
+    if (SendAll(g.sock, framed.data(), framed.size()))
+    {
+        return true;
+    }
+    // The host closed its end (orderly Stop, or it vanished). Nothing to do
+    // but say so once; the main loop's next read hits EOF and exits cleanly.
+    static bool reported = false;
+    if (!reported)
+    {
+        reported = true;
+        LOGW("socket write failed (%s) — host gone, dropping output", strerror(errno));
+    }
+    return false;
 }
 
 // Read one framed message; returns false on EOF/error. On success fills type +
@@ -144,28 +138,26 @@ bool SendMsg(MsgType type, const std::vector<uint8_t>& payload)
 bool RecvMsg(MsgType& outType, std::vector<uint8_t>& outPayload)
 {
     uint8_t header[kHeaderBytes];
-    if (!ReadAll(g.sock, header, kHeaderBytes)) return false;
+    if (!RecvAll(g.sock, header, kHeaderBytes)) return false;
 
-    Reader r(header, kHeaderBytes);
-    uint32_t magic = r.U32();
-    uint16_t type = r.U16();
-    r.U16(); // version
-    uint32_t len = r.U32();
-    if (magic != kMagic || len > kMaxPayloadBytes)
+    const FrameHeader parsed = ParseHeader(header, kHeaderBytes);
+    if (!parsed.ok)
     {
-        LOGE("bad frame magic=0x%08x len=%u", magic, len);
+        LOGE("bad frame header (version=%u len=%u) — expected protocol v%u", parsed.version,
+             parsed.payloadLength, (unsigned)kProtocolVersion);
         return false;
     }
-    outType = (MsgType)type;
-    outPayload.resize(len);
-    if (len > 0 && !ReadAll(g.sock, outPayload.data(), len)) return false;
+    outType = parsed.type;
+    outPayload.resize(parsed.payloadLength);
+    if (parsed.payloadLength > 0 && !RecvAll(g.sock, outPayload.data(), parsed.payloadLength))
+        return false;
     return true;
 }
 
 // --------------------------------------------------------------------------
 // Mach rendezvous: hand the parent a send right to our receive port, then
 // collect one IOSurface send right per slot. Parent-side is the mirror in
-// HevcEncoderHelperClient.mm. See EncoderHelperIpc.h for the ownership rules.
+// EncoderHelperClient.mm. See EncoderHelperIpc.h for the ownership rules.
 // --------------------------------------------------------------------------
 bool MachRendezvousAndReceiveSurfaces(const std::string& rendezvousName, uint32_t expectedSlots)
 {
@@ -314,6 +306,32 @@ void SendNal(uint64_t cookie, int64_t ptsNs, const uint8_t* body, size_t bodyLen
     SendMsg(MsgType::Nal, payload);
 }
 
+// VPS/SPS/PPS (HEVC) or SPS/PPS (H.264). The two live behind different
+// CoreMedia accessors, which is the only place the NAL path is codec-specific:
+// both emit the same Annex-B framing the runtime's in-process path emits.
+size_t ParameterSetCount(CMFormatDescriptionRef fd)
+{
+    size_t count = 0;
+    const OSStatus st =
+        g.codec == CodecCode::H264
+            ? CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fd, 0, nullptr, nullptr, &count,
+                                                                 nullptr)
+            : CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fd, 0, nullptr, nullptr, &count,
+                                                                 nullptr);
+    return st == noErr ? count : 0;
+}
+
+bool ParameterSetAt(CMFormatDescriptionRef fd, size_t index, const uint8_t** ps, size_t* psSize)
+{
+    const OSStatus st =
+        g.codec == CodecCode::H264
+            ? CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fd, index, ps, psSize, nullptr,
+                                                                 nullptr)
+            : CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fd, index, ps, psSize, nullptr,
+                                                                 nullptr);
+    return st == noErr && *ps != nullptr && *psSize > 0;
+}
+
 void EmitSampleNalUnits(CMSampleBufferRef sb, bool key, uint64_t cookie, int64_t ptsNs)
 {
     if (key)
@@ -321,16 +339,12 @@ void EmitSampleNalUnits(CMSampleBufferRef sb, bool key, uint64_t cookie, int64_t
         CMFormatDescriptionRef fd = CMSampleBufferGetFormatDescription(sb);
         if (fd != nullptr)
         {
-            size_t count = 0;
-            CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fd, 0, nullptr, nullptr, &count,
-                                                               nullptr);
+            const size_t count = ParameterSetCount(fd);
             for (size_t i = 0; i < count; ++i)
             {
                 const uint8_t* ps = nullptr;
                 size_t psSize = 0;
-                if (CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fd, i, &ps, &psSize, nullptr,
-                                                                       nullptr) == noErr &&
-                    ps != nullptr && psSize > 0)
+                if (ParameterSetAt(fd, i, &ps, &psSize))
                 {
                     SendNal(cookie, ptsNs, ps, psSize, true);
                 }
@@ -400,6 +414,23 @@ void SetNumberProp(VTCompressionSessionRef s, CFStringRef key, int32_t value)
     CFRelease(n);
 }
 
+CMVideoCodecType CodecType(CodecCode codec)
+{
+    return codec == CodecCode::H264 ? kCMVideoCodecType_H264 : kCMVideoCodecType_HEVC;
+}
+
+// Mirrors VideoToolboxProfileLevel() in runtime/src/VideoEncoder.mm — the helper
+// must request exactly the profile the runtime negotiated, never a substitute.
+CFStringRef ProfileLevel(CodecCode codec, ProfileCode profile)
+{
+    if (codec == CodecCode::H264)
+    {
+        return kVTProfileLevel_H264_Main_AutoLevel;
+    }
+    return profile == ProfileCode::Main10 ? kVTProfileLevel_HEVC_Main10_AutoLevel
+                                          : kVTProfileLevel_HEVC_Main_AutoLevel;
+}
+
 InitStatus CreateSession()
 {
     NSDictionary* spec = @{
@@ -409,19 +440,39 @@ InitStatus CreateSession()
 
     VTCompressionSessionRef s = nullptr;
     OSStatus st = VTCompressionSessionCreate(kCFAllocatorDefault, g.width, g.height,
-                                             kCMVideoCodecType_HEVC,
+                                             CodecType(g.codec),
                                              (__bridge CFDictionaryRef)spec, nullptr,
                                              kCFAllocatorDefault, CompressionCallback, nullptr, &s);
     if (st != noErr || s == nullptr)
     {
-        LOGE("VTCompressionSessionCreate(RequireHardware=YES) failed: %d", (int)st);
+        LOGE("VTCompressionSessionCreate(%s, RequireHardware=YES) failed: %d",
+             CodecName(g.codec), (int)st);
         return InitStatus::SessionCreateFailed;
     }
 
     VTSessionSetProperty(s, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
     VTSessionSetProperty(s, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
-    VTSessionSetProperty(s, kVTCompressionPropertyKey_ProfileLevel,
-                         kVTProfileLevel_HEVC_Main_AutoLevel);
+
+    // The same BT.709 colour contract as the in-process session, from the one
+    // shared definition, so both paths' bitstreams carry identical VUI colour
+    // descriptions and use the same RGB-to-YCbCr matrix (Main10 included).
+    const oxrsys::encoder_color::ApplyResult color =
+        oxrsys::encoder_color::ApplySessionColorProperties(s);
+    if (!color.ok())
+    {
+        LOGW("failed to apply complete BT.709 color metadata (primaries=%d transfer=%d matrix=%d)",
+             (int)color.primaries, (int)color.transferFunction, (int)color.yCbCrMatrix);
+    }
+    const OSStatus profileStatus = VTSessionSetProperty(
+        s, kVTCompressionPropertyKey_ProfileLevel, ProfileLevel(g.codec, g.profile));
+    if (profileStatus != noErr)
+    {
+        // Same contract as the in-process path: an unavailable profile is a
+        // downgrade to the encoder default, logged, not a failed session.
+        LOGW("profile for %s/%s unavailable (%d) — falling back to the encoder default",
+             CodecName(g.codec), g.profile == ProfileCode::Main10 ? "Main10" : "Main",
+             (int)profileStatus);
+    }
 
     if (g.preset == PresetCode::Speed)
         VTSessionSetProperty(s, kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality,
@@ -460,7 +511,8 @@ InitStatus CreateSession()
         usingHardware = CFBooleanGetValue(hwRef);
         CFRelease(hwRef);
     }
-    LOGI("VT session created %ux%u @%ufps %uMbps hardware=%s", g.width, g.height, g.fps,
+    LOGI("VT session created %s/%s %ux%u @%ufps %uMbps hardware=%s", CodecName(g.codec),
+         g.profile == ProfileCode::Main10 ? "Main10" : "Main", g.width, g.height, g.fps,
          g.bitrateMbps, usingHardware ? "YES" : "NO");
     return usingHardware ? InitStatus::Ok : InitStatus::HardwareUnavailable;
 }
@@ -512,6 +564,13 @@ int main(int argc, char** argv)
 {
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 
+    // This is our own process, so a process-wide SIG_IGN is fine here (unlike
+    // in the runtime dylib, which lives in the host's process). The host
+    // vanishing must end this helper through EOF, not a signal: that covers the
+    // control socket and also stderr, which is a pipe the host reads and may
+    // already have closed when our last log line is written.
+    signal(SIGPIPE, SIG_IGN);
+
     int sockFd = -1;
     std::string rendezvous;
     for (int i = 1; i < argc; ++i)
@@ -528,6 +587,8 @@ int main(int argc, char** argv)
         return 2;
     }
     g.sock = sockFd;
+    // Belt and braces with SIG_IGN above; the runtime also sets it on its end.
+    DisableSigPipe(sockFd);
     LOGI("started pid=%d socket-fd=%d rendezvous=%s", getpid(), sockFd, rendezvous.c_str());
 
     // 1. Read Init config from the socket.
@@ -539,21 +600,24 @@ int main(int argc, char** argv)
         return 3;
     }
     {
-        Reader r(payload.data(), payload.size());
-        g.width = r.U32();
-        g.height = r.U32();
-        g.fps = r.U32();
-        g.bitrateMbps = r.U32();
-        g.keyframeIntervalSec = r.U32();
-        g.slotCount = r.U32();
-        g.preset = (PresetCode)r.U32();
-        if (!r.ok() || g.slotCount == 0 || g.slotCount > kMaxSlots)
+        InitPayload init;
+        if (!DeserializeInit(payload.data(), payload.size(), init))
         {
-            LOGE("bad Init payload slotCount=%u", g.slotCount);
+            LOGE("bad Init payload (%zu bytes)", payload.size());
             return 3;
         }
+        g.width = init.width;
+        g.height = init.height;
+        g.fps = init.fps;
+        g.bitrateMbps = init.bitrateMbps;
+        g.keyframeIntervalSec = init.keyframeIntervalSec;
+        g.slotCount = init.slotCount;
+        g.preset = init.preset;
+        g.codec = init.codec;
+        g.profile = init.profile;
     }
-    LOGI("Init: %ux%u @%ufps %uMbps key=%us slots=%u preset=%u", g.width, g.height, g.fps,
+    LOGI("Init: %s/%s %ux%u @%ufps %uMbps key=%us slots=%u preset=%u", CodecName(g.codec),
+         g.profile == ProfileCode::Main10 ? "Main10" : "Main", g.width, g.height, g.fps,
          g.bitrateMbps, g.keyframeIntervalSec, g.slotCount, (uint32_t)g.preset);
 
     // 2. Mach rendezvous: receive the compose surfaces (zero-copy).
@@ -582,7 +646,7 @@ int main(int argc, char** argv)
              (uint32_t)status);
         return 4;
     }
-    LOGI("ready: hardware HEVC encoder live");
+    LOGI("ready: hardware %s encoder live", CodecName(g.codec));
 
     // 5. Encode loop.
     while (g.running.load())

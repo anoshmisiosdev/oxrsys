@@ -7,7 +7,9 @@
 #include <memory>
 #include <vector>
 #include <chrono>
+#include <atomic>
 #include <cstdint>
+#include <ctime>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -92,11 +94,16 @@ public:
     }
 
     XrTime GetCurrentTime() const;
+    // XR_KHR_convert_timespec_time helpers. CLOCK_MONOTONIC is captured at the
+    // same instant startTime_ is set (monoStartNs_), so XrTime == mono_ns -
+    // monoStartNs_ and the mapping is a pure offset consistent with GetCurrentTime().
+    XrTime TimespecToXrTime(const struct timespec& ts) const;
+    void XrTimeToTimespec(XrTime time, struct timespec& ts) const;
     void BeginDebugUtilsLabelRegion(const XrDebugUtilsLabelEXT& labelInfo);
     void EndDebugUtilsLabelRegion();
     void InsertDebugUtilsLabel(const XrDebugUtilsLabelEXT& labelInfo);
     void GetDebugUtilsLabels(std::vector<XrDebugUtilsLabelEXT>& labels, std::vector<std::string>& labelNames) const;
-    void Shutdown();
+    XrResult Shutdown();
 
 private:
     struct DebugUtilsLabelState
@@ -111,7 +118,17 @@ private:
     XrResult ValidateSwapchainSubImage(const XrSwapchainSubImage& subImage) const;
     XrResult ValidateProjectionLayer(const XrCompositionLayerProjection& layer,
                                      FrameSource& frameSource) const;
-    XrResult ValidateQuadLayer(const XrCompositionLayerQuad& layer) const;
+    // Re-expresses a quad layer's centre pose in the projection layer's space.
+    // Returns false when the two spaces cannot be related this frame.
+    static bool RelocateQuadPose(Space* quadSpace, const XrPosef& quadPose, Space* projectionSpace,
+                                 XrTime displayTime, const FrameSource& frameSource,
+                                 FramePose& outPose);
+    // Validates a quad layer and, on success, appends it to `outQuad` expressed
+    // in `projectionSpace` — the reference space the projection layer's views
+    // were submitted in, which is what the compositor projects against.
+    XrResult ValidateQuadLayer(const XrCompositionLayerQuad& layer, XrTime displayTime,
+                               Space* projectionSpace, const FrameSource& frameSource,
+                               FrameQuadLayer& outQuad) const;
 
     uint64_t handle_ = 0;
     Instance* instance_;
@@ -127,10 +144,22 @@ private:
 
     std::unique_ptr<InputManager> inputManager_;
     std::unique_ptr<StreamingServer> streamingServer_;
+    std::shared_ptr<std::atomic_bool> streamingSnapshotDemand_ =
+        std::make_shared<std::atomic_bool>(false);
+
+    // Head pose returned by the most recent xrLocateViews — the exact pose the application renders
+    // the current frame for. Captured here so the streamed frame is tagged with it at submission.
+    XrPosef lastRenderHeadPose_ = {{0, 0, 0, 1}, {0, 0, 0}};
+    bool lastRenderHasPose_ = false;
     std::vector<std::unique_ptr<Swapchain>> swapchains_;
+    mutable std::mutex swapchainsMutex_;
+    std::mutex shutdownMutex_;
+    std::atomic_bool teardownStarted_{false};
     std::vector<std::unique_ptr<Space>> spaces_;
 
     std::chrono::steady_clock::time_point startTime_;
+    // CLOCK_MONOTONIC nanoseconds sampled at the same instant as startTime_.
+    int64_t monoStartNs_ = 0;
     std::chrono::steady_clock::time_point lastFrameTime_;
 
     // Self-correcting absolute-deadline frame-pacing grid (see WaitFrame). Anchors
@@ -149,5 +178,5 @@ private:
     bool wiredActive_ = false;
     void StartStreamingIfNeeded();
     void CheckStreamingConnection();
-    void StopStreaming();
+    bool StopStreaming();
 };

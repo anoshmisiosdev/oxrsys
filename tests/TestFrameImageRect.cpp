@@ -51,8 +51,8 @@ TEST_CASE("A default FrameImageSource still covers the whole image")
 {
     FrameImageSource source = {};
 
-    CHECK(source.rect.IsEmpty());
-    CHECK(source.rect.CoversFullImage(1512, 1680));
+    CHECK(source.Rect().IsEmpty());
+    CHECK(source.Rect().CoversFullImage(1512, 1680));
 
     const FrameImageRect resolved = source.GetRect(1512, 1680);
     CHECK(resolved.offsetX == 0);
@@ -64,9 +64,9 @@ TEST_CASE("A default FrameImageSource still covers the whole image")
 TEST_CASE("A full-image rect resolves to the full image")
 {
     FrameImageSource source = {};
-    source.rect = FrameImageRectFromSubImage(MakeSubImage(0, 0, 1512, 1680));
+    source.SetRect(FrameImageRectFromSubImage(MakeSubImage(0, 0, 1512, 1680)));
 
-    CHECK(source.rect.CoversFullImage(1512, 1680));
+    CHECK(source.Rect().CoversFullImage(1512, 1680));
 
     const FrameImageRect resolved = source.GetRect(1512, 1680);
     CHECK(resolved.offsetX == 0);
@@ -80,12 +80,12 @@ TEST_CASE("An offset rect resolves to the requested sub-region")
     // The BasaultVR (UE4) case: one 3024x1680 side-by-side swapchain image
     // submitted twice, the left eye taking uMin 0..0.5 and the right 0.5..1.0.
     FrameImageSource left = {};
-    left.rect = FrameImageRectFromSubImage(MakeSubImage(0, 0, 1512, 1680));
+    left.SetRect(FrameImageRectFromSubImage(MakeSubImage(0, 0, 1512, 1680)));
     FrameImageSource right = {};
-    right.rect = FrameImageRectFromSubImage(MakeSubImage(1512, 0, 1512, 1680));
+    right.SetRect(FrameImageRectFromSubImage(MakeSubImage(1512, 0, 1512, 1680)));
 
-    CHECK_FALSE(left.rect.CoversFullImage(3024, 1680));
-    CHECK_FALSE(right.rect.CoversFullImage(3024, 1680));
+    CHECK_FALSE(left.Rect().CoversFullImage(3024, 1680));
+    CHECK_FALSE(right.Rect().CoversFullImage(3024, 1680));
 
     const FrameImageRect leftResolved = left.GetRect(3024, 1680);
     CHECK(leftResolved.offsetX == 0);
@@ -151,10 +151,10 @@ TEST_CASE("Resolving falls back to the full image for degenerate input")
 TEST_CASE("Resetting a FrameImageSource clears the rect")
 {
     FrameImageSource source = {};
-    source.rect = FrameImageRectFromSubImage(MakeSubImage(1512, 0, 1512, 1680));
+    source.SetRect(FrameImageRectFromSubImage(MakeSubImage(1512, 0, 1512, 1680)));
     source.Reset();
 
-    CHECK(source.rect.IsEmpty());
+    CHECK(source.Rect().IsEmpty());
     CHECK(source.GetRect(3024, 1680).width == 3024);
 }
 

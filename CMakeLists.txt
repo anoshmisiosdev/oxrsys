@@ -23,16 +23,36 @@ if(NOT "${OXRSYS_BUILD}" MATCHES "^[0-9]+$")
     message(FATAL_ERROR "OXRSYS_BUILD must be an integer in ${OXRSYS_VERSION_CONFIG_FILE}")
 endif()
 
+if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Darwin"
+        AND (NOT CMAKE_SYSTEM_NAME OR CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+        AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0" CACHE STRING
+        "Minimum supported macOS version" FORCE)
+endif()
+
 project(OXRSys VERSION "${OXRSYS_VERSION}" LANGUAGES C CXX)
+
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    message(FATAL_ERROR "OXRSys is a macOS-only OpenXR runtime")
+endif()
+
+foreach(oxrsys_removed_option IN ITEMS
+        OXRSYS_BUILD_QT_FRONTENDS
+        OXRSYS_VIDEO_ENCODER
+        OXRSYS_LIBVA_PROVIDER)
+    if(DEFINED ${oxrsys_removed_option})
+        message(FATAL_ERROR
+            "${oxrsys_removed_option} was removed from the macOS-only runtime"
+        )
+    endif()
+endforeach()
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-if(APPLE)
-    enable_language(OBJCXX)
-    set(CMAKE_OBJCXX_STANDARD 20)
-    set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
-endif()
+enable_language(OBJCXX)
+set(CMAKE_OBJCXX_STANDARD 20)
+set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
 enable_testing()
 
 execute_process(
@@ -105,6 +125,23 @@ if(CMAKE_OSX_ARCHITECTURES AND NOT CMAKE_OSX_ARCHITECTURES STREQUAL CMAKE_HOST_S
 endif()
 add_subdirectory(drivers)
 
+# Header-only Vulkan discovery. OXRSys must use the application's Vulkan
+# dispatch and therefore intentionally does not link a Vulkan loader.
+find_path(OXRSYS_VULKAN_INCLUDE_DIR
+    NAMES vulkan/vulkan.h
+    HINTS
+        "$ENV{VULKAN_SDK}"
+        /opt/homebrew
+        /usr/local
+    PATH_SUFFIXES include Include
+    REQUIRED
+)
+add_library(oxrsys_vulkan_headers INTERFACE)
+target_include_directories(oxrsys_vulkan_headers INTERFACE
+    "${OXRSYS_VULKAN_INCLUDE_DIR}"
+)
+add_library(OXRSYS::VulkanHeaders ALIAS oxrsys_vulkan_headers)
+
 # --- Our runtime ---
 add_subdirectory(runtime)
 
@@ -115,8 +152,6 @@ add_subdirectory(runtime)
 if(APPLE AND OXRSYS_BUILD_WMR_DRIVER AND NOT OXRSYS_WMR_CROSS_ARCH)
     add_subdirectory(runtime/headset_helper)
 endif()
-
-find_package(Vulkan REQUIRED)
 
 add_custom_target(oxrsys_runtime_sync_compile_commands ALL
     COMMAND ${CMAKE_COMMAND}
@@ -129,20 +164,9 @@ add_custom_target(oxrsys_runtime_sync_compile_commands ALL
 # --- Tests ---
 set(OXRSYS_TEST_ENV_ROOT "${CMAKE_BINARY_DIR}/test-env")
 set(OXRSYS_TEST_HOME "${OXRSYS_TEST_ENV_ROOT}/home")
-set(OXRSYS_TEST_XDG_CONFIG_HOME "${OXRSYS_TEST_ENV_ROOT}/xdg-config")
-set(OXRSYS_TEST_XDG_STATE_HOME "${OXRSYS_TEST_ENV_ROOT}/xdg-state")
-set(OXRSYS_TEST_APPDATA "${OXRSYS_TEST_ENV_ROOT}/appdata")
-file(MAKE_DIRECTORY
-    "${OXRSYS_TEST_HOME}"
-    "${OXRSYS_TEST_XDG_CONFIG_HOME}"
-    "${OXRSYS_TEST_XDG_STATE_HOME}"
-    "${OXRSYS_TEST_APPDATA}"
-)
+file(MAKE_DIRECTORY "${OXRSYS_TEST_HOME}")
 set(OXRSYS_ISOLATED_TEST_ENV
     "HOME=${OXRSYS_TEST_HOME}"
-    "XDG_CONFIG_HOME=${OXRSYS_TEST_XDG_CONFIG_HOME}"
-    "XDG_STATE_HOME=${OXRSYS_TEST_XDG_STATE_HOME}"
-    "APPDATA=${OXRSYS_TEST_APPDATA}"
 )
 
 set(OXRSYS_LOGCAT_TEST_HOME "${OXRSYS_TEST_ENV_ROOT}/home-logcat")
@@ -168,50 +192,60 @@ file(CHMOD "${OXRSYS_FAKE_ADB}"
 )
 set(OXRSYS_LOGCAT_TEST_ENV
     "HOME=${OXRSYS_LOGCAT_TEST_HOME}"
-    "XDG_CONFIG_HOME=${OXRSYS_TEST_XDG_CONFIG_HOME}"
-    "XDG_STATE_HOME=${OXRSYS_TEST_XDG_STATE_HOME}"
-    "APPDATA=${OXRSYS_TEST_APPDATA}"
     "OXRSYS_ADB_PATH=${OXRSYS_FAKE_ADB}"
 )
 
 add_executable(oxrsys_runtime_tests
+    tests/TestBoundedDrain.cpp
+    tests/TestClientLiveness.cpp
     tests/TestConfig.cpp
+    tests/TestControllerVelocity.cpp
+    tests/TestEncoderHelperIpc.cpp
+    tests/TestEncoderPathPolicy.cpp
     tests/TestFrameImageRect.cpp
     tests/TestInputManager.cpp
     tests/TestRuntimePlatform.cpp
     tests/TestStreamingAbr.cpp
     tests/TestStreamingFrameQueue.cpp
+    tests/TestStreamingReconfigure.cpp
+    tests/TestSnapshotLeasePool.cpp
+    tests/TestSwapchainCreateValidation.cpp
+    tests/TestVideoCodecSelection.cpp
+    tests/TestVideoTextureFormat.cpp
     tests/TestVulkanDispatch.cpp
+    tests/TestCompositionLayerAlpha.cpp
     tests/TestProtocolLayout.cpp
+    tests/TestQuestPassthroughAlphaPolicy.cpp
     tests/TestQuestShellInteraction.cpp
-    clients/Android/android-vr/app/src/main/cpp/QuestShellInteraction.cpp
+    tests/TestQuadLayerProjection.cpp
+    clients/android-vr/app/src/main/cpp/QuestPassthroughAlphaPolicy.cpp
+    clients/android-vr/app/src/main/cpp/QuestShellInteraction.cpp
     runtime/src/InputManager.cpp
     runtime/src/TrackingReceiver.cpp
     runtime/src/Config.cpp
     runtime/src/RuntimePlatform.cpp
     runtime/src/RuntimeSockets.cpp
     runtime/src/StreamingFrameQueue.cpp
+    runtime/src/VideoCodecSelection.cpp
+    runtime/src/EncoderPathPolicy.cpp
     runtime/src/VulkanDispatch.cpp
 )
 target_include_directories(oxrsys_runtime_tests PRIVATE
     runtime/src
-    clients/Android/android-vr/app/src/main/cpp
+    runtime/encoder_helper
+    clients/android-vr/app/src/main/cpp
     common/protocol/include
     ${openxr_SOURCE_DIR}/include
-    ${Vulkan_INCLUDE_DIRS}
 )
 target_link_libraries(oxrsys_runtime_tests PRIVATE
     Catch2::Catch2WithMain
     glm::glm
     spdlog::spdlog
+    OXRSYS::VulkanHeaders
     ${CMAKE_DL_LIBS}
 )
-if(APPLE)
-    target_compile_definitions(oxrsys_runtime_tests PRIVATE
-        XR_USE_GRAPHICS_API_METAL
-    )
-endif()
 target_compile_definitions(oxrsys_runtime_tests PRIVATE
+    XR_USE_GRAPHICS_API_METAL
     XR_USE_GRAPHICS_API_VULKAN
 )
 add_test(NAME oxrsys_runtime_tests COMMAND oxrsys_runtime_tests)
@@ -248,44 +282,136 @@ set_tests_properties(oxrsys_runtime_status_tests PROPERTIES
     TIMEOUT 120
 )
 
+add_executable(oxrsys_runtime_loader_extension_tests
+    tests/TestRuntimeLoaderExtensions.cpp
+)
+target_include_directories(oxrsys_runtime_loader_extension_tests PRIVATE
+    ${openxr_SOURCE_DIR}/include
+)
+target_link_libraries(oxrsys_runtime_loader_extension_tests PRIVATE
+    Catch2::Catch2WithMain
+    OpenXR::openxr_loader
+)
+add_dependencies(oxrsys_runtime_loader_extension_tests oxrsys_runtime)
+add_test(NAME oxrsys_runtime_loader_extension_tests
+    COMMAND oxrsys_runtime_loader_extension_tests
+)
+set_tests_properties(oxrsys_runtime_loader_extension_tests PROPERTIES
+    ENVIRONMENT
+        "HOME=${OXRSYS_TEST_HOME};XR_RUNTIME_JSON=$<TARGET_FILE_DIR:oxrsys_runtime>/oxrsys-runtime.json"
+    TIMEOUT 120
+)
+
 set(OXRSYS_RUNTIME_TEST_TARGETS
     oxrsys_runtime
     oxrsys_runtime_tests
     oxrsys_runtime_status_tests
+    oxrsys_runtime_loader_extension_tests
 )
 
-if(APPLE)
-    add_executable(oxrsys_runtime_api_tests
-        tests/TestRuntimeApi.cpp
-        tests/TestMetalSupport.mm
-        tests/TestFrameImageRectMetal.mm
-    )
-    target_include_directories(oxrsys_runtime_api_tests PRIVATE
-        runtime/src
-        ${openxr_SOURCE_DIR}/include
-    )
-    target_link_libraries(oxrsys_runtime_api_tests PRIVATE
-        Catch2::Catch2WithMain
-        OpenXR::openxr_loader
-        "-framework Metal"
-        "-framework MetalPerformanceShaders"
-        "-framework Foundation"
-    )
-    target_compile_definitions(oxrsys_runtime_api_tests PRIVATE
-        XR_USE_GRAPHICS_API_METAL
-        OXRSYS_VERSION_MAJOR=${OXRSYS_VERSION_MAJOR}
-        OXRSYS_VERSION_MINOR=${OXRSYS_VERSION_MINOR}
-        OXRSYS_VERSION_PATCH=${OXRSYS_VERSION_PATCH}
-    )
-    add_dependencies(oxrsys_runtime_api_tests oxrsys_runtime)
-    add_test(NAME oxrsys_runtime_api_tests COMMAND oxrsys_runtime_api_tests)
-    set_tests_properties(oxrsys_runtime_api_tests PROPERTIES
-        ENVIRONMENT
-            "HOME=${OXRSYS_TEST_HOME};XDG_CONFIG_HOME=${OXRSYS_TEST_XDG_CONFIG_HOME};XDG_STATE_HOME=${OXRSYS_TEST_XDG_STATE_HOME};APPDATA=${OXRSYS_TEST_APPDATA};XR_RUNTIME_JSON=$<TARGET_FILE_DIR:oxrsys_runtime>/oxrsys-runtime.json"
-        TIMEOUT 120
-    )
-    list(APPEND OXRSYS_RUNTIME_TEST_TARGETS oxrsys_runtime_api_tests)
-endif()
+add_executable(oxrsys_runtime_api_tests
+    tests/TestRuntimeApi.cpp
+    tests/TestMetalSupport.mm
+    tests/TestFrameImageRectMetal.mm
+)
+target_include_directories(oxrsys_runtime_api_tests PRIVATE
+    runtime/src
+    ${openxr_SOURCE_DIR}/include
+)
+target_link_libraries(oxrsys_runtime_api_tests PRIVATE
+    Catch2::Catch2WithMain
+    OpenXR::openxr_loader
+    "-framework Metal"
+    "-framework MetalPerformanceShaders"
+    "-framework Foundation"
+)
+target_compile_definitions(oxrsys_runtime_api_tests PRIVATE
+    XR_USE_GRAPHICS_API_METAL
+    OXRSYS_VERSION_MAJOR=${OXRSYS_VERSION_MAJOR}
+    OXRSYS_VERSION_MINOR=${OXRSYS_VERSION_MINOR}
+    OXRSYS_VERSION_PATCH=${OXRSYS_VERSION_PATCH}
+)
+add_dependencies(oxrsys_runtime_api_tests oxrsys_runtime)
+add_test(NAME oxrsys_runtime_api_tests COMMAND oxrsys_runtime_api_tests)
+set_tests_properties(oxrsys_runtime_api_tests PROPERTIES
+    ENVIRONMENT
+        "HOME=${OXRSYS_TEST_HOME};XR_RUNTIME_JSON=$<TARGET_FILE_DIR:oxrsys_runtime>/oxrsys-runtime.json"
+    TIMEOUT 120
+)
+list(APPEND OXRSYS_RUNTIME_TEST_TARGETS oxrsys_runtime_api_tests)
+
+add_executable(oxrsys_quad_layer_metal_tests
+    tests/TestQuadLayerMetal.mm
+    runtime/src/QuadLayerRenderer.mm
+)
+target_include_directories(oxrsys_quad_layer_metal_tests PRIVATE
+    runtime/src
+    common/protocol/include
+    ${openxr_SOURCE_DIR}/include
+)
+target_link_libraries(oxrsys_quad_layer_metal_tests PRIVATE
+    Catch2::Catch2WithMain
+    glm::glm
+    spdlog::spdlog
+    "-framework Metal"
+    "-framework Foundation"
+)
+target_compile_definitions(oxrsys_quad_layer_metal_tests PRIVATE
+    XR_USE_GRAPHICS_API_METAL
+)
+add_test(NAME oxrsys_quad_layer_metal_tests COMMAND oxrsys_quad_layer_metal_tests)
+set_tests_properties(oxrsys_quad_layer_metal_tests PROPERTIES
+    ENVIRONMENT "${OXRSYS_ISOLATED_TEST_ENV}"
+    TIMEOUT 60
+)
+list(APPEND OXRSYS_RUNTIME_TEST_TARGETS oxrsys_quad_layer_metal_tests)
+
+add_executable(oxrsys_videotoolbox_encoder_tests
+    tests/TestVideoToolboxEncoder.mm
+    tests/TestEncoderHelperClient.mm
+    runtime/src/VideoEncoder.mm
+    runtime/src/EncoderHelperClient.mm
+    runtime/src/EncoderPathPolicy.cpp
+    runtime/src/QuadLayerRenderer.mm
+    runtime/src/Config.cpp
+    runtime/src/RuntimePlatform.cpp
+)
+target_include_directories(oxrsys_videotoolbox_encoder_tests PRIVATE
+    runtime/src
+    runtime/encoder_helper
+    common/protocol/include
+    ${openxr_SOURCE_DIR}/include
+)
+target_link_libraries(oxrsys_videotoolbox_encoder_tests PRIVATE
+    Catch2::Catch2WithMain
+    glm::glm
+    spdlog::spdlog
+    "-framework Metal"
+    "-framework MetalPerformanceShaders"
+    "-framework Foundation"
+    "-framework VideoToolbox"
+    "-framework CoreMedia"
+    "-framework CoreVideo"
+    "-framework IOSurface"
+)
+target_compile_definitions(oxrsys_videotoolbox_encoder_tests PRIVATE
+    XR_USE_GRAPHICS_API_METAL
+    OXRSYS_VERSION_MAJOR=${OXRSYS_VERSION_MAJOR}
+    OXRSYS_VERSION_MINOR=${OXRSYS_VERSION_MINOR}
+    OXRSYS_VERSION_PATCH=${OXRSYS_VERSION_PATCH}
+)
+add_test(NAME oxrsys_videotoolbox_encoder_tests
+    COMMAND oxrsys_videotoolbox_encoder_tests
+)
+# The encoder tests drive the build's own native-arm64 helper, wherever the
+# runtime dylib that would normally sit beside it is.
+add_dependencies(oxrsys_videotoolbox_encoder_tests oxrsys-encoder-helper)
+set_tests_properties(oxrsys_videotoolbox_encoder_tests PROPERTIES
+    ENVIRONMENT
+        "${OXRSYS_ISOLATED_TEST_ENV};OXRSYS_ENCODER_HELPER_PATH=$<TARGET_FILE:oxrsys-encoder-helper>"
+    TIMEOUT 60
+)
+list(APPEND OXRSYS_RUNTIME_TEST_TARGETS oxrsys_videotoolbox_encoder_tests)
 
 add_dependencies(oxrsys_runtime_sync_compile_commands
     ${OXRSYS_RUNTIME_TEST_TARGETS}
@@ -293,41 +419,12 @@ add_dependencies(oxrsys_runtime_sync_compile_commands
 
 option(OXRSYS_ENABLE_CTS "Fetch and wire an opt-in OpenXR CTS lane" OFF)
 
-set(OXRSYS_BUILD_QT_FRONTENDS "AUTO" CACHE STRING "Build Qt frontends: AUTO, ON, or OFF")
-set_property(CACHE OXRSYS_BUILD_QT_FRONTENDS PROPERTY STRINGS AUTO ON OFF)
-string(TOUPPER "${OXRSYS_BUILD_QT_FRONTENDS}" OXRSYS_BUILD_QT_FRONTENDS_NORMALIZED)
-if(NOT OXRSYS_BUILD_QT_FRONTENDS_NORMALIZED MATCHES "^(AUTO|ON|OFF)$")
-    message(FATAL_ERROR "OXRSYS_BUILD_QT_FRONTENDS must be AUTO, ON, or OFF")
-endif()
-
-set(OXRSYS_QT_FRONTENDS_ENABLED OFF)
-if(OXRSYS_BUILD_QT_FRONTENDS_NORMALIZED STREQUAL "ON")
-    set(OXRSYS_QT_FRONTENDS_ENABLED ON)
-elseif(OXRSYS_BUILD_QT_FRONTENDS_NORMALIZED STREQUAL "AUTO" AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    include(${CMAKE_CURRENT_SOURCE_DIR}/clients/Qt/cmake/DetectQt6.cmake)
-    find_package(Qt6 QUIET COMPONENTS Core Widgets Network)
-    if(Qt6_FOUND)
-        set(OXRSYS_QT_FRONTENDS_ENABLED ON)
-    else()
-        message(STATUS "Qt6 was not found; skipping Qt frontends in AUTO mode")
-    endif()
-endif()
-
-if(OXRSYS_QT_FRONTENDS_ENABLED)
-    include(${CMAKE_CURRENT_SOURCE_DIR}/clients/Qt/cmake/DetectQt6.cmake)
-    find_package(Qt6 REQUIRED COMPONENTS Core Widgets Network)
-    set(OXRSYS_PROTOCOL_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/common/protocol/include")
-    add_subdirectory(clients/Qt)
-endif()
-
-if(APPLE)
-    add_custom_target(oxrsys_runtime_set_default_runtime
-        COMMAND /bin/zsh ${CMAKE_CURRENT_SOURCE_DIR}/scripts/oxrsys_runtime_default.sh set $<TARGET_FILE_DIR:oxrsys_runtime>/oxrsys-runtime.json
-        DEPENDS oxrsys_runtime
-        USES_TERMINAL
-        COMMENT "Registering the generated OpenXR manifest as the default runtime for this user"
-    )
-endif()
+add_custom_target(oxrsys_runtime_set_default_runtime
+    COMMAND /bin/zsh ${CMAKE_CURRENT_SOURCE_DIR}/scripts/oxrsys_runtime_default.sh set $<TARGET_FILE_DIR:oxrsys_runtime>/oxrsys-runtime.json
+    DEPENDS oxrsys_runtime
+    USES_TERMINAL
+    COMMENT "Registering the generated OpenXR manifest as the default runtime for this user"
+)
 
 if(OXRSYS_ENABLE_CTS)
     include(ExternalProject)
@@ -339,6 +436,39 @@ if(OXRSYS_ENABLE_CTS)
     set(OXRSYS_CTS_SOURCE_DIR "${OXRSYS_CTS_PREFIX_DIR}/source")
     set(OXRSYS_CTS_BINARY_DIR "${OXRSYS_CTS_PREFIX_DIR}/build")
     set(OXRSYS_CTS_REPORT_DIR "${CMAKE_BINARY_DIR}/reports/openxr-cts")
+    set(OXRSYS_CTS_CMAKE_ARGS
+        -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
+    )
+    if(APPLE)
+        execute_process(
+            COMMAND xcrun --find metal
+            RESULT_VARIABLE OXRSYS_CTS_METAL_RESULT
+            OUTPUT_VARIABLE OXRSYS_CTS_METAL_EXECUTABLE
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET
+        )
+        if(OXRSYS_CTS_METAL_RESULT EQUAL 0 AND OXRSYS_CTS_METAL_EXECUTABLE)
+            set(MetalTools_METAL_EXECUTABLE "${OXRSYS_CTS_METAL_EXECUTABLE}" CACHE FILEPATH "Path to the Apple metal compiler" FORCE)
+        endif()
+        execute_process(
+            COMMAND xcrun --find metallib
+            RESULT_VARIABLE OXRSYS_CTS_METALLIB_RESULT
+            OUTPUT_VARIABLE OXRSYS_CTS_METALLIB_EXECUTABLE
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET
+        )
+        if(OXRSYS_CTS_METALLIB_RESULT EQUAL 0 AND OXRSYS_CTS_METALLIB_EXECUTABLE)
+            set(MetalTools_METALLIB_EXECUTABLE "${OXRSYS_CTS_METALLIB_EXECUTABLE}" CACHE FILEPATH "Path to the Apple metallib compiler" FORCE)
+        endif()
+        if(MetalTools_METAL_EXECUTABLE AND MetalTools_METALLIB_EXECUTABLE)
+            list(APPEND OXRSYS_CTS_CMAKE_ARGS
+                -DMetalTools_METAL_EXECUTABLE=${MetalTools_METAL_EXECUTABLE}
+                -DMetalTools_METALLIB_EXECUTABLE=${MetalTools_METALLIB_EXECUTABLE}
+            )
+        else()
+            message(WARNING "Could not resolve metal and metallib with xcrun; install the Xcode Metal Toolchain before running the CTS Metal target.")
+        endif()
+    endif()
 
     ExternalProject_Add(openxr_cts
         GIT_REPOSITORY https://github.com/KhronosGroup/OpenXR-CTS.git
@@ -348,7 +478,7 @@ if(OXRSYS_ENABLE_CTS)
         SOURCE_DIR "${OXRSYS_CTS_SOURCE_DIR}"
         BINARY_DIR "${OXRSYS_CTS_BINARY_DIR}"
         CMAKE_ARGS
-            -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
+            ${OXRSYS_CTS_CMAKE_ARGS}
         UPDATE_DISCONNECTED ON
         INSTALL_COMMAND ""
         EXCLUDE_FROM_ALL ON

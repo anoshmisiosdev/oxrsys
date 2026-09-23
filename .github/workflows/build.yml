@@ -1,0 +1,210 @@
+# SPDX-License-Identifier: MPL-2.0
+name: Build & Test
+
+on:
+  push:
+    branches: [main, develop, 'ci/**']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  runtime:
+    name: Runtime (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-26
+            preset: macos-arm64
+            arch: arm64
+          - runner: macos-26-intel
+            preset: macos-x64
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Enforce macOS-only source layout
+        run: |
+          removed_paths=(
+            clients/Apple
+            clients/Android
+            clients/Qt
+            clients/android-vr/gradlew.bat
+            runtime/src/SwapchainOpenGL.cpp
+            runtime/src/SwapchainD3D11.cpp
+            runtime/src/SwapchainD3D12.cpp
+            runtime/src/D3DGraphicsContext.h
+            runtime/src/MediaFoundationVideoEncoder.cpp
+            runtime/src/VaapiVideoEncoder.cpp
+            runtime/src/StubVideoEncoder.cpp
+            runtime/src/VideoFramePreparation.cpp
+            runtime/src/VideoFramePreparation.h
+            runtime/src/VideoBitstream.cpp
+            runtime/src/VideoBitstream.h
+            tests/TestWindowsD3D.cpp
+            tests/TestNativeVideoEncoderSmoke.cpp
+            tests/TestVideoFramePreparation.cpp
+            tests/TestVideoBitstream.cpp
+          )
+          for removed_path in "${removed_paths[@]}"; do
+            if [[ ( -e "${removed_path}" || -L "${removed_path}" ) && \
+                -n "$(git ls-files -- "${removed_path}")" ]]; then
+              echo "Removed platform surface is still present: ${removed_path}" >&2
+              exit 1
+            fi
+          done
+          mkdir -p build
+          if cmake -S . -B build/removed-option-check \
+              -DOXRSYS_VIDEO_ENCODER=VIDEOTOOLBOX >build/removed-option-check.log 2>&1; then
+            echo 'Removed CMake options must fail configuration.' >&2
+            exit 1
+          fi
+          if ! rg -q 'OXRSYS_VIDEO_ENCODER was removed' build/removed-option-check.log; then
+            cat build/removed-option-check.log
+            exit 1
+          fi
+      - name: Install build dependencies
+        run: brew install ninja vulkan-headers
+      - name: Cache third-party sources
+        uses: actions/cache@v4
+        with:
+          path: build/${{ matrix.preset }}/_deps
+          key: deps-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('CMakeLists.txt', 'runtime/CMakeLists.txt', 'cmake/**') }}
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }}
+      - name: Build
+        run: cmake --build build/${{ matrix.preset }}
+      - name: Test
+        run: ctest --test-dir build/${{ matrix.preset }} --output-on-failure
+      - name: Build and test Home
+        run: >-
+          xcodebuild
+          -project "clients/home/OXRSys Home.xcodeproj"
+          -scheme "OXRSys Home"
+          -configuration Debug
+          -destination 'platform=macOS'
+          -derivedDataPath "build/xcode/home-${{ matrix.arch }}"
+          ARCHS=${{ matrix.arch }}
+          ONLY_ACTIVE_ARCH=NO
+          CODE_SIGNING_ALLOWED=NO
+          test
+      - name: Build simulator for macOS
+        run: >-
+          xcodebuild
+          -project "clients/simulator/OXRSys Simulator.xcodeproj"
+          -scheme "OXRSys Simulator"
+          -configuration Debug
+          -destination 'platform=macOS'
+          -derivedDataPath "build/xcode/simulator-${{ matrix.arch }}"
+          ARCHS=${{ matrix.arch }}
+          ONLY_ACTIVE_ARCH=NO
+          CODE_SIGNING_ALLOWED=NO
+          build
+
+  apple-clients:
+    name: Apple clients
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Enforce platform UI boundaries
+        run: |
+          if rg -n '^import AppKit' clients --glob '*.swift' | rg -v '/Platform/macOS/'; then
+            echo 'AppKit imports must stay under Platform/macOS.' >&2
+            exit 1
+          fi
+          if rg -n '^import UIKit' clients --glob '*.swift' | rg -v '/Platform/iOS/'; then
+            echo 'UIKit imports must stay under Platform/iOS.' >&2
+            exit 1
+          fi
+      - name: Test shared streaming package
+        run: swift test --package-path clients/shared/OXRSysStreaming
+      - name: Build shared simulator package
+        run: swift build --package-path clients/shared/OXRSysSimulator
+      - name: Build simulator for iOS Simulator
+        run: >-
+          xcodebuild
+          -project "clients/simulator/OXRSys Simulator.xcodeproj"
+          -scheme "OXRSys Simulator"
+          -configuration Debug
+          -destination 'generic/platform=iOS Simulator'
+          -derivedDataPath build/xcode/simulator-ios
+          CODE_SIGNING_ALLOWED=NO
+          build
+      - name: Build simulator for iOS device
+        run: >-
+          xcodebuild
+          -project "clients/simulator/OXRSys Simulator.xcodeproj"
+          -scheme "OXRSys Simulator"
+          -configuration Debug
+          -destination 'generic/platform=iOS'
+          -derivedDataPath build/xcode/simulator-ios-device
+          CODE_SIGNING_ALLOWED=NO
+          build
+      - name: Build visionOS viewer
+        run: >-
+          xcodebuild
+          -project "clients/visionos/OXRSys visionOS.xcodeproj"
+          -scheme "OXRSys visionOS"
+          -configuration Debug
+          -destination 'generic/platform=visionOS Simulator'
+          -derivedDataPath build/xcode/visionos
+          CODE_SIGNING_ALLOWED=NO
+          build
+      - name: Build visionOS viewer for device
+        run: >-
+          xcodebuild
+          -project "clients/visionos/OXRSys visionOS.xcodeproj"
+          -scheme "OXRSys visionOS"
+          -configuration Debug
+          -destination 'generic/platform=visionOS'
+          -derivedDataPath build/xcode/visionos-device
+          CODE_SIGNING_ALLOWED=NO
+          build
+
+  android-client:
+    name: Android VR client
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+          cache-dependency-path: clients/android-vr/**/*.gradle*
+      - uses: android-actions/setup-android@v3
+      - name: Install Android build components
+        run: >-
+          sdkmanager
+          'platforms;android-35'
+          'build-tools;35.0.0'
+          'cmake;3.22.1'
+          'ndk;28.2.13676358'
+      - name: Build stable APKs
+        working-directory: clients/android-vr
+        run: ./gradlew assembleDebug assembleRelease
+
+  package:
+    name: Universal macOS package
+    runs-on: macos-26
+    needs: [runtime, apple-clients]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: brew install ninja vulkan-headers
+      - name: Build universal package
+        run: >-
+          ./scripts/macos_build_package.sh
+          --configuration Release
+          --architectures universal
+          --output-dir build/OXRSys-macOS-Release
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: OXRSys-macOS-universal
+          path: build/OXRSys-macOS-Release
+          if-no-files-found: error

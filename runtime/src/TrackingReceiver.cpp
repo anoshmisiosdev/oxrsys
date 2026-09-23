@@ -2,6 +2,8 @@
 
 #include "TrackingReceiver.h"
 
+#include "VelocityMath.h"
+
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
@@ -353,11 +355,13 @@ bool TrackingReceiver::GetPredictedPose(oxr::protocol::TrackingPacket& outPacket
         // displacement (what previously overshot as "world moves when I look").
         spdlog::info("TrackingReceiver: prediction horizon={:.1f}ms head_ang_vel={} "
                      "ang_speed={:.2f}rad/s lin_speed={:.3f}m/s pos_horizon={:.2f}ms "
-                     "(scale={:.2f}) rot_horizon={:.2f}ms (scale={:.2f}) predicted_disp={:.1f}mm",
+                     "(scale={:.2f}) rot_horizon={:.2f}ms (scale={:.2f}) predicted_disp={:.1f}mm "
+                     "reordered_dropped={}",
                      horizonMs, hasHeadAngularVelocity ? "yes" : "no", headAngularSpeed,
                      headReportedSpeed, headPositionHorizonSeconds * 1000.0f, couplingScale,
                      headRotationHorizonSeconds * 1000.0f, rotScale,
-                     std::min(headReportedSpeed, 3.0f) * headPositionHorizonSeconds * 1000.0f);
+                     std::min(headReportedSpeed, 3.0f) * headPositionHorizonSeconds * 1000.0f,
+                     reorderedDropCount_.load());
     }
 
     StoreVec3(outPacket.headPosition,
@@ -433,6 +437,23 @@ void TrackingReceiver::StorePacket(const oxr::protocol::TrackingPacket& packet, 
 
     {
         std::lock_guard<std::mutex> lock(poseMutex_);
+
+        // Drop out-of-order / duplicate tracking packets. UDP reorders packets freely over Wi-Fi,
+        // and the client stamps each sample with a monotonically increasing timestamp. If a packet
+        // arrives with a timestamp at or before the latest stored one, accepting it would put a
+        // backward sample at the head of the history; finite-difference prediction would then read
+        // a reversed delta over a tiny receive-time gap and emit a large bogus angular velocity.
+        // That is the cause of per-frame render-pose jumps (the head-rotation jitter): the runtime
+        // renders the app from a pose that jumps several degrees while the real head moved a
+        // fraction of a degree. Ordering by client timestamp keeps the history strictly forward in
+        // time. Packets without a timestamp (0) cannot be ordered, so they are always accepted.
+        if (hasData_.load() && packet.timestampNs > 0 && latestPacket_.timestampNs > 0 &&
+            packet.timestampNs <= latestPacket_.timestampNs)
+        {
+            reorderedDropCount_.fetch_add(1);
+            return;
+        }
+
         const glm::quat* headReference = nullptr;
         const glm::quat* leftControllerReference = nullptr;
         const glm::quat* rightControllerReference = nullptr;
@@ -483,7 +504,9 @@ bool TrackingReceiver::GetRawControllerVelocity(bool leftHand, glm::vec3& linear
         : oxr::protocol::TRACKING_FLAG_RIGHT_CONTROLLER_ACTIVE;
 
     // The two most recent samples that both have this controller active, so the finite
-    // difference spans real tracked motion and never straddles an inactivity gap.
+    // difference spans real tracked motion and never straddles an inactivity gap. If the
+    // controller went inactive between the two newest active samples, the chain is broken and we
+    // report nothing rather than a bogus delta spanning the gap.
     const HistorySample* newer = nullptr;
     const HistorySample* older = nullptr;
     for (auto it = history_.rbegin(); it != history_.rend(); ++it)
@@ -510,8 +533,17 @@ bool TrackingReceiver::GetRawControllerVelocity(bool leftHand, glm::vec3& linear
         return false;
     }
 
-    const double dt = static_cast<double>(newer->receiveTimeNs - older->receiveTimeNs) / 1e9;
-    if (dt <= 1e-4 || dt > 0.1) // reject duplicate/stale (dropped-packet) pairs
+    // Prefer the client's own sample clock (same convention as GetPredictedPose); fall back to
+    // host receive time for clients that do not stamp packets. Unlike prediction we do NOT fall
+    // back on a non-positive packet delta: a duplicate or backwards pair means we do not know the
+    // interval, and reporting no velocity is strictly better than reporting a fabricated one.
+    const int64_t deltaNs =
+        (newer->packet.timestampNs > 0 && older->packet.timestampNs > 0)
+            ? (newer->packet.timestampNs - older->packet.timestampNs)
+            : (newer->receiveTimeNs - older->receiveTimeNs);
+
+    const double dt = static_cast<double>(deltaNs) / 1e9;
+    if (!oxrsys::velocity::IsUsableSampleInterval(dt)) // duplicate, backwards or stale pair
     {
         return false;
     }
@@ -521,24 +553,21 @@ bool TrackingReceiver::GetRawControllerVelocity(bool leftHand, glm::vec3& linear
     const float* newerRot = leftHand ? newer->packet.leftControllerRot : newer->packet.rightControllerRot;
     const float* olderRot = leftHand ? older->packet.leftControllerRot : older->packet.rightControllerRot;
 
-    linearVelocity = (LoadVec3(newerPos) - LoadVec3(olderPos)) / static_cast<float>(dt);
+    // Plain two-point finite difference: this reports the instantaneous peak. Do not smooth or
+    // average in more samples here — that clips exactly the spike punch/throw detection looks for.
+    linearVelocity = oxrsys::velocity::FiniteDifferenceLinearVelocity(LoadVec3(newerPos),
+                                                                     LoadVec3(olderPos), dt);
+    angularVelocity = oxrsys::velocity::FiniteDifferenceAngularVelocity(LoadQuat(newerRot),
+                                                                       LoadQuat(olderRot), dt);
 
-    // Angular velocity from the delta rotation q_delta = q_new * inverse(q_old), taken as
-    // an axis-angle over dt (shortest arc).
-    glm::quat delta = LoadQuat(newerRot) * glm::inverse(LoadQuat(olderRot));
-    if (delta.w < 0.0f)
+    // One line per hand for the lifetime of the receiver — enough to confirm in a log that
+    // XrSpaceVelocity is live, cheap enough to sit on the per-frame path.
+    const uint32_t handBit = leftHand ? 0x1u : 0x2u;
+    if ((velocityLoggedHands_.fetch_or(handBit) & handBit) == 0)
     {
-        delta = -delta;
-    }
-    const glm::vec3 axis = glm::axis(delta);
-    const float angle = glm::angle(delta); // [0, pi]
-    if (angle > 1e-5f && glm::length(axis) > 1e-5f)
-    {
-        angularVelocity = glm::normalize(axis) * (angle / static_cast<float>(dt));
-    }
-    else
-    {
-        angularVelocity = glm::vec3(0.0f);
+        spdlog::info("TrackingReceiver: {} controller velocity live (undamped finite difference, "
+                     "dt={:.1f}ms, speed={:.2f}m/s)",
+                     leftHand ? "left" : "right", dt * 1000.0, glm::length(linearVelocity));
     }
 
     return true;

@@ -40,11 +40,15 @@ public:
     bool GetLatestPose(oxr::protocol::TrackingPacket& outPacket) const;
     bool GetPredictedPose(oxr::protocol::TrackingPacket& outPacket) const;
 
-    // Raw controller velocity (linear m/s, angular rad/s) in the client tracking frame,
-    // from a finite difference of the two most recent RAW pose samples - deliberately NOT
-    // the predicted/clamped pose, so velocity-based game mechanics (e.g. punch detection)
-    // see the true, undamped controller speed. The head keeps its own prediction/jitter
-    // handling untouched. Returns false without enough recent history for that controller.
+    // Raw controller velocity (linear m/s, angular rad/s) in the client tracking frame, from a
+    // finite difference of the two most recent RAW pose samples in which the controller is
+    // active — deliberately NOT the predicted/clamped pose, and deliberately undamped, so
+    // velocity-based game mechanics (Unity deviceVelocity, XRI throw/punch detection) see the
+    // true instantaneous controller speed. Any smoothing here would clip exactly the peak such
+    // mechanics test for, and clip it harder the faster the motion. The head keeps its own
+    // prediction/jitter handling untouched. Returns false when there is no usable recent history
+    // pair for that controller, in which case the caller must report no velocity rather than a
+    // fabricated one.
     bool GetRawControllerVelocity(bool leftHand, glm::vec3& linearVelocity,
                                   glm::vec3& angularVelocity) const;
 
@@ -60,6 +64,7 @@ public:
 
     // Stats
     uint64_t GetPacketCount() const { return packetCount_.load(); }
+    uint64_t GetReorderedDropCount() const { return reorderedDropCount_.load(); }
 
 private:
     struct HistorySample
@@ -76,12 +81,16 @@ private:
     std::atomic<bool> running_{false};
     std::atomic<bool> hasData_{false};
     std::atomic<uint64_t> packetCount_{0};
+    std::atomic<uint64_t> reorderedDropCount_{0};
 
     mutable std::mutex poseMutex_;
     oxr::protocol::TrackingPacket latestPacket_ = {};
     std::deque<HistorySample> history_;
     std::atomic<float> predictionHorizonMs_{0.0f};
     mutable std::atomic<int64_t> lastPredictionDiagnosticNs_{0};
+    // Bit 0 = left, bit 1 = right. Set the first time each controller yields a real velocity so
+    // the "velocity is live" diagnostic is logged once per hand and never per frame.
+    mutable std::atomic<uint32_t> velocityLoggedHands_{0};
 
     static constexpr size_t MaxHistorySamples = 8;
 };

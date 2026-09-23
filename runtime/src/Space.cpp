@@ -5,6 +5,7 @@
 #include "Runtime.h"
 #include "InputManager.h"
 #include "ActionSet.h"
+#include "VelocityMath.h"
 #include <glm/glm.hpp>
 #include <glm/gtc/quaternion.hpp>
 
@@ -97,6 +98,12 @@ struct LocatedWorldPose
     // untracked pose is the OpenXR way to say "this is the last known / default pose" —
     // which is exactly the VIEW space before any tracking packet has arrived.
     bool tracked = true;
+    // Set for controller (action pose) spaces only — reference spaces (LOCAL/STAGE/VIEW) are
+    // treated as static, so they have no velocity of their own. Carried here so the velocity
+    // path reuses the hand GetWorldPose already resolved instead of redoing the action-data and
+    // path-string lookups on every frame.
+    bool isController = false;
+    InputManager::Hand hand = InputManager::Hand::Left;
 };
 
 // Compute world pose of a space.
@@ -154,15 +161,18 @@ static LocatedWorldPose GetWorldPose(Space* space, const InputManager& inputMana
         }
 
         result.active = poseActive;
+        result.isController = true;
         if (poseActive && !poseBindingPath.empty())
         {
             InputManager::Hand hand = HandFromBindingPath(poseBindingPath);
+            result.hand = hand;
             result.pose = inputManager.GetPoseComponentForProfile(
                 hand, ComponentFromBindingPath(poseBindingPath), poseProfilePath);
         }
         else
         {
             InputManager::Hand hand = HandFromPath(space->GetSubactionPath());
+            result.hand = hand;
             result.pose = inputManager.GetControllerPose(hand);
         }
     }
@@ -182,40 +192,19 @@ static LocatedWorldPose GetWorldPose(Space* space, const InputManager& inputMana
     return result;
 }
 
-// World-frame velocity of a space (linear m/s, angular rad/s), for XrSpaceVelocity. Only
-// controller (action pose) spaces move here; reference spaces (LOCAL/STAGE/VIEW) are treated
-// as static so their velocity is zero. The controller velocity is undamped (derived from raw
-// poses), so punch-style mechanics see true speed. Returns false when no velocity is known.
-static bool GetWorldVelocity(Space* space, const InputManager& inputManager,
+// World-frame velocity of an already-located space (linear m/s, angular rad/s), for
+// XrSpaceVelocity. Only controller (action pose) spaces move here; reference spaces
+// (LOCAL/STAGE/VIEW) are treated as static, so their velocity is zero. The controller velocity is
+// undamped — derived from raw poses — so punch/throw-style mechanics see true speed. Returns false
+// when no velocity is known, and the caller must then report none rather than fabricate one.
+static bool GetWorldVelocity(const LocatedWorldPose& located, const InputManager& inputManager,
                              glm::vec3& linVel, glm::vec3& angVel)
 {
-    if (space->GetType() != Space::Type::Action)
+    if (!located.isController)
     {
         return false;
     }
-
-    auto* action = Runtime::Get().FromHandle<ActionState>(
-        reinterpret_cast<uint64_t>(space->GetAction()));
-
-    std::string poseBindingPath;
-    bool poseActive = false;
-    if (action != nullptr)
-    {
-        const auto& data = action->GetSubactionData(space->GetSubactionPath());
-        poseActive = data.poseActive;
-        poseBindingPath = Runtime::Get().GetPathString(data.poseSourcePath);
-        if (poseBindingPath.empty() || !poseActive)
-        {
-            const auto& fallbackData = action->GetSubactionData(XR_NULL_PATH);
-            poseActive = fallbackData.poseActive;
-            poseBindingPath = Runtime::Get().GetPathString(fallbackData.poseSourcePath);
-        }
-    }
-
-    const InputManager::Hand hand = poseBindingPath.empty()
-        ? HandFromPath(space->GetSubactionPath())
-        : HandFromBindingPath(poseBindingPath);
-    return inputManager.GetControllerVelocity(hand, linVel, angVel);
+    return inputManager.GetControllerVelocity(located.hand, linVel, angVel);
 }
 
 XrResult Space::LocateSpace(Space* baseSpace, XrTime time, XrSpaceLocation* location)
@@ -266,28 +255,18 @@ XrResult Space::LocateSpace(Space* baseSpace, XrTime time, XrSpaceLocation* loca
 
     if (XrSpaceVelocity* velocity = FindSpaceVelocity(location->next))
     {
-        glm::vec3 thisLin(0.0f), thisAng(0.0f), baseLin(0.0f), baseAng(0.0f);
-        const bool haveThis = GetWorldVelocity(this, inputManager, thisLin, thisAng);
-        GetWorldVelocity(baseSpace, inputManager, baseLin, baseAng); // static base stays 0
+        glm::vec3 thisLin(0.0f);
+        glm::vec3 thisAng(0.0f);
+        glm::vec3 baseLin(0.0f);
+        glm::vec3 baseAng(0.0f);
+        const bool haveThis = GetWorldVelocity(thisPose, inputManager, thisLin, thisAng);
+        GetWorldVelocity(basePose, inputManager, baseLin, baseAng); // static base stays 0
 
-        if (haveThis && poseTracked)
-        {
-            // Change the controller's world velocity into the base space's frame. For a
-            // static base (LOCAL/STAGE - the usual case for input) this is an exact change
-            // of basis, so the reported speed magnitude equals the true controller speed.
-            const glm::vec3 relLin = baseRotInv * (thisLin - baseLin);
-            const glm::vec3 relAng = baseRotInv * (thisAng - baseAng);
-            velocity->linearVelocity = ToXr(relLin);
-            velocity->angularVelocity = ToXr(relAng);
-            velocity->velocityFlags =
-                XR_SPACE_VELOCITY_LINEAR_VALID_BIT | XR_SPACE_VELOCITY_ANGULAR_VALID_BIT;
-        }
-        else
-        {
-            velocity->velocityFlags = 0;
-            velocity->linearVelocity = {0.0f, 0.0f, 0.0f};
-            velocity->angularVelocity = {0.0f, 0.0f, 0.0f};
-        }
+        oxrsys::velocity::FillRelativeVelocity(
+            // Velocity is only reported for a tracked pose, matching the
+            // TRACKED bits above (an untracked VIEW base has no live motion).
+            *velocity, haveThis, poseTracked,
+            ToGlm(basePose.pose.orientation), thisLin, thisAng, baseLin, baseAng);
     }
 
     return XR_SUCCESS;
