@@ -25,6 +25,7 @@
 
 #import <IOSurface/IOSurface.h>
 #import <Metal/Metal.h>
+#include <simd/simd.h>
 
 #include <spdlog/spdlog.h>
 
@@ -116,18 +117,29 @@ bool RecvFramed(int fd, MsgType& type, std::vector<uint8_t>& payload)
     return true;
 }
 
-// Compose: draw one eye snapshot into half of the shared slot surface.
+// Compose: draw one eye snapshot into half of the shared slot surface. The uv
+// transform selects the XrSwapchainSubImage::imageRect sub-region of the eye
+// texture; it is identity-shaped (scale 1, offset 0) for a full-image rect.
+struct ComposeUvTransform
+{
+    vector_float2 uvScale;
+    vector_float2 uvOffset;
+};
+
 const char* kComposeShader = R"MSL(
 #include <metal_stdlib>
 using namespace metal;
+struct UvTransform { float2 uvScale; float2 uvOffset; };
 struct Out { float4 position [[position]]; float2 uv; };
 vertex Out compose_vertex(uint vid [[vertex_id]]) {
     float2 pos = float2((vid == 1) ? 3.0 : -1.0, (vid == 2) ? -3.0 : 1.0);
     Out o; o.position = float4(pos, 0.0, 1.0); o.uv = float2((pos.x + 1.0) * 0.5, (1.0 - pos.y) * 0.5); return o;
 }
-fragment float4 compose_fragment(Out in [[stage_in]], texture2d<float> eye [[texture(0)]]) {
+fragment float4 compose_fragment(Out in [[stage_in]], texture2d<float> eye [[texture(0)]],
+                                 constant UvTransform& xform [[buffer(0)]]) {
     constexpr sampler s(address::clamp_to_edge, filter::linear);
-    return float4(eye.sample(s, in.uv).rgb, 1.0);
+    float2 uv = xform.uvOffset + clamp(in.uv, float2(0.0), float2(1.0)) * xform.uvScale;
+    return float4(eye.sample(s, uv).rgb, 1.0);
 }
 )MSL";
 
@@ -746,7 +758,16 @@ void WiredHeadset::Impl::PresentLoop()
                 [enc setViewport:vp];
                 MTLScissorRect sc = {(NSUInteger)(i * half), 0, (NSUInteger)half, target.height};
                 [enc setScissorRect:sc];
-                [enc setFragmentTexture:(__bridge id<MTLTexture>)sources[i]->image.get() atIndex:0];
+                id<MTLTexture> eyeTexture = (__bridge id<MTLTexture>)sources[i]->image.get();
+                const FrameImageRect rect = sources[i]->GetRect((uint32_t)eyeTexture.width,
+                                                                (uint32_t)eyeTexture.height);
+                const FrameImageUvTransform uv = MakeFrameImageUvTransform(
+                    rect, (uint32_t)eyeTexture.width, (uint32_t)eyeTexture.height);
+                ComposeUvTransform xform = {};
+                xform.uvScale = {uv.scaleX, uv.scaleY};
+                xform.uvOffset = {uv.offsetX, uv.offsetY};
+                [enc setFragmentTexture:eyeTexture atIndex:0];
+                [enc setFragmentBytes:&xform length:sizeof(xform) atIndex:0];
                 [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
             }
             [enc endEncoding];
