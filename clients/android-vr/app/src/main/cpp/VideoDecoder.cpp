@@ -251,6 +251,13 @@ uint32_t VideoDecoder::FlushOutputToSurface(int64_t timeoutUs)
             {
                 const char* fmtStr = AMediaFormat_toString(fmt);
                 LOGI("Output format changed: %s", fmtStr ? fmtStr : "(null)");
+                int32_t colorRange = 0;
+                if (AMediaFormat_getInt32(fmt, AMEDIAFORMAT_KEY_COLOR_RANGE, &colorRange))
+                {
+                    // MediaFormat.COLOR_RANGE_FULL = 1, COLOR_RANGE_LIMITED = 2
+                    fullRangeOutput_.store(colorRange == 1);
+                    LOGI("Decoder output color range: %s", colorRange == 1 ? "full" : "limited");
+                }
                 AMediaFormat_delete(fmt);
             }
             continue;

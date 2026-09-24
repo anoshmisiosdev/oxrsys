@@ -72,6 +72,11 @@ public:
     bool IsInitialized() const { return codec_ != nullptr; }
     protocol::VideoCodec GetCodec() const { return activeCodec_; }
 
+    // True when the decoder reports full-range (0-255) YCbCr output. The Quest's external-OES
+    // sampler always applies the limited-range (16-235) expansion, so the blit undoes it for
+    // full-range streams (the host's software HEVC encoder produces those).
+    bool IsFullRangeOutput() const { return fullRangeOutput_.load(); }
+
     uint32_t GetWidth() const { return width_; }
     uint32_t GetHeight() const { return height_; }
     uint32_t GetSkippedFramesBeforeAcquire() const { return skippedFramesBeforeAcquire_.load(); }
@@ -99,6 +104,7 @@ private:
     AImage* currentImage_ = nullptr;
     std::thread outputThread_;
     std::atomic<bool> outputThreadRunning_{false};
+    std::atomic<bool> fullRangeOutput_{false};
     std::atomic<uint32_t> outputFramesReleasedSinceAcquire_{0};
 
     uint32_t width_ = 0;

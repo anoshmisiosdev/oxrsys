@@ -121,6 +121,16 @@ uniform vec2 uFoveationEyeSizeRatio;
 uniform int uReprojectionWarpEnabled;
 uniform vec2 uReprojectionWarpOffset;
 uniform int uPassthroughAlphaEnabled;
+uniform int uFullRangeSource;
+
+// The stream carries sRGB-encoded values (the host streams the application's sRGB swapchain
+// codes, tagged BT.709). The eye swapchains are GL_SRGB8_ALPHA8, which sRGB-encodes on write,
+// so the shader must output linear values; writing the sampled values directly encoded them a
+// second time (washed-out, lifted blacks: code 16 displayed as ~74).
+vec3 srgbToLinear(vec3 c) {
+    c = clamp(c, vec3(0.0), vec3(1.0));
+    return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), c));
+}
 
 float compressAxis(float eyeUv, float centerSize, float centerShift, float edgeRatio) {
     float c0 = (1.0 - centerSize) * 0.5;
@@ -233,12 +243,16 @@ void main() {
             color = clamp(color + detail * (0.125 * uUpscaleSharpness), vec3(0.0), vec3(1.0));
         }
     }
+    if (uFullRangeSource != 0) {
+        // The external sampler expanded 16-235 to 0-255; a full-range stream needs that undone.
+        color = color * (219.0 / 255.0) + vec3(16.0 / 255.0);
+    }
     float alpha = 1.0;
     if (uPassthroughAlphaEnabled != 0) {
         float maxChannel = max(max(color.r, color.g), color.b);
         alpha = smoothstep(0.02, 0.10, maxChannel);
     }
-    fragColor = vec4(color, alpha);
+    fragColor = vec4(srgbToLinear(color), alpha);
 }
 )";
 
@@ -1754,7 +1768,15 @@ bool XrApp::SetupActions()
     strncpy(actionInfo.localizedActionName, "Menu", XR_MAX_LOCALIZED_ACTION_NAME_SIZE);
     XR_CHECK(xrCreateAction(actionSet_, &actionInfo, &menuAction_), "xrCreateAction(menu)");
 
-    XrPath bindingPaths[15];
+    // Thumbstick click (boolean, both hands)
+    actionInfo.countSubactionPaths = 2;
+    actionInfo.subactionPaths = handPaths_;
+    strncpy(actionInfo.actionName, "thumbstick_click", XR_MAX_ACTION_NAME_SIZE);
+    strncpy(actionInfo.localizedActionName, "Thumbstick Click", XR_MAX_LOCALIZED_ACTION_NAME_SIZE);
+    XR_CHECK(xrCreateAction(actionSet_, &actionInfo, &thumbstickClickAction_),
+             "xrCreateAction(thumbstick_click)");
+
+    XrPath bindingPaths[17];
     xrStringToPath(instance_, "/user/hand/left/input/grip/pose", &bindingPaths[0]);
     xrStringToPath(instance_, "/user/hand/right/input/grip/pose", &bindingPaths[1]);
     xrStringToPath(instance_, "/user/hand/left/input/aim/pose", &bindingPaths[2]);
@@ -1770,6 +1792,8 @@ bool XrApp::SetupActions()
     xrStringToPath(instance_, "/user/hand/left/input/y/click", &bindingPaths[12]);
     xrStringToPath(instance_, "/user/hand/right/input/b/click", &bindingPaths[13]);
     xrStringToPath(instance_, "/user/hand/left/input/menu/click", &bindingPaths[14]);
+    xrStringToPath(instance_, "/user/hand/left/input/thumbstick/click", &bindingPaths[15]);
+    xrStringToPath(instance_, "/user/hand/right/input/thumbstick/click", &bindingPaths[16]);
 
     XrActionSuggestedBinding bindingsWithAim[] = {
         {gripPoseAction_, bindingPaths[0]},
@@ -1787,6 +1811,8 @@ bool XrApp::SetupActions()
         {bButtonAction_, bindingPaths[12]},
         {bButtonAction_, bindingPaths[13]},
         {menuAction_, bindingPaths[14]},
+        {thumbstickClickAction_, bindingPaths[15]},
+        {thumbstickClickAction_, bindingPaths[16]},
     };
     XrActionSuggestedBinding bindingsWithoutAim[] = {
         {gripPoseAction_, bindingPaths[0]},
@@ -1802,6 +1828,8 @@ bool XrApp::SetupActions()
         {bButtonAction_, bindingPaths[12]},
         {bButtonAction_, bindingPaths[13]},
         {menuAction_, bindingPaths[14]},
+        {thumbstickClickAction_, bindingPaths[15]},
+        {thumbstickClickAction_, bindingPaths[16]},
     };
 
     const char* controllerProfiles[] = {
@@ -1952,6 +1980,7 @@ bool XrApp::CreateSwapchains()
         glGetUniformLocation(blitProgram_, "uReprojectionWarpOffset");
     blitPassthroughAlphaEnabledUniform_ =
         glGetUniformLocation(blitProgram_, "uPassthroughAlphaEnabled");
+    blitFullRangeSourceUniform_ = glGetUniformLocation(blitProgram_, "uFullRangeSource");
 
     glUseProgram(blitProgram_);
     glUniform1i(blitTextureUniform_, 0);
@@ -4215,6 +4244,8 @@ void XrApp::BlitVideoToSwapchain(int eye)
                 reprojectionWarpOffsetX_, reprojectionWarpOffsetY_);
     glUniform1i(blitPassthroughAlphaEnabledUniform_,
                 EvaluatePassthroughAlphaKey().useBlackKeyAlpha ? 1 : 0);
+    glUniform1i(blitFullRangeSourceUniform_,
+                (videoDecoder_ && videoDecoder_->IsFullRangeOutput()) ? 1 : 0);
 
     glBindVertexArray(blitVao_);
     glDrawArrays(GL_TRIANGLES, 0, 6);
@@ -5199,6 +5230,15 @@ protocol::TrackingPacket XrApp::BuildTrackingPacket(XrTime predictedDisplayTime)
     if (readBooleanAction(menuAction_, handPaths_[0]))
     {
         buttons |= protocol::BUTTON_MENU;
+    }
+    // Stick clicks were never sent, so no app could see them
+    if (readBooleanAction(thumbstickClickAction_, handPaths_[0]))
+    {
+        buttons |= protocol::BUTTON_LEFT_THUMBSTICK;
+    }
+    if (readBooleanAction(thumbstickClickAction_, handPaths_[1]))
+    {
+        buttons |= protocol::BUTTON_RIGHT_THUMBSTICK;
     }
     packet.buttonState = buttons;
 
