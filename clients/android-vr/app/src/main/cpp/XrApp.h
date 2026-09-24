@@ -197,6 +197,7 @@ private:
     XrAction aButtonAction_ = XR_NULL_HANDLE;
     XrAction bButtonAction_ = XR_NULL_HANDLE;
     XrAction menuAction_ = XR_NULL_HANDLE;
+    XrAction thumbstickClickAction_ = XR_NULL_HANDLE;
     XrSpace gripSpaces_[2] = {};     // [0]=left, [1]=right
     XrSpace aimSpaces_[2] = {};      // [0]=left, [1]=right
     XrPath handPaths_[2] = {};       // /user/hand/left, /user/hand/right

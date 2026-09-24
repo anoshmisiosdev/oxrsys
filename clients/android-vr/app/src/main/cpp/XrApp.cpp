@@ -1768,7 +1768,15 @@ bool XrApp::SetupActions()
     strncpy(actionInfo.localizedActionName, "Menu", XR_MAX_LOCALIZED_ACTION_NAME_SIZE);
     XR_CHECK(xrCreateAction(actionSet_, &actionInfo, &menuAction_), "xrCreateAction(menu)");
 
-    XrPath bindingPaths[15];
+    // Thumbstick click (boolean, both hands)
+    actionInfo.countSubactionPaths = 2;
+    actionInfo.subactionPaths = handPaths_;
+    strncpy(actionInfo.actionName, "thumbstick_click", XR_MAX_ACTION_NAME_SIZE);
+    strncpy(actionInfo.localizedActionName, "Thumbstick Click", XR_MAX_LOCALIZED_ACTION_NAME_SIZE);
+    XR_CHECK(xrCreateAction(actionSet_, &actionInfo, &thumbstickClickAction_),
+             "xrCreateAction(thumbstick_click)");
+
+    XrPath bindingPaths[17];
     xrStringToPath(instance_, "/user/hand/left/input/grip/pose", &bindingPaths[0]);
     xrStringToPath(instance_, "/user/hand/right/input/grip/pose", &bindingPaths[1]);
     xrStringToPath(instance_, "/user/hand/left/input/aim/pose", &bindingPaths[2]);
@@ -1784,6 +1792,8 @@ bool XrApp::SetupActions()
     xrStringToPath(instance_, "/user/hand/left/input/y/click", &bindingPaths[12]);
     xrStringToPath(instance_, "/user/hand/right/input/b/click", &bindingPaths[13]);
     xrStringToPath(instance_, "/user/hand/left/input/menu/click", &bindingPaths[14]);
+    xrStringToPath(instance_, "/user/hand/left/input/thumbstick/click", &bindingPaths[15]);
+    xrStringToPath(instance_, "/user/hand/right/input/thumbstick/click", &bindingPaths[16]);
 
     XrActionSuggestedBinding bindingsWithAim[] = {
         {gripPoseAction_, bindingPaths[0]},
@@ -1801,6 +1811,8 @@ bool XrApp::SetupActions()
         {bButtonAction_, bindingPaths[12]},
         {bButtonAction_, bindingPaths[13]},
         {menuAction_, bindingPaths[14]},
+        {thumbstickClickAction_, bindingPaths[15]},
+        {thumbstickClickAction_, bindingPaths[16]},
     };
     XrActionSuggestedBinding bindingsWithoutAim[] = {
         {gripPoseAction_, bindingPaths[0]},
@@ -1816,6 +1828,8 @@ bool XrApp::SetupActions()
         {bButtonAction_, bindingPaths[12]},
         {bButtonAction_, bindingPaths[13]},
         {menuAction_, bindingPaths[14]},
+        {thumbstickClickAction_, bindingPaths[15]},
+        {thumbstickClickAction_, bindingPaths[16]},
     };
 
     const char* controllerProfiles[] = {
@@ -5216,6 +5230,15 @@ protocol::TrackingPacket XrApp::BuildTrackingPacket(XrTime predictedDisplayTime)
     if (readBooleanAction(menuAction_, handPaths_[0]))
     {
         buttons |= protocol::BUTTON_MENU;
+    }
+    // Stick clicks were never sent, so no app could see them
+    if (readBooleanAction(thumbstickClickAction_, handPaths_[0]))
+    {
+        buttons |= protocol::BUTTON_LEFT_THUMBSTICK;
+    }
+    if (readBooleanAction(thumbstickClickAction_, handPaths_[1]))
+    {
+        buttons |= protocol::BUTTON_RIGHT_THUMBSTICK;
     }
     packet.buttonState = buttons;
 
