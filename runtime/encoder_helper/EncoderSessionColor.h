@@ -14,10 +14,16 @@
 //
 // SDR BT.709 for every codec and profile, HEVC Main10 included: Main10 is a
 // 10-bit bitstream from the same 8-bit SDR source, not an HDR/BT.2020 stream.
-// Range is not set here: VideoToolbox has no compression property for it. Every
-// hardware encoder signals video (limited) range for a BGRA source; the
-// software HEVC encoder (all a Rosetta process gets for HEVC) signals full
-// range. The helper only ever runs a hardware session.
+//
+// Range: video (limited) range on every path. VideoToolbox has no compression
+// property for it; a session derives it from its source. Every hardware
+// encoder writes video range for the BGRA compose surface. The software HEVC
+// encoder (all a Rosetta process gets for HEVC, and so the in-process fallback
+// when the helper dies) writes FULL range for a BGRA source once HEVC Main is
+// requested explicitly. So a software session is never handed BGRA: its frames
+// are first converted to an explicitly video-range 4:2:0 buffer with
+// CreateVideoRangeTransferSession(), and the encoder keeps that range. The
+// helper only ever runs a hardware session and needs no conversion.
 //
 // Header-only, system frameworks only, so the helper stays a single translation
 // unit with no runtime dependencies.
@@ -59,6 +65,41 @@ inline ApplyResult ApplySessionColorProperties(VTCompressionSessionRef session)
     result.yCbCrMatrix =
         VTSessionSetProperty(session, kVTCompressionPropertyKey_YCbCrMatrix, kYCbCrMatrix);
     return result;
+}
+
+// The source format a software session is fed instead of BGRA. Eight-bit for
+// every profile: the compose surface is 8-bit, and HEVC Main10 keeps encoding a
+// 10-bit bitstream from it, exactly as with a BGRA source.
+inline constexpr OSType kVideoRangeSourcePixelFormat =
+    kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+
+// A pixel-transfer session that converts the BGRA compose surface into a
+// kVideoRangeSourcePixelFormat buffer with the same BT.709 matrix, primaries
+// and transfer function the compression session signals, and tags the output
+// with them. Returns nullptr on failure; the caller owns the reference.
+inline VTPixelTransferSessionRef CreateVideoRangeTransferSession()
+{
+    VTPixelTransferSessionRef transfer = nullptr;
+    if (VTPixelTransferSessionCreate(kCFAllocatorDefault, &transfer) != noErr ||
+        transfer == nullptr)
+    {
+        return nullptr;
+    }
+    const bool configured =
+        VTSessionSetProperty(transfer, kVTPixelTransferPropertyKey_DestinationYCbCrMatrix,
+                             kYCbCrMatrix) == noErr &&
+        VTSessionSetProperty(transfer, kVTPixelTransferPropertyKey_DestinationColorPrimaries,
+                             kPrimaries) == noErr &&
+        VTSessionSetProperty(transfer, kVTPixelTransferPropertyKey_DestinationTransferFunction,
+                             kTransferFunction) == noErr;
+    if (!configured)
+    {
+        VTPixelTransferSessionInvalidate(transfer);
+        CFRelease(transfer);
+        return nullptr;
+    }
+    VTSessionSetProperty(transfer, kVTPixelTransferPropertyKey_RealTime, kCFBooleanTrue);
+    return transfer;
 }
 
 } // namespace oxrsys::encoder_color

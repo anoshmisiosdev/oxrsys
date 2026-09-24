@@ -67,7 +67,8 @@ FrameImageSource MakeSource(id<MTLDevice> device, uint32_t width, uint32_t heigh
 void EncodeOneFrame(oxr::protocol::VideoCodec codec,
                     MTLPixelFormat pixelFormat = MTLPixelFormatBGRA8Unorm,
                     bool foveated = false,
-                    bool tenBit = false)
+                    bool tenBit = false,
+                    bool forceSoftware = false)
 {
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     REQUIRE(device != nil);
@@ -108,7 +109,16 @@ void EncodeOneFrame(oxr::protocol::VideoCodec codec,
     // surface, both in-process and in the helper; it must produce Annex-B NAL
     // units like any other profile.
     encoder.SetTenBitEncoding(tenBit);
+    // The software session a Rosetta host falls back to when the helper dies,
+    // pinned here so its colour contract is checked on every machine.
+    encoder.SetForceSoftwareEncoderForTesting(forceSoftware);
     REQUIRE(encoder.Initialize(128, 64, 60, 8, graphics, codec));
+    const int helperPid = encoder.EncoderHelperPid();
+    if (forceSoftware)
+    {
+        CHECK_FALSE(encoder.InProcessSessionUsesHardware());
+        CHECK(encoder.EncoderHelperPid() == -1);
+    }
 
     FrameSource frame = {};
     frame.left = MakeSource(device, 64, 64, pixelFormat);
@@ -163,22 +173,22 @@ void EncodeOneFrame(oxr::protocol::VideoCodec codec,
         CHECK(nalCount > 0);
         CHECK(annexB);
 
-        // Whichever process encoded this (in-process, or the helper when the
-        // policy or encoder_helper picked it), the stream must carry the one
-        // BT.709 colour description both sessions are configured from.
-        //
-        // Range is deliberately not asserted here: no session property sets
-        // it, and VideoToolbox's software HEVC encoder (all a Rosetta process
-        // gets for HEVC, and all an encoder-less CI runner gets) signals full
-        // range where every hardware encoder signals video range. The helper
-        // is hardware-only; its range is checked in TestEncoderHelperClient.
+        // Whichever process and encoder produced this (in-process hardware,
+        // the helper when the policy or encoder_helper picked it, or the
+        // in-process software session), the stream must carry the one BT.709
+        // limited-range colour description (EncoderSessionColor.h). Range is
+        // the part a software session gets wrong unaided: it writes full range
+        // for a BGRA source, so it is fed a video-range 4:2:0 conversion.
         const oxrsys::test::VuiColor color = oxrsys::test::ParseVuiColor(
             nals, codec == oxr::protocol::VideoCodec::H265);
+        INFO("codec " << static_cast<int>(codec) << ", ten-bit " << tenBit << ", software "
+                      << forceSoftware << ", helper pid " << helperPid);
         CHECK(color.present);
         CHECK(color.primaries == oxrsys::test::CFToString(oxrsys::encoder_color::kPrimaries));
         CHECK(color.transfer ==
               oxrsys::test::CFToString(oxrsys::encoder_color::kTransferFunction));
         CHECK(color.matrix == oxrsys::test::CFToString(oxrsys::encoder_color::kYCbCrMatrix));
+        CHECK_FALSE(color.fullRange);
     }
 
     encoder.Shutdown();
@@ -262,6 +272,25 @@ TEST_CASE("VideoToolbox encodes Metal textures with every advertised codec",
     }
 }
 
+TEST_CASE("Software VideoToolbox sessions keep the limited-range colour contract",
+          "[video][encoder][videotoolbox][color]")
+{
+    // Without the video-range conversion, VideoToolbox's software HEVC encoder
+    // signals full range for HEVC Main, so a helper death under Rosetta would
+    // flip the stream's range mid-session.
+    const auto capabilities = VideoEncoder::QueryBackendCapabilities();
+    REQUIRE(capabilities.supportsH264);
+    EncodeOneFrame(oxr::protocol::VideoCodec::H264, MTLPixelFormatBGRA8Unorm,
+                   /*foveated=*/false, /*tenBit=*/false, /*forceSoftware=*/true);
+    if (capabilities.supportsH265)
+    {
+        EncodeOneFrame(oxr::protocol::VideoCodec::H265, MTLPixelFormatBGRA8Unorm,
+                       /*foveated=*/false, /*tenBit=*/false, /*forceSoftware=*/true);
+        EncodeOneFrame(oxr::protocol::VideoCodec::H265, MTLPixelFormatBGRA8Unorm,
+                       /*foveated=*/false, /*tenBit=*/true, /*forceSoftware=*/true);
+    }
+}
+
 TEST_CASE("VideoEncoder falls back in-process when the encoder helper dies mid-stream",
           "[video][encoder][videotoolbox][helper][lifecycle]")
 {
@@ -280,6 +309,7 @@ TEST_CASE("VideoEncoder falls back in-process when the encoder helper dies mid-s
     size_t duplicateCompletions = 0;
     std::set<uint64_t> completedFrames;
     bool killed = false;
+    std::vector<std::vector<uint8_t>> nalsAfterKill;
 
     VideoEncoder encoder;
     // H.265: the codec a Rosetta host is refused hardware for, so `auto` picks
@@ -299,7 +329,14 @@ TEST_CASE("VideoEncoder falls back in-process when the encoder helper dies mid-s
         frame.left = MakeSource(device, 64, 64, MTLPixelFormatBGRA8Unorm);
         frame.right = MakeSource(device, 64, 64, MTLPixelFormatBGRA8Unorm);
         const bool ok = encoder.EncodeStereo(
-            std::move(frame), timestampNs, [](const uint8_t*, size_t, bool, int64_t) {},
+            std::move(frame), timestampNs,
+            [&](const uint8_t* data, size_t size, bool, int64_t) {
+                std::lock_guard<std::mutex> lock(mutex);
+                if (killed && data != nullptr)
+                {
+                    nalsAfterKill.emplace_back(data, data + size);
+                }
+            },
             [&](const VideoEncoder::FrameMetrics& metrics) {
                 {
                     std::lock_guard<std::mutex> lock(mutex);
@@ -360,6 +397,17 @@ TEST_CASE("VideoEncoder falls back in-process when the encoder helper dies mid-s
         // finalized twice (by both the death reclaim and the submit path).
         CHECK(completions >= accepted);
         CHECK(duplicateCompletions == 0);
+
+        // The fallback keeps the stream's colour contract. Under Rosetta it is
+        // the software HEVC session, which would signal full range for the
+        // BGRA compose surface without its video-range conversion.
+        const oxrsys::test::VuiColor color = oxrsys::test::ParseVuiColor(nalsAfterKill, true);
+        INFO("in-process fallback is " << (encoder.InProcessSessionUsesHardware() ? "hardware"
+                                                                                   : "software"));
+        CHECK(color.present);
+        CHECK(color.primaries == oxrsys::test::CFToString(oxrsys::encoder_color::kPrimaries));
+        CHECK(color.matrix == oxrsys::test::CFToString(oxrsys::encoder_color::kYCbCrMatrix));
+        CHECK_FALSE(color.fullRange);
     }
     [queue release];
     [device release];

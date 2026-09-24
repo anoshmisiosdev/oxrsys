@@ -965,7 +965,11 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
     // Which process encodes this codec, and why. Decided from what VideoToolbox
     // will actually grant this process — not from its architecture — so the
     // logic survives Apple changing what Rosetta is allowed.
+    // Tests can pin the in-process session to the software encoder, the one a
+    // Rosetta host falls back to when the helper dies, on any machine.
+    const bool forceSoftware = forceSoftwareForTesting_;
     const bool hardwareInProcess =
+        !forceSoftware &&
         HardwareEncoderAvailableInProcess(VideoToolboxCodecType(codec_), width, height);
     {
         oxrsys::encoder::EncodePathInputs pathInputs;
@@ -973,7 +977,8 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
         pathInputs.tenBit = tenBit_ && codec_ == oxr::protocol::VideoCodec::H265;
         pathInputs.inProcessHardwareAvailable = hardwareInProcess;
         pathInputs.override_ =
-            oxrsys::encoder::ParseHelperOverride(initialConfig.encoderHelperMode);
+            forceSoftware ? oxrsys::encoder::HelperOverride::ForceInProcess
+                          : oxrsys::encoder::ParseHelperOverride(initialConfig.encoderHelperMode);
         encodePath_ = oxrsys::encoder::ChooseEncodePath(pathInputs);
         spdlog::info("VideoEncoder: {} encode path for {} - {} (in-process hardware encoder: {})",
                      encodePath_.useHelper ? "out-of-process native-arm64 helper" : "in-process",
@@ -988,7 +993,8 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
     // software HEVC encoder; now that path is entered knowingly, logged, and
     // (when the helper covers the codec) only as the fallback behind it.
     NSDictionary* encoderSpec = @{
-        (NSString*)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @YES,
+        (NSString*)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder:
+            forceSoftware ? @NO : @YES,
         (NSString*)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder:
             hardwareInProcess ? @YES : @NO,
     };
@@ -1136,6 +1142,7 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
             sessionUsesHardware = CFBooleanGetValue(hardwareRef);
             CFRelease(hardwareRef);
         }
+        inProcessSessionHardware_ = sessionUsesHardware;
         if (sessionUsesHardware)
         {
             spdlog::info("VideoEncoder: in-process {} session is hardware-accelerated",
@@ -1156,12 +1163,24 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
         }
     }
 
+    // A software session writes full range for a BGRA source (HEVC Main), which
+    // would break the limited-range stream contract exactly when the helper dies
+    // and this session takes over mid-stream. Hand it an explicitly video-range
+    // 4:2:0 conversion of each frame instead; see EncoderSessionColor.h. Set up
+    // now, not on helper death, so the fallback never allocates on the frame path.
+    if (!inProcessSessionHardware_ && !CreateVideoRangeConversion(width, height))
+    {
+        spdlog::warn("VideoEncoder: could not set up the video-range conversion for the software "
+                     "{} session - its stream may signal full range",
+                     VideoCodecName(codec_));
+    }
+
     // VideoToolbox refuses the hardware HEVC encoder to an x86_64/Rosetta
     // process and silently returns a software session instead. When the policy
     // above chose the helper, delegate the per-frame encode to a native-arm64
     // child process that is granted the hardware encoder; this session stays
     // live as the fallback. See runtime/encoder_helper/README.md.
-    if (encodePath_.useHelper && TryStartHelper())
+    if (encodePath_.useHelper && !forceSoftware && TryStartHelper())
     {
         spdlog::info("VideoEncoder: hardware {} via the native-arm64 out-of-process helper",
                      VideoCodecName(codec_));
@@ -1172,6 +1191,73 @@ bool VideoEncoder::Initialize(uint32_t width, uint32_t height, uint32_t fps,
     spdlog::info("VideoEncoder: Initialized {} encoder {}x{} @ {}fps, {}Mbps (slots={}, keyframe={}s, preset={})",
                   VideoCodecName(codec_), width, height, fps, bitrateMbps, SlotCount, keyframeIntervalSec, preset);
     return true;
+}
+
+bool VideoEncoder::CreateVideoRangeConversion(uint32_t width, uint32_t height)
+{
+    VTPixelTransferSessionRef transfer = oxrsys::encoder_color::CreateVideoRangeTransferSession();
+    if (transfer == nullptr)
+    {
+        return false;
+    }
+    NSDictionary* poolAttributes = @{
+        (NSString*)kCVPixelBufferPoolMinimumBufferCountKey: @(SlotCount),
+    };
+    NSDictionary* bufferAttributes = @{
+        (NSString*)kCVPixelBufferWidthKey: @(width),
+        (NSString*)kCVPixelBufferHeightKey: @(height),
+        (NSString*)kCVPixelBufferPixelFormatTypeKey:
+            @(oxrsys::encoder_color::kVideoRangeSourcePixelFormat),
+        (NSString*)kCVPixelBufferIOSurfacePropertiesKey: @{},
+    };
+    CVPixelBufferPoolRef pool = nullptr;
+    if (CVPixelBufferPoolCreate(kCFAllocatorDefault, (__bridge CFDictionaryRef)poolAttributes,
+                                (__bridge CFDictionaryRef)bufferAttributes,
+                                &pool) != kCVReturnSuccess ||
+        pool == nullptr)
+    {
+        VTPixelTransferSessionInvalidate(transfer);
+        CFRelease(transfer);
+        return false;
+    }
+    videoToolbox_.videoRangeTransfer = transfer;
+    videoToolbox_.videoRangePool = pool;
+    spdlog::info("VideoEncoder: software {} session is fed a BT.709 video-range 4:2:0 conversion "
+                 "of each frame, keeping the stream limited-range",
+                 VideoCodecName(codec_));
+    return true;
+}
+
+void* VideoEncoder::ConvertToVideoRange(void* bgraPixelBuffer)
+{
+    VTPixelTransferSessionRef transfer =
+        (VTPixelTransferSessionRef)videoToolbox_.videoRangeTransfer;
+    CVPixelBufferPoolRef pool = (CVPixelBufferPoolRef)videoToolbox_.videoRangePool;
+    if (transfer == nullptr || pool == nullptr || bgraPixelBuffer == nullptr)
+    {
+        return nullptr;
+    }
+    CVPixelBufferRef converted = nullptr;
+    if (CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &converted) !=
+            kCVReturnSuccess ||
+        converted == nullptr)
+    {
+        return nullptr;
+    }
+    const OSStatus status =
+        VTPixelTransferSessionTransferImage(transfer, (CVPixelBufferRef)bgraPixelBuffer, converted);
+    if (status != noErr)
+    {
+        if (!videoRangeConversionWarningLogged_.exchange(true))
+        {
+            spdlog::warn("VideoEncoder: video-range conversion failed ({}); encoding the BGRA "
+                         "surface directly, which may signal full range",
+                         status);
+        }
+        CVPixelBufferRelease(converted);
+        return nullptr;
+    }
+    return converted;
 }
 
 bool VideoEncoder::TryStartHelper()
@@ -1493,6 +1579,17 @@ bool VideoEncoder::Shutdown(std::chrono::nanoseconds timeout)
     {
         CFRelease(videoToolbox_.pixelBufferPool);
         videoToolbox_.pixelBufferPool = nullptr;
+    }
+    if (videoToolbox_.videoRangeTransfer != nullptr)
+    {
+        VTPixelTransferSessionInvalidate((VTPixelTransferSessionRef)videoToolbox_.videoRangeTransfer);
+        CFRelease(videoToolbox_.videoRangeTransfer);
+        videoToolbox_.videoRangeTransfer = nullptr;
+    }
+    if (videoToolbox_.videoRangePool != nullptr)
+    {
+        CFRelease(videoToolbox_.videoRangePool);
+        videoToolbox_.videoRangePool = nullptr;
     }
     if (videoToolbox_.textureCache != nullptr)
     {
@@ -2038,14 +2135,23 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
                 FinalizeEncodeFrame(context, true);
                 return;
             }
+            // A software session encodes a video-range 4:2:0 copy of the
+            // slot (EncoderSessionColor.h); VideoToolbox retains it for as
+            // long as it needs it, so the local reference is dropped below.
+            CVPixelBufferRef videoRangeBuffer =
+                (CVPixelBufferRef)this->ConvertToVideoRange(pixelBuffer);
             status = VTCompressionSessionEncodeFrame(
                 compressionSession,
-                pixelBuffer,
+                videoRangeBuffer != nullptr ? videoRangeBuffer : pixelBuffer,
                 presentationTime,
                 kCMTimeInvalid,
                 frameProps,
                 context,
                 nullptr);
+            if (videoRangeBuffer != nullptr)
+            {
+                CVPixelBufferRelease(videoRangeBuffer);
+            }
         }
         context->metrics.encodeSubmitMs = ToMilliseconds(Clock::now() - submitStart);
         context->encodeSubmitFinished = Clock::now();
