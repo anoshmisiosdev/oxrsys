@@ -259,13 +259,23 @@ TEST_CASE("InputManager — streaming controller activity gates pose updates", "
     receiver.InjectPacket(reinterpret_cast<const uint8_t*>(&inactive), sizeof(inactive));
     im.Update(0.0f);
 
+    // Untracked for a moment (held still / out of view) but still connected: the pose stops
+    // being tracked, the controller and its interaction profile stay.
     CHECK_FALSE(im.IsControllerTrackingActive(InputManager::Hand::Left));
     CHECK_FALSE(im.IsInputDeviceActive(InputManager::Hand::Left));
-    CHECK(im.GetCurrentInteractionProfile(InputManager::Hand::Left).empty());
+    CHECK(im.IsControllerPresent(InputManager::Hand::Left));
+    CHECK(im.GetCurrentInteractionProfile(InputManager::Hand::Left) ==
+          "/interaction_profiles/meta/touch_controller_quest_2");
     left = im.GetControllerPose(InputManager::Hand::Left);
     CHECK_THAT(left.position.x, WithinAbs(-0.35f, 0.001f));
     CHECK_THAT(left.position.y, WithinAbs(1.20f, 0.001f));
     CHECK_THAT(left.position.z, WithinAbs(-0.55f, 0.001f));
+
+    // A client disconnect forgets the controllers.
+    im.SetTrackingReceiver(nullptr);
+    CHECK_FALSE(im.IsControllerPresent(InputManager::Hand::Left));
+    CHECK(im.GetCurrentInteractionProfile(InputManager::Hand::Left) !=
+          "/interaction_profiles/meta/touch_controller_quest_2");
 }
 
 TEST_CASE("InputManager — streaming client names map to controller profiles and aliases", "[input]")
