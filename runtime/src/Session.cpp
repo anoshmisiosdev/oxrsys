@@ -11,6 +11,8 @@
 #include "SwapchainCreateValidation.h"
 #include "Space.h"
 #include "InputManager.h"
+#include <mutex>
+#include "HeadsetViewStore.h"
 #include "StreamingServer.h"
 #include "RuntimeStatus.h"
 #include "WiredHeadset.h"
@@ -182,12 +184,55 @@ bool IsFiniteFov(const XrFovf& fov)
            std::isfinite(fov.angleUp) && std::isfinite(fov.angleDown);
 }
 
+// The last headset view (FOV/IPD) seen in this process, else the one saved by an earlier
+// run. Sessions are recreated freely (OpenComposite restarts its session to load input
+// bindings), so every new session starts from the newest known view.
+std::mutex g_headsetViewMutex;
+oxrsys::runtime::SavedHeadsetView g_headsetView;
+bool g_headsetViewLoaded = false;
+
+oxrsys::runtime::SavedHeadsetView CurrentSavedHeadsetView()
+{
+    std::scoped_lock lock(g_headsetViewMutex);
+    if (!g_headsetViewLoaded)
+    {
+        g_headsetViewLoaded = true;
+        const std::string& path = Config::Get().headsetViewPath;
+        if (oxrsys::runtime::LoadHeadsetView(path, g_headsetView))
+        {
+            spdlog::info("OXRSys: using the saved headset view until a client reports one "
+                         "(IPD={:.1f}mm FOV L={:.3f} R={:.3f} U={:.3f} D={:.3f}, from {})",
+                         g_headsetView.ipd * 1000.0f, g_headsetView.fov[0], g_headsetView.fov[1],
+                         g_headsetView.fov[2], g_headsetView.fov[3], path);
+        }
+    }
+    return g_headsetView;
+}
+
+void StoreHeadsetView(const oxrsys::runtime::SavedHeadsetView& view)
+{
+    std::scoped_lock lock(g_headsetViewMutex);
+    g_headsetView = view;
+    g_headsetViewLoaded = true;
+    const std::string& path = Config::Get().headsetViewPath;
+    if (oxrsys::runtime::SaveHeadsetView(path, view))
+    {
+        spdlog::info("OXRSys: saved headset view IPD={:.1f}mm FOV L={:.3f} R={:.3f} U={:.3f} D={:.3f} to {}",
+                     view.ipd * 1000.0f, view.fov[0], view.fov[1], view.fov[2], view.fov[3], path);
+    }
+    else
+    {
+        spdlog::warn("OXRSys: could not save the headset view to {}", path);
+    }
+}
+
 } // namespace
 
 Session::Session(Instance* instance, void* metalDevice, void* metalCommandQueue)
     : instance_(instance), graphicsContext_(GraphicsContext::Metal(metalDevice, metalCommandQueue))
 {
     inputManager_ = std::make_unique<InputManager>();
+    inputManager_->SetSavedHeadsetView(CurrentSavedHeadsetView());
 
     startTime_ = std::chrono::steady_clock::now();
     monoStartNs_ = MonotonicNowNs();
@@ -206,6 +251,7 @@ Session::Session(Instance* instance, const GraphicsContext& graphicsContext)
     : instance_(instance), graphicsContext_(graphicsContext)
 {
     inputManager_ = std::make_unique<InputManager>();
+    inputManager_->SetSavedHeadsetView(CurrentSavedHeadsetView());
 
     startTime_ = std::chrono::steady_clock::now();
     monoStartNs_ = MonotonicNowNs();
@@ -284,6 +330,54 @@ void Session::TransitionState(XrSessionState newState)
 
     instance_->PushEvent(event);
     spdlog::info("OXRSys: Session state -> {}", static_cast<int>(newState));
+}
+
+void Session::PublishTrackingChanges()
+{
+    // The first streamed head pose re-anchors LOCAL (and LOCAL_FLOOR) from the provisional
+    // default-head anchor to the real head. Tell the application, as OpenXR requires.
+    XrPosef poseInPreviousSpace{};
+    if (inputManager_->TakeLocalReferenceChange(poseInPreviousSpace))
+    {
+        const XrTime changeTime = static_cast<XrTime>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - startTime_)
+                .count());
+        std::vector<XrReferenceSpaceType> changed = {XR_REFERENCE_SPACE_TYPE_LOCAL};
+        if (instance_ != nullptr && instance_->SupportsLocalFloor())
+        {
+            changed.push_back(XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR);
+        }
+        for (XrReferenceSpaceType type : changed)
+        {
+            XrEventDataBuffer event{};
+            auto* pending = reinterpret_cast<XrEventDataReferenceSpaceChangePending*>(&event);
+            pending->type = XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING;
+            pending->next = nullptr;
+            pending->session = reinterpret_cast<XrSession>(handle_);
+            pending->referenceSpaceType = type;
+            pending->changeTime = changeTime;
+            pending->poseValid = XR_TRUE;
+            pending->poseInPreviousSpace = poseInPreviousSpace;
+            if (type == XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR)
+            {
+                // LOCAL_FLOOR keeps its floor height; only LOCAL's x/z and yaw moved.
+                pending->poseInPreviousSpace.position.y = 0.0f;
+            }
+            instance_->PushEvent(event);
+        }
+        spdlog::info("OXRSys: LOCAL reference re-anchored to the first tracked head pose "
+                     "(moved ({:.3f}, {:.3f}, {:.3f}) in the previous LOCAL space); "
+                     "queued XrEventDataReferenceSpaceChangePending",
+                     poseInPreviousSpace.position.x, poseInPreviousSpace.position.y,
+                     poseInPreviousSpace.position.z);
+    }
+
+    oxrsys::runtime::SavedHeadsetView view;
+    if (inputManager_->TakeHeadsetViewUpdate(view))
+    {
+        StoreHeadsetView(view);
+    }
 }
 
 XrResult Session::BeginSession(const XrSessionBeginInfo* beginInfo)
@@ -603,6 +697,7 @@ XrResult Session::WaitFrame(const XrFrameWaitInfo* frameWaitInfo, XrFrameState* 
 
     // Update input
     inputManager_->Update(dt);
+    PublishTrackingChanges();
 
     auto displayTime = std::chrono::duration_cast<std::chrono::nanoseconds>(now - startTime_).count();
 
@@ -797,6 +892,18 @@ XrResult Session::EndFrame(const XrFrameEndInfo* frameEndInfo)
 
     // Send to the wired headset's presenter, or the connected streaming client.
     CheckStreamingConnection();
+
+    // The FOV the headset will display this frame with. The encoder reprojects an eye image
+    // submitted with a different FOV (an app that cached an older projection) onto it.
+    {
+        XrView displayViews[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+        inputManager_->GetEyeViews(displayViews, 2);
+        for (int eye = 0; eye < 2; ++eye)
+        {
+            frameSource.displayFov[eye] = ToFrameFov(displayViews[eye].fov);
+        }
+        frameSource.displayFovValid = true;
+    }
     if (wiredActive_)
     {
         WiredHeadset::Shared().SendFrame(std::move(frameSource));
@@ -1404,6 +1511,7 @@ void Session::StartStreamingIfNeeded()
     if (streamingServer_->Start(width, height, refreshHz))
     {
         streamingStarted_ = true;
+        inputManager_->SetAwaitingStreamingClient(true);
         spdlog::info("OXRSys: Streaming server started, waiting for headset connection...");
     }
     else

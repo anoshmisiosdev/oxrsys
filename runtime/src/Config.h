@@ -118,6 +118,7 @@ public:
     std::string logFilePath;        // Full path to oxrsys-runtime.log
     std::string questLogFilePath;   // Full path to oxrsys-headset.log
     std::string runtimeStatusPath;  // Full path to runtime_status.json
+    std::string headsetViewPath;    // Full path to headset_view.txt (last streamed FOV/IPD)
 
     void Shutdown();
 

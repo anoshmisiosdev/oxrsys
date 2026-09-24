@@ -372,6 +372,11 @@ struct FrameSource
     bool alphaBlend = false;
     // Index 0 = left eye, 1 = right eye.
     FrameEyeView views[2] = {};
+    // The FOV the headset displays each eye with. When a submitted view's fov differs
+    // (the application rendered with an older projection), the encoder reprojects the eye
+    // image onto this FOV. Index 0 = left eye.
+    FrameFov displayFov[2] = {};
+    bool displayFovValid = false;
     // Quad layers submitted after the projection layer, in submission order:
     // later entries composite on top of earlier ones.
     std::vector<FrameQuadLayer> quads = {};
@@ -393,6 +398,9 @@ struct FrameSource
         alphaBlend = false;
         views[0] = {};
         views[1] = {};
+        displayFov[0] = {};
+        displayFov[1] = {};
+        displayFovValid = false;
         quads.clear();
     }
 };

@@ -218,9 +218,12 @@ add_executable(oxrsys_runtime_tests
     tests/TestQuestPassthroughAlphaPolicy.cpp
     tests/TestQuestShellInteraction.cpp
     tests/TestQuadLayerProjection.cpp
+    tests/TestEyeFovRemap.cpp
+    tests/TestHeadsetViewStore.cpp
     clients/android-vr/app/src/main/cpp/QuestPassthroughAlphaPolicy.cpp
     clients/android-vr/app/src/main/cpp/QuestShellInteraction.cpp
     runtime/src/InputManager.cpp
+    runtime/src/HeadsetViewStore.cpp
     runtime/src/TrackingReceiver.cpp
     runtime/src/Config.cpp
     runtime/src/RuntimePlatform.cpp
@@ -342,7 +345,9 @@ list(APPEND OXRSYS_RUNTIME_TEST_TARGETS oxrsys_runtime_api_tests)
 
 add_executable(oxrsys_quad_layer_metal_tests
     tests/TestQuadLayerMetal.mm
+    tests/TestEyeFovReprojectorMetal.mm
     runtime/src/QuadLayerRenderer.mm
+    runtime/src/EyeFovReprojector.mm
 )
 target_include_directories(oxrsys_quad_layer_metal_tests PRIVATE
     runtime/src
@@ -373,6 +378,7 @@ add_executable(oxrsys_videotoolbox_encoder_tests
     runtime/src/EncoderHelperClient.mm
     runtime/src/EncoderPathPolicy.cpp
     runtime/src/QuadLayerRenderer.mm
+    runtime/src/EyeFovReprojector.mm
     runtime/src/Config.cpp
     runtime/src/RuntimePlatform.cpp
 )

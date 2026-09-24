@@ -177,6 +177,8 @@ private:
     bool streamingStarted_ = false;
     bool wiredActive_ = false;
     void StartStreamingIfNeeded();
+    // Queues reference-space change events and persists a newly reported headset view.
+    void PublishTrackingChanges();
     void CheckStreamingConnection();
     bool StopStreaming();
 };

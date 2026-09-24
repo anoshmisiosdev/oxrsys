@@ -106,7 +106,16 @@ Tracking packets update head, controller, hand-joint, velocity, eye-FOV, and cli
 Controller poses are accepted only when the corresponding active flag is set. The action system is
 profile-aware and keeps hand interaction available alongside controller-first bindings.
 
-Reference spaces currently include `VIEW`, `LOCAL`, `LOCAL_FLOOR`, and `STAGE`.
+Reference spaces currently include `VIEW`, `LOCAL`, `LOCAL_FLOOR`, and `STAGE`. `STAGE` is the
+client's floor origin. `LOCAL` is anchored at the head: provisionally at the default head pose until
+the first streamed head pose, then at that pose, with `XrEventDataReferenceSpaceChangePending`
+queued for `LOCAL` and `LOCAL_FLOOR` when it moves. Until a waiting streaming server's first client
+reports tracking, the head pose is valid but not tracked.
+
+Eye views use the live client FOV/IPD; before a client reports one they use the last view a client
+reported (saved as `headset_view.txt` in the state directory), else a symmetric placeholder. The
+encoder reprojects a projection view submitted with a `fov` other than the one the headset displays
+onto the display FOV, so applications that cached an older projection still line up.
 `xrLocateSpacesKHR` aliases the OpenXR 1.1 `xrLocateSpaces` entry point.
 
 ## Configuration And Status

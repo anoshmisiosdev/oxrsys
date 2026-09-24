@@ -816,11 +816,45 @@ TEST_CASE("Runtime enumerates and creates LOCAL_FLOOR reference spaces", "[runti
     XR_CHECK(xrLocateSpace(localFloorSpace, context.localSpace, sampleTime, &location));
     CHECK((location.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) != 0);
     CHECK((location.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) != 0);
+    // LOCAL is anchored at the head (the 1.6m default head before any client), LOCAL_FLOOR
+    // at the floor directly below it.
     CHECK_THAT(location.pose.position.x, WithinAbs(0.0f, 0.001f));
-    CHECK_THAT(location.pose.position.y, WithinAbs(0.0f, 0.001f));
+    CHECK_THAT(location.pose.position.y, WithinAbs(-1.6f, 0.001f));
     CHECK_THAT(location.pose.position.z, WithinAbs(0.0f, 0.001f));
 
     XR_CHECK(xrDestroySpace(localFloorSpace));
+}
+
+TEST_CASE("The head starts at the LOCAL origin before any headset client", "[runtime][spaces]")
+{
+    // Regression: LOCAL used to sit at the floor until the first streamed head pose, so an
+    // application's first head pose in LOCAL was 1.6m up, then dropped to ~0 when the real
+    // anchor was captured. Seated OpenVR games (HITMAN 3) calibrate from that first pose and
+    // ended up under the floor.
+    RuntimeSessionContext context({XR_KHR_METAL_ENABLE_EXTENSION_NAME});
+
+    XrReferenceSpaceCreateInfo createInfo = {XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+    createInfo.poseInReferenceSpace.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+    createInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
+    XrSpace viewSpace = XR_NULL_HANDLE;
+    XR_CHECK(xrCreateReferenceSpace(context.session, &createInfo, &viewSpace));
+    createInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_STAGE;
+    XrSpace stageSpace = XR_NULL_HANDLE;
+    XR_CHECK(xrCreateReferenceSpace(context.session, &createInfo, &stageSpace));
+
+    XrSpaceLocation inLocal = {XR_TYPE_SPACE_LOCATION};
+    XR_CHECK(xrLocateSpace(viewSpace, context.localSpace, 1, &inLocal));
+    CHECK((inLocal.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) != 0);
+    CHECK_THAT(inLocal.pose.position.x, WithinAbs(0.0f, 0.001f));
+    CHECK_THAT(inLocal.pose.position.y, WithinAbs(0.0f, 0.001f));
+    CHECK_THAT(inLocal.pose.position.z, WithinAbs(0.0f, 0.001f));
+
+    XrSpaceLocation inStage = {XR_TYPE_SPACE_LOCATION};
+    XR_CHECK(xrLocateSpace(viewSpace, stageSpace, 1, &inStage));
+    CHECK_THAT(inStage.pose.position.y, WithinAbs(1.6f, 0.001f));
+
+    XR_CHECK(xrDestroySpace(stageSpace));
+    XR_CHECK(xrDestroySpace(viewSpace));
 }
 
 TEST_CASE("Runtime hides LOCAL_FLOOR for OpenXR 1.0 instances", "[runtime][spaces]")
@@ -2279,8 +2313,10 @@ TEST_CASE("Hand interaction pose and value inputs work through automation", "[ru
     XrSpaceLocation spaceLocation = {XR_TYPE_SPACE_LOCATION};
     XR_CHECK(xrLocateSpace(pinchActionSpace, context.localSpace, sampleTime, &spaceLocation));
     CHECK((spaceLocation.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) != 0);
+    // Automation poses are in world (floor) coordinates; LOCAL is anchored at the 1.6m
+    // default head, so the hand is 0.35m below the LOCAL origin.
     CHECK_THAT(spaceLocation.pose.position.x, WithinAbs(0.15f, 0.001f));
-    CHECK_THAT(spaceLocation.pose.position.y, WithinAbs(1.25f, 0.001f));
+    CHECK_THAT(spaceLocation.pose.position.y, WithinAbs(1.25f - 1.6f, 0.001f));
     CHECK_THAT(spaceLocation.pose.position.z, WithinAbs(-0.35f, 0.001f));
 
     std::array<XrSpace, 1> spaces = {pinchActionSpace};
@@ -2306,7 +2342,7 @@ TEST_CASE("Hand interaction pose and value inputs work through automation", "[ru
     REQUIRE(velocities.velocityCount == 1);
     CHECK((locationData[0].locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) != 0);
     CHECK_THAT(locationData[0].pose.position.x, WithinAbs(0.15f, 0.001f));
-    CHECK_THAT(locationData[0].pose.position.y, WithinAbs(1.25f, 0.001f));
+    CHECK_THAT(locationData[0].pose.position.y, WithinAbs(1.25f - 1.6f, 0.001f));
     CHECK_THAT(locationData[0].pose.position.z, WithinAbs(-0.35f, 0.001f));
     CHECK((velocityData[0].velocityFlags & XR_SPACE_VELOCITY_LINEAR_VALID_BIT) != 0);
     CHECK((velocityData[0].velocityFlags & XR_SPACE_VELOCITY_ANGULAR_VALID_BIT) != 0);

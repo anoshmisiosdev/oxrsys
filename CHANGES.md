@@ -73,6 +73,21 @@ This file tracks user-facing, integration-facing, and runtime-relevant changes f
 
 ### Fixed
 
+- Fixed applications that read the projection once at startup (OpenVR games through
+  OpenComposite, e.g. HITMAN 3) seeing a different view than the headset displays. Before a
+  streaming client connected, the runtime reported a placeholder symmetric FOV and 63 mm IPD, and
+  the encoder showed every eye image as if it had been rendered with the client's FOV: the image
+  was shifted outwards in each eye (about 10.75 degrees on a Quest 2), which reads as double
+  vision. The runtime now saves the last FOV/IPD a client reported (`headset_view.txt` in the
+  state directory) and reports it from session start, and the encoder reprojects any eye submitted
+  with a `fov` other than the display's onto the display FOV (black where nothing was rendered).
+- Fixed seated applications ending up under the floor. `LOCAL` sat at the floor until the first
+  streamed head pose and was then re-anchored at the head, so an application's first head pose in
+  `LOCAL` was 1.6 m up and later dropped to about 0 without notice; games that calibrate from the
+  first pose kept the wrong height. `LOCAL` is now anchored at the default head pose from the
+  start, the re-anchor on the first tracking packet queues
+  `XrEventDataReferenceSpaceChangePending` for `LOCAL` (and `LOCAL_FLOOR`), and while a streaming
+  server waits for its first client the head pose is valid but no longer reported as tracked.
 - Fixed intermittent visionOS immersive-entry stalls and compositor terminations by waiting for a
   reusable GPU slot before acquiring a finite-pool frame, reducing the shared-event wait from 10
   seconds to 10 milliseconds, and presenting startup frames without pose adjustment when ARKit has

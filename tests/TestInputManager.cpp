@@ -645,3 +645,119 @@ TEST_CASE("InputManager — head pose is only reported tracked with live data", 
         CHECK_THAT(im.GetHeadPose().position.y, WithinAbs(1.2, 0.001));
     }
 }
+
+namespace
+{
+
+oxr::protocol::TrackingPacket Quest2Packet(float headX, float headY, float headZ)
+{
+    oxr::protocol::TrackingPacket packet = {};
+    packet.timestampNs = 1'000'000'000;
+    packet.headPosition[0] = headX;
+    packet.headPosition[1] = headY;
+    packet.headPosition[2] = headZ;
+    packet.headOrientation[3] = 1.0f;
+    packet.ipd = 0.0583f;
+    packet.eyeFov[0] = -0.9076f;
+    packet.eyeFov[1] = 0.7330f;
+    packet.eyeFov[2] = 0.8378f;
+    packet.eyeFov[3] = -0.8727f;
+    return packet;
+}
+
+// Head position relative to the LOCAL origin (no rotation involved in these tests).
+float HeadYInLocal(const InputManager& im)
+{
+    return im.GetHeadPose().position.y - im.GetReferenceSpacePose(XR_REFERENCE_SPACE_TYPE_LOCAL).position.y;
+}
+
+} // namespace
+
+TEST_CASE("InputManager — LOCAL is head-anchored before and after the first tracking packet", "[input][spaces]")
+{
+    TrackingReceiver receiver;
+    InputManager im;
+
+    // Before any client: the head is the placeholder and LOCAL is provisionally anchored
+    // on it, so an app that reads its first pose sees the head at the LOCAL origin rather
+    // than 1.6m up (and never sees it jump down by the eye height later).
+    CHECK_THAT(HeadYInLocal(im), WithinAbs(0.0, 1e-5));
+    XrPosef unused{};
+    CHECK_FALSE(im.TakeLocalReferenceChange(unused));
+
+    im.SetTrackingReceiver(&receiver);
+    const oxr::protocol::TrackingPacket packet = Quest2Packet(-0.07f, 1.515f, 0.21f);
+    receiver.InjectPacket(reinterpret_cast<const uint8_t*>(&packet), sizeof(packet));
+    im.Update(0.011f);
+
+    CHECK_THAT(HeadYInLocal(im), WithinAbs(0.0, 1e-5));
+    CHECK_THAT(im.GetReferenceSpacePose(XR_REFERENCE_SPACE_TYPE_STAGE).position.y, WithinAbs(0.0, 1e-5));
+
+    // The re-anchor is reported once, as the new origin in the previous LOCAL space.
+    XrPosef moved{};
+    REQUIRE(im.TakeLocalReferenceChange(moved));
+    CHECK_THAT(moved.position.x, WithinAbs(-0.07, 1e-4));
+    CHECK_THAT(moved.position.y, WithinAbs(1.515 - 1.6, 1e-4));
+    CHECK_THAT(moved.position.z, WithinAbs(0.21, 1e-4));
+    CHECK_FALSE(im.TakeLocalReferenceChange(moved));
+
+    im.SetTrackingReceiver(nullptr);
+}
+
+TEST_CASE("InputManager — a streaming server waiting for its client reports an untracked head", "[input]")
+{
+    TrackingReceiver receiver;
+    InputManager im;
+    im.SetAwaitingStreamingClient(true);
+    CHECK_FALSE(im.IsHeadPoseTracked());
+
+    im.SetTrackingReceiver(&receiver);
+    CHECK_FALSE(im.IsHeadPoseTracked());
+    const oxr::protocol::TrackingPacket packet = Quest2Packet(0.0f, 1.5f, 0.0f);
+    receiver.InjectPacket(reinterpret_cast<const uint8_t*>(&packet), sizeof(packet));
+    im.Update(0.011f);
+    CHECK(im.IsHeadPoseTracked());
+    im.SetTrackingReceiver(nullptr);
+}
+
+TEST_CASE("InputManager — a restarted session reports the headset view from its first frame", "[input][restart]")
+{
+    // Session 1: the client streams its real view; the session persists it.
+    oxrsys::runtime::SavedHeadsetView saved;
+    {
+        TrackingReceiver receiver;
+        InputManager first;
+        first.SetAwaitingStreamingClient(true);
+        first.SetTrackingReceiver(&receiver);
+        const oxr::protocol::TrackingPacket packet = Quest2Packet(-0.07f, 1.515f, 0.21f);
+        receiver.InjectPacket(reinterpret_cast<const uint8_t*>(&packet), sizeof(packet));
+        first.Update(0.011f);
+        REQUIRE(first.TakeHeadsetViewUpdate(saved));
+        CHECK_FALSE(first.TakeHeadsetViewUpdate(saved)); // only on change
+        first.SetTrackingReceiver(nullptr);
+    }
+
+    // Session 2 (OpenComposite restarts its session to load input bindings): before the
+    // client's tracking reaches it, views already use the saved headset view, the head is
+    // untracked, and it sits at the LOCAL origin.
+    InputManager second;
+    second.SetSavedHeadsetView(saved);
+    second.SetAwaitingStreamingClient(true);
+
+    XrView views[2] = {};
+    second.GetEyeViews(views, 2);
+    CHECK_THAT(views[0].fov.angleLeft, WithinAbs(-0.9076, 1e-5));
+    CHECK_THAT(views[0].fov.angleRight, WithinAbs(0.7330, 1e-5));
+    CHECK_THAT(views[1].fov.angleLeft, WithinAbs(-0.7330, 1e-5));
+    CHECK_THAT(views[1].fov.angleRight, WithinAbs(0.9076, 1e-5));
+    CHECK_THAT(views[1].pose.position.x - views[0].pose.position.x, WithinAbs(0.0583, 1e-5));
+    CHECK_FALSE(second.IsHeadPoseTracked());
+    CHECK_THAT(HeadYInLocal(second), WithinAbs(0.0, 1e-5));
+
+    // Without a saved view the placeholder is still used.
+    InputManager fresh;
+    XrView placeholder[2] = {};
+    fresh.GetEyeViews(placeholder, 2);
+    CHECK_THAT(placeholder[1].pose.position.x - placeholder[0].pose.position.x, WithinAbs(0.063, 1e-5));
+    CHECK_THAT(placeholder[0].fov.angleLeft, WithinAbs(-placeholder[0].fov.angleRight, 1e-6));
+}

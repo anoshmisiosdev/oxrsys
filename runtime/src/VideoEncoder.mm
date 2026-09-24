@@ -1766,6 +1766,44 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
         rightTex = composed;
     }
 
+    // An eye rendered with a fov other than the one the headset displays (an application that
+    // cached an older projection) is redrawn onto the display fov; shown as-is it would be
+    // shifted and scaled in each eye. Runs after the quads, which were placed in the submitted
+    // fov, so they move with the eye image.
+    if (stereo && frameSource.displayFovValid)
+    {
+        for (int eye = 0; eye < 2; ++eye)
+        {
+            const FrameEyeView& view = frameSource.views[eye];
+            if (!view.valid || !oxrsys::video::FovNeedsRemap(view.fov, frameSource.displayFov[eye]))
+            {
+                continue;
+            }
+            const oxrsys::video::FovRemap remap =
+                oxrsys::video::ComputeFovRemap(view.fov, frameSource.displayFov[eye]);
+            id<MTLTexture>& eyeTex = eye == 0 ? leftTex : rightTex;
+            id<MTLTexture> reprojected = (__bridge id<MTLTexture>)fovReprojector_.Reproject(
+                (__bridge void*)cmdBuf, (__bridge void*)eyeTex, remap,
+                eye == 0 ? &slot.leftFovTexture : &slot.rightFovTexture);
+            if (reprojected == nil)
+            {
+                return dropAcquiredSlot("failed to reproject an eye onto the display fov");
+            }
+            eyeTex = reprojected;
+
+            static std::atomic_bool loggedFovRemap[2] = {false, false};
+            if (!loggedFovRemap[eye].exchange(true))
+            {
+                const FrameFov& from = view.fov;
+                const FrameFov& to = frameSource.displayFov[eye];
+                spdlog::info("VideoEncoder: {} eye was rendered with fov L={:.4f} R={:.4f} U={:.4f} D={:.4f}; "
+                             "reprojecting onto the display fov L={:.4f} R={:.4f} U={:.4f} D={:.4f}",
+                             eye == 0 ? "left" : "right", from.angleLeft, from.angleRight, from.angleUp,
+                             from.angleDown, to.angleLeft, to.angleRight, to.angleUp, to.angleDown);
+            }
+        }
+    }
+
     const auto leftCopyMode = oxrsys::video::SelectTextureCopyMode(
         static_cast<uint64_t>(leftTex.pixelFormat));
     const auto rightCopyMode = stereo
@@ -2172,6 +2210,7 @@ void VideoEncoder::DestroySlots()
 {
     std::lock_guard<std::mutex> lock(slotMutex_);
     quadRenderer_.Shutdown();
+    fovReprojector_.Shutdown();
     for (BufferSlot& slot : slots_)
     {
         slot.inUse = false;
@@ -2210,6 +2249,16 @@ void VideoEncoder::DestroySlots()
         {
             [(id<MTLTexture>)slot.rightQuadTexture release];
             slot.rightQuadTexture = nullptr;
+        }
+        if (slot.leftFovTexture != nullptr)
+        {
+            [(id<MTLTexture>)slot.leftFovTexture release];
+            slot.leftFovTexture = nullptr;
+        }
+        if (slot.rightFovTexture != nullptr)
+        {
+            [(id<MTLTexture>)slot.rightFovTexture release];
+            slot.rightFovTexture = nullptr;
         }
         if (slot.metalTexture != nullptr)
         {

@@ -13,6 +13,8 @@
 
 #include <oxrsys/protocol/Protocol.h>
 
+#include "HeadsetViewStore.h"
+
 class TrackingReceiver;
 
 class InputManager
@@ -64,6 +66,25 @@ public:
 
     // Re-anchor the LOCAL reference to the current head pose (recenter).
     void RecenterLocalReference();
+
+    // Reports (once) that LOCAL / LOCAL_FLOOR moved: the first streamed head pose
+    // replaces the provisional anchor at the default head pose. `poseInPreviousSpace`
+    // is the new LOCAL origin expressed in the previous LOCAL space, as
+    // XrEventDataReferenceSpaceChangePending wants it. The session turns this into
+    // that event; returns false when nothing moved since the last call.
+    bool TakeLocalReferenceChange(XrPosef& poseInPreviousSpace);
+
+    // A streaming server is running and waiting for its first client. Until that
+    // client's first tracking packet, the head pose is the placeholder default and
+    // must not be reported as tracked.
+    void SetAwaitingStreamingClient(bool awaiting) { awaitingStreamingClient_.store(awaiting); }
+
+    // The last view a streaming headset reported (possibly from an earlier run).
+    // Used for the eye views whenever no live FOV/IPD is streaming yet.
+    void SetSavedHeadsetView(const oxrsys::runtime::SavedHeadsetView& view) { savedHeadsetView_ = view; }
+    // Returns true (once per change) when the live streamed FOV/IPD differs from the
+    // saved view; `view` then holds the new one to persist.
+    bool TakeHeadsetViewUpdate(oxrsys::runtime::SavedHeadsetView& view);
 
     // Controller poses (world space)
     XrPosef GetControllerPose(Hand hand) const;
@@ -150,9 +171,17 @@ private:
     // LOCAL reference space anchor, captured from the first streamed head pose
     // (and on recenter). Position is the HMD position at capture; orientation is
     // the yaw-only (gravity-aligned) component of the head orientation at capture.
+    // Until the first streamed head pose, LOCAL is provisionally anchored at the default
+    // head pose, so the head sits at the LOCAL origin from the very first frame (as OpenXR
+    // specifies) instead of 1.6m up, and capturing the real anchor later is continuous.
     bool localReferenceCaptured_ = false;
-    glm::vec3 localReferencePosition_ = {0.0f, 0.0f, 0.0f};
+    glm::vec3 localReferencePosition_ = {0.0f, 1.6f, 0.0f};
     glm::quat localReferenceYaw_ = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+    bool localReferenceChanged_ = false;
+    XrPosef localReferenceChangePose_ = {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
+
+    std::atomic<bool> awaitingStreamingClient_{false};
+    oxrsys::runtime::SavedHeadsetView savedHeadsetView_;
 
     glm::quat headQuat_ = glm::quat(1.0f, 0.0f, 0.0f, 0.0f); // w,x,y,z
     glm::quat leftControllerRot_ = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);

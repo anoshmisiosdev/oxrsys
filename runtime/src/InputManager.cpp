@@ -222,6 +222,12 @@ bool InputManager::IsHeadPoseTracked() const
     // GetHeadPose() is now a stale last-known pose — valid, but not tracked. If no client
     // was ever attached we are in simulator/automation mode, which synthesises a head pose
     // on purpose; reporting that as tracked is that mode's contract.
+    // A streaming server waiting for its first client: the head pose is the placeholder,
+    // not a (simulated) tracked head.
+    if (awaitingStreamingClient_.load() && !streamingEverAttached_.load())
+    {
+        return false;
+    }
     return !streamingEverAttached_.load();
 }
 
@@ -251,8 +257,16 @@ void InputManager::UpdateFromStreaming()
     // content authored at LOCAL y=0 appeared on the physical floor.
     if (!localReferenceCaptured_)
     {
+        const glm::vec3 previousPosition = localReferencePosition_;
+        const glm::quat previousYaw = localReferenceYaw_;
         RecenterLocalReference();
         localReferenceCaptured_ = true;
+        const glm::quat previousInverse = glm::inverse(previousYaw);
+        const glm::quat relativeYaw = previousInverse * localReferenceYaw_;
+        const glm::vec3 relativePosition = previousInverse * (localReferencePosition_ - previousPosition);
+        localReferenceChangePose_.orientation = {relativeYaw.x, relativeYaw.y, relativeYaw.z, relativeYaw.w};
+        localReferenceChangePose_.position = {relativePosition.x, relativePosition.y, relativePosition.z};
+        localReferenceChanged_ = true;
         spdlog::info("InputManager: captured LOCAL reference origin pos=({:.3f}, {:.3f}, {:.3f}) "
                      "(STAGE-relative eye height={:.3f}m)",
                      localReferencePosition_.x, localReferencePosition_.y,
@@ -422,6 +436,38 @@ void InputManager::RecenterLocalReference()
     localReferenceYaw_ = glm::angleAxis(yaw, glm::vec3(0.0f, 1.0f, 0.0f));
 }
 
+bool InputManager::TakeLocalReferenceChange(XrPosef& poseInPreviousSpace)
+{
+    if (!localReferenceChanged_)
+    {
+        return false;
+    }
+    localReferenceChanged_ = false;
+    poseInPreviousSpace = localReferenceChangePose_;
+    return true;
+}
+
+bool InputManager::TakeHeadsetViewUpdate(oxrsys::runtime::SavedHeadsetView& view)
+{
+    if (!IsStreaming() || !oxrsys::runtime::IsPlausibleHeadsetView(streamingIpd_, streamingFov_))
+    {
+        return false;
+    }
+    if (!oxrsys::runtime::HeadsetViewsDiffer(savedHeadsetView_, streamingIpd_, streamingFov_))
+    {
+        return false;
+    }
+    savedHeadsetView_.valid = true;
+    savedHeadsetView_.ipd = streamingIpd_;
+    for (int i = 0; i < 4; ++i)
+    {
+        savedHeadsetView_.fov[i] = streamingFov_[i];
+    }
+    savedHeadsetView_.clientName = streamingClientName_;
+    view = savedHeadsetView_;
+    return true;
+}
+
 XrPosef InputManager::GetReferenceSpacePose(XrReferenceSpaceType referenceSpaceType) const
 {
     XrPosef pose{};
@@ -444,24 +490,19 @@ XrPosef InputManager::GetReferenceSpacePose(XrReferenceSpaceType referenceSpaceT
             break;
 
         case XR_REFERENCE_SPACE_TYPE_LOCAL:
-            if (localReferenceCaptured_)
-            {
-                pose.position = {localReferencePosition_.x,
-                                 localReferencePosition_.y,
-                                 localReferencePosition_.z};
-                pose.orientation = {localReferenceYaw_.x, localReferenceYaw_.y,
-                                    localReferenceYaw_.z, localReferenceYaw_.w};
-            }
+            // Captured anchor, or the provisional one at the default head pose.
+            pose.position = {localReferencePosition_.x,
+                             localReferencePosition_.y,
+                             localReferencePosition_.z};
+            pose.orientation = {localReferenceYaw_.x, localReferenceYaw_.y,
+                                localReferenceYaw_.z, localReferenceYaw_.w};
             break;
 
         case XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR:
             // LOCAL's horizontal position and yaw, but anchored at floor height.
-            if (localReferenceCaptured_)
-            {
-                pose.position = {localReferencePosition_.x, floorOriginY, localReferencePosition_.z};
-                pose.orientation = {localReferenceYaw_.x, localReferenceYaw_.y,
-                                    localReferenceYaw_.z, localReferenceYaw_.w};
-            }
+            pose.position = {localReferencePosition_.x, floorOriginY, localReferencePosition_.z};
+            pose.orientation = {localReferenceYaw_.x, localReferenceYaw_.y,
+                                localReferenceYaw_.z, localReferenceYaw_.w};
             break;
 
         default:
@@ -480,14 +521,25 @@ void InputManager::GetEyeViews(XrView* views, uint32_t viewCount) const
 
     glm::quat rot = GetHeadRotation();
     glm::vec3 right = rot * glm::vec3(1.0f, 0.0f, 0.0f);
-    float ipd = (IsStreaming() && streamingIpd_ > 0.0f)
-        ? streamingIpd_
-        : DefaultIpd;
-    float halfIpd = ipd * 0.5f;
-
     bool hasStreamingFov = IsStreaming() &&
         streamingFov_[0] < 0.0f && streamingFov_[1] > 0.0f &&
         streamingFov_[2] > 0.0f && streamingFov_[3] < 0.0f;
+
+    // No live view yet: use the one the headset reported last time, if any, so apps that
+    // read the projection once at startup render what the headset will display.
+    const bool useSavedView = !hasStreamingFov && savedHeadsetView_.valid;
+    const float* eyeFov = hasStreamingFov ? streamingFov_ : savedHeadsetView_.fov;
+
+    float ipd = DefaultIpd;
+    if (IsStreaming() && streamingIpd_ > 0.0f)
+    {
+        ipd = streamingIpd_;
+    }
+    else if (savedHeadsetView_.valid)
+    {
+        ipd = savedHeadsetView_.ipd;
+    }
+    float halfIpd = ipd * 0.5f;
 
     for (uint32_t i = 0; i < 2; i++)
     {
@@ -508,20 +560,20 @@ void InputManager::GetEyeViews(XrView* views, uint32_t viewCount) const
         // Legacy fallback for clients that do not send TrackingPacket.eyeFov.
         // fov_degrees is the vertical FOV; horizontal FOV is derived from the
         // texture aspect ratio so angular pixels are square.
-        if (hasStreamingFov)
+        if (hasStreamingFov || useSavedView)
         {
             if (i == 0)
             {
-                views[i].fov.angleLeft = streamingFov_[0];
-                views[i].fov.angleRight = streamingFov_[1];
+                views[i].fov.angleLeft = eyeFov[0];
+                views[i].fov.angleRight = eyeFov[1];
             }
             else
             {
-                views[i].fov.angleLeft = -streamingFov_[1];
-                views[i].fov.angleRight = -streamingFov_[0];
+                views[i].fov.angleLeft = -eyeFov[1];
+                views[i].fov.angleRight = -eyeFov[0];
             }
-            views[i].fov.angleUp = streamingFov_[2];
-            views[i].fov.angleDown = streamingFov_[3];
+            views[i].fov.angleUp = eyeFov[2];
+            views[i].fov.angleDown = eyeFov[3];
         }
         else
         {
@@ -545,7 +597,7 @@ void InputManager::GetEyeViews(XrView* views, uint32_t viewCount) const
     if (!loggedFov)
     {
         spdlog::info("InputManager: Using {} FOV/IPD (L={:.2f} R={:.2f} U={:.2f} D={:.2f}, IPD={:.1f}mm)",
-                      hasStreamingFov ? "streaming" : "default",
+                      hasStreamingFov ? "streaming" : (useSavedView ? "saved headset" : "default"),
                       views[0].fov.angleLeft, views[0].fov.angleRight,
                       views[0].fov.angleUp, views[0].fov.angleDown,
                       ipd * 1000.0f);

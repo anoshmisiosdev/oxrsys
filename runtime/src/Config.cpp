@@ -235,6 +235,7 @@ void Config::DetectDylibDir()
     logFilePath = stateDir + "/oxrsys-runtime.log";
     questLogFilePath = stateDir + "/oxrsys-headset.log";
     runtimeStatusPath = stateDir + "/runtime_status.json";
+    headsetViewPath = stateDir + "/headset_view.txt";
 }
 
 // ─── Config file parsing ─────────────────────────────────────────────────────
