@@ -9,6 +9,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <atomic>
 
 namespace oxrsys::quad
@@ -328,7 +329,7 @@ void* QuadLayerRenderer::GetPipeline(uint64_t pixelFormat, FrameQuadBlend blend)
 
 void* QuadLayerRenderer::ComposeEye(void* commandBuffer, void* eyeTexture,
                                     const FrameSource& frameSource, bool leftEye,
-                                    void** cachedTexture)
+                                    void** cachedTexture, uint32_t minWidth, uint32_t minHeight)
 {
     if (!HasWorkForEye(frameSource, leftEye))
     {
@@ -352,14 +353,18 @@ void* QuadLayerRenderer::ComposeEye(void* commandBuffer, void* eyeTexture,
     // Reuse the per-eye composite texture; it only changes when the eye image's
     // size or format changes, which happens at session start or a streaming
     // reconfigure, not per frame.
+    const NSUInteger targetWidth = std::max<NSUInteger>(source.width, minWidth);
+    const NSUInteger targetHeight = std::max<NSUInteger>(source.height, minHeight);
+    const bool scaleBackground = targetWidth != source.width || targetHeight != source.height;
+
     id<MTLTexture> destination = (__bridge id<MTLTexture>)*cachedTexture;
     if (destination == nil || destination.pixelFormat != source.pixelFormat ||
-        destination.width != source.width || destination.height != source.height)
+        destination.width != targetWidth || destination.height != targetHeight)
     {
         MTLTextureDescriptor* descriptor =
             [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:source.pixelFormat
-                                                               width:source.width
-                                                              height:source.height
+                                                               width:targetWidth
+                                                              height:targetHeight
                                                            mipmapped:NO];
         descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite |
                            MTLTextureUsageRenderTarget;
@@ -379,7 +384,10 @@ void* QuadLayerRenderer::ComposeEye(void* commandBuffer, void* eyeTexture,
     }
 
     // Start from the projection layer's pixels, then draw the quads on top --
-    // OpenXR composites layers in submission order.
+    // OpenXR composites layers in submission order. A smaller eye image is drawn scaled to
+    // the destination as the first primitive of the render pass below instead.
+    if (!scaleBackground)
+    {
     id<MTLBlitCommandEncoder> blit = [cmdBuf blitCommandEncoder];
     if (blit == nil)
     {
@@ -396,10 +404,11 @@ void* QuadLayerRenderer::ComposeEye(void* commandBuffer, void* eyeTexture,
          destinationLevel:0
         destinationOrigin:MTLOriginMake(0, 0, 0)];
     [blit endEncoding];
+    }
 
     MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
     pass.colorAttachments[0].texture = destination;
-    pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
+    pass.colorAttachments[0].loadAction = scaleBackground ? MTLLoadActionDontCare : MTLLoadActionLoad;
     pass.colorAttachments[0].storeAction = MTLStoreActionStore;
 
     id<MTLRenderCommandEncoder> encoder = [cmdBuf renderCommandEncoderWithDescriptor:pass];
@@ -411,6 +420,38 @@ void* QuadLayerRenderer::ComposeEye(void* commandBuffer, void* eyeTexture,
     [encoder setFragmentSamplerState:(id<MTLSamplerState>)sampler_ atIndex:0];
 
     bool drewAnything = false;
+    if (scaleBackground)
+    {
+        void* backgroundPipeline =
+            GetPipeline(static_cast<uint64_t>(destination.pixelFormat), FrameQuadBlend::Opaque);
+        if (backgroundPipeline == nullptr)
+        {
+            [encoder endEncoding];
+            LogQuadFailureOnce("failed to create the eye background pipeline");
+            return nullptr;
+        }
+        // Full-target strip (UL, LL, UR, LR), sampling the whole eye image; alpha is kept.
+        QuadVertex background[4] = {};
+        static constexpr float kCorners[4][4] = {
+            {-1.0f, 1.0f, 0.0f, 0.0f}, {-1.0f, -1.0f, 0.0f, 1.0f},
+            {1.0f, 1.0f, 1.0f, 0.0f}, {1.0f, -1.0f, 1.0f, 1.0f}};
+        for (size_t i = 0; i < 4; ++i)
+        {
+            background[i].position[0] = kCorners[i][0];
+            background[i].position[1] = kCorners[i][1];
+            background[i].position[2] = 0.0f;
+            background[i].position[3] = 1.0f;
+            background[i].uv[0] = kCorners[i][2];
+            background[i].uv[1] = kCorners[i][3];
+        }
+        QuadFragmentUniforms backgroundUniforms = {};
+        backgroundUniforms.colorMode = SelectColorMode(source.pixelFormat, destination.pixelFormat);
+        [encoder setRenderPipelineState:(id<MTLRenderPipelineState>)backgroundPipeline];
+        [encoder setVertexBytes:background length:sizeof(background) atIndex:0];
+        [encoder setFragmentTexture:source atIndex:0];
+        [encoder setFragmentBytes:&backgroundUniforms length:sizeof(backgroundUniforms) atIndex:0];
+        [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+    }
     for (const FrameQuadLayer& quad : frameSource.quads)
     {
         if (!quad.IsValid() || !quad.IsVisibleForEye(leftEye))
@@ -476,7 +517,8 @@ void* QuadLayerRenderer::ComposeEye(void* commandBuffer, void* eyeTexture,
     // Every quad was culled (behind the eye, degenerate pose, unusable format).
     // The blit already produced an exact copy, so returning `destination` is
     // still correct; returning the source avoids the redundant copy next frame.
-    return drewAnything ? (void*)destination : eyeTexture;
+    // A scaled background makes the destination the only correct result.
+    return (drewAnything || scaleBackground) ? (void*)destination : eyeTexture;
 }
 
 } // namespace oxrsys::quad

@@ -73,6 +73,10 @@ This file tracks user-facing, integration-facing, and runtime-relevant changes f
 
 ### Fixed
 
+- Fixed quad layers over tiny eye images being reduced to a single texel. OpenVR games show
+  loading screens and cutscenes as an overlay over 1x1 black eye textures (HITMAN 3 through
+  OpenComposite); quads were composited at the eye image's own size, so the headset showed black.
+  The quad composite is now at least the encoded eye size, with the eye image scaled behind it.
 - Fixed applications that read the projection once at startup (OpenVR games through
   OpenComposite, e.g. HITMAN 3) seeing a different view than the headset displays. Before a
   streaming client connected, the runtime reported a placeholder symmetric FOV and 63 mm IPD, and
