@@ -1531,6 +1531,20 @@ bool VideoEncoder::Encode(FrameImageSource imageSource, int64_t timestampNs, OnN
 bool VideoEncoder::EncodeStereo(FrameSource frameSource, int64_t timestampNs, OnNalUnitCallback callback,
                                  OnFrameEncodedCallback frameCallback)
 {
+    // Debug: OXRSYS_DEBUG_DUMP_STREAM=<path> appends the Annex-B elementary stream to <path>.
+    static FILE* streamDump = [] {
+        const char* path = std::getenv("OXRSYS_DEBUG_DUMP_STREAM");
+        return path != nullptr && path[0] != '\0' ? std::fopen(path, "wb") : nullptr;
+    }();
+    if (streamDump != nullptr && callback)
+    {
+        OnNalUnitCallback inner = std::move(callback);
+        callback = [inner](const uint8_t* data, size_t size, bool keyframe, int64_t ts) {
+            std::fwrite(data, 1, size, streamDump);
+            std::fflush(streamDump);
+            inner(data, size, keyframe, ts);
+        };
+    }
     return EncodeInternal(std::move(frameSource), true, timestampNs,
                           std::move(callback), std::move(frameCallback));
 }
