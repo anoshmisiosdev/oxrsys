@@ -249,6 +249,7 @@ private:
     GLint blitReprojectionWarpEnabledUniform_ = -1;
     GLint blitReprojectionWarpOffsetUniform_ = -1;
     GLint blitPassthroughAlphaEnabledUniform_ = -1;
+    GLint blitFullRangeSourceUniform_ = -1;
     GLint shellMvpUniform_ = -1;
 
     // Networking

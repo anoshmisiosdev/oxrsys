@@ -73,6 +73,15 @@ This file tracks user-facing, integration-facing, and runtime-relevant changes f
 
 ### Fixed
 
+- Fixed the Quest client showing every stream washed out (lifted blacks, flattened midtones,
+  "like 10-bit on an 8-bit panel"). The stream carries sRGB-encoded values and the client's eye
+  swapchains are `GL_SRGB8_ALPHA8`, which sRGB-encode on write, but the blit wrote the sampled
+  values directly, encoding them a second time (code 16 displayed as ~74, mid-grey 128 as ~193).
+  The blit now converts to linear before writing. It also undoes the external sampler's
+  limited-range expansion when the decoder reports full-range output (the host's software HEVC
+  fallback), which the sampler ignores. Verified with `tools/color` on a Quest 2: codes 16/32/64/
+  128/192/235 now display as 17/32/66/131/196/241 on both the hardware-helper (limited range) and
+  software (full range) encode paths.
 - Fixed applications that read the projection once at startup (OpenVR games through
   OpenComposite, e.g. HITMAN 3) seeing a different view than the headset displays. Before a
   streaming client connected, the runtime reported a placeholder symmetric FOV and 63 mm IPD, and

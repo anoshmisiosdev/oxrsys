@@ -121,6 +121,16 @@ uniform vec2 uFoveationEyeSizeRatio;
 uniform int uReprojectionWarpEnabled;
 uniform vec2 uReprojectionWarpOffset;
 uniform int uPassthroughAlphaEnabled;
+uniform int uFullRangeSource;
+
+// The stream carries sRGB-encoded values (the host streams the application's sRGB swapchain
+// codes, tagged BT.709). The eye swapchains are GL_SRGB8_ALPHA8, which sRGB-encodes on write,
+// so the shader must output linear values; writing the sampled values directly encoded them a
+// second time (washed-out, lifted blacks: code 16 displayed as ~74).
+vec3 srgbToLinear(vec3 c) {
+    c = clamp(c, vec3(0.0), vec3(1.0));
+    return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), c));
+}
 
 float compressAxis(float eyeUv, float centerSize, float centerShift, float edgeRatio) {
     float c0 = (1.0 - centerSize) * 0.5;
@@ -233,12 +243,16 @@ void main() {
             color = clamp(color + detail * (0.125 * uUpscaleSharpness), vec3(0.0), vec3(1.0));
         }
     }
+    if (uFullRangeSource != 0) {
+        // The external sampler expanded 16-235 to 0-255; a full-range stream needs that undone.
+        color = color * (219.0 / 255.0) + vec3(16.0 / 255.0);
+    }
     float alpha = 1.0;
     if (uPassthroughAlphaEnabled != 0) {
         float maxChannel = max(max(color.r, color.g), color.b);
         alpha = smoothstep(0.02, 0.10, maxChannel);
     }
-    fragColor = vec4(color, alpha);
+    fragColor = vec4(srgbToLinear(color), alpha);
 }
 )";
 
@@ -1952,6 +1966,7 @@ bool XrApp::CreateSwapchains()
         glGetUniformLocation(blitProgram_, "uReprojectionWarpOffset");
     blitPassthroughAlphaEnabledUniform_ =
         glGetUniformLocation(blitProgram_, "uPassthroughAlphaEnabled");
+    blitFullRangeSourceUniform_ = glGetUniformLocation(blitProgram_, "uFullRangeSource");
 
     glUseProgram(blitProgram_);
     glUniform1i(blitTextureUniform_, 0);
@@ -4215,6 +4230,8 @@ void XrApp::BlitVideoToSwapchain(int eye)
                 reprojectionWarpOffsetX_, reprojectionWarpOffsetY_);
     glUniform1i(blitPassthroughAlphaEnabledUniform_,
                 EvaluatePassthroughAlphaKey().useBlackKeyAlpha ? 1 : 0);
+    glUniform1i(blitFullRangeSourceUniform_,
+                (videoDecoder_ && videoDecoder_->IsFullRangeOutput()) ? 1 : 0);
 
     glBindVertexArray(blitVao_);
     glDrawArrays(GL_TRIANGLES, 0, 6);
