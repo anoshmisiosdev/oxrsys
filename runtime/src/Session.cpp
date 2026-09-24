@@ -867,6 +867,30 @@ XrResult Session::EndFrame(const XrFrameEndInfo* frameEndInfo)
     }
 
     frameSource.quads = std::move(pendingQuads);
+    {
+        // Describe the quad layers whenever the set changes (and every ~10 s while any are
+        // shown), so a layer that covers the view can be identified from the log.
+        static std::atomic<size_t> loggedQuadCount{static_cast<size_t>(-1)};
+        static std::atomic<uint32_t> quadLogFrames{0};
+        const size_t quadCount = frameSource.quads.size();
+        const bool periodic = quadCount > 0 && (quadLogFrames.fetch_add(1) % 900) == 0;
+        if (loggedQuadCount.exchange(quadCount) != quadCount || periodic)
+        {
+            spdlog::info("OXRSys: frame has {} quad layer(s) over the projection layer "
+                         "({} submitted beneath it)", quadCount, quadsBeforeProjection);
+            for (size_t i = 0; i < quadCount; ++i)
+            {
+                const FrameQuadLayer& quad = frameSource.quads[i];
+                spdlog::info("OXRSys:   quad {}: {:.3f}x{:.3f} m at ({:.3f}, {:.3f}, {:.3f}) "
+                             "src rect {}x{}+{}+{} of {}x{} blend={} eyes={}",
+                             i, quad.widthMeters, quad.heightMeters, quad.pose.position[0],
+                             quad.pose.position[1], quad.pose.position[2], quad.image.sourceWidth,
+                             quad.image.sourceHeight, quad.image.sourceX, quad.image.sourceY,
+                             quad.image.imageWidth, quad.image.imageHeight,
+                             static_cast<int>(quad.blend), static_cast<int>(quad.eyeVisibility));
+            }
+        }
+    }
     if (quadsBeforeProjection > 0)
     {
         static std::atomic_bool loggedOccludedQuads{false};

@@ -22,7 +22,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <exception>
 #include <utility>
 #include <vector>
@@ -1533,6 +1535,83 @@ bool VideoEncoder::EncodeStereo(FrameSource frameSource, int64_t timestampNs, On
                           std::move(callback), std::move(frameCallback));
 }
 
+
+namespace
+{
+
+// Debug: OXRSYS_DEBUG_DUMP_FRAME=N writes the N-th encoded frame's composed eye images (after
+// quad composition and fov reprojection, i.e. exactly what is encoded) and every quad layer's
+// source image to /tmp as PPM (+ a PGM of the alpha channel for quads). 8-bit RGBA/BGRA only.
+void DebugDumpTexture(id<MTLCommandBuffer> cmdBuf, id<MTLTexture> texture, const std::string& path,
+                      bool writeAlpha)
+{
+    if (texture == nil)
+    {
+        return;
+    }
+    const MTLPixelFormat format = texture.pixelFormat;
+    const bool bgra = format == MTLPixelFormatBGRA8Unorm || format == MTLPixelFormatBGRA8Unorm_sRGB;
+    const bool rgba = format == MTLPixelFormatRGBA8Unorm || format == MTLPixelFormatRGBA8Unorm_sRGB;
+    if (!bgra && !rgba)
+    {
+        spdlog::info("VideoEncoder: debug dump skips {} (pixel format {})", path, static_cast<int>(format));
+        return;
+    }
+    MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
+                                                                                 width:texture.width
+                                                                                height:texture.height
+                                                                             mipmapped:NO];
+    d.storageMode = MTLStorageModeShared;
+    d.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> readback = [texture.device newTextureWithDescriptor:d];
+    id<MTLBlitCommandEncoder> blit = [cmdBuf blitCommandEncoder];
+    [blit copyFromTexture:texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+               sourceSize:MTLSizeMake(texture.width, texture.height, 1)
+                toTexture:readback destinationSlice:0 destinationLevel:0
+        destinationOrigin:MTLOriginMake(0, 0, 0)];
+    [blit endEncoding];
+    const std::string pathCopy = path;
+    [cmdBuf addCompletedHandler:^(id<MTLCommandBuffer>) {
+        const NSUInteger w = readback.width, h = readback.height;
+        std::vector<uint8_t> pixels(w * h * 4);
+        [readback getBytes:pixels.data() bytesPerRow:w * 4 fromRegion:MTLRegionMake2D(0, 0, w, h)
+               mipmapLevel:0];
+        FILE* f = std::fopen(pathCopy.c_str(), "wb");
+        FILE* a = writeAlpha ? std::fopen((pathCopy + ".alpha.pgm").c_str(), "wb") : nullptr;
+        double sum[4] = {};
+        if (f != nullptr)
+        {
+            std::fprintf(f, "P6\n%lu %lu\n255\n", (unsigned long)w, (unsigned long)h);
+            if (a != nullptr)
+            {
+                std::fprintf(a, "P5\n%lu %lu\n255\n", (unsigned long)w, (unsigned long)h);
+            }
+            for (NSUInteger i = 0; i < w * h; ++i)
+            {
+                const uint8_t* p = &pixels[i * 4];
+                uint8_t rgb[3] = {bgra ? p[2] : p[0], p[1], bgra ? p[0] : p[2]};
+                std::fwrite(rgb, 1, 3, f);
+                if (a != nullptr)
+                {
+                    std::fputc(p[3], a);
+                }
+                sum[0] += rgb[0]; sum[1] += rgb[1]; sum[2] += rgb[2]; sum[3] += p[3];
+            }
+            std::fclose(f);
+        }
+        if (a != nullptr)
+        {
+            std::fclose(a);
+        }
+        const double n = static_cast<double>(w * h);
+        spdlog::info("VideoEncoder: debug dump {} ({}x{}) mean rgba {:.1f} {:.1f} {:.1f} {:.1f}", pathCopy, w, h,
+                     sum[0] / n, sum[1] / n, sum[2] / n, sum[3] / n);
+        [readback release];
+    }];
+}
+
+} // namespace
+
 bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
                                    int64_t timestampNs, OnNalUnitCallback callback,
                                    OnFrameEncodedCallback frameCallback)
@@ -1800,6 +1879,64 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
                              "reprojecting onto the display fov L={:.4f} R={:.4f} U={:.4f} D={:.4f}",
                              eye == 0 ? "left" : "right", from.angleLeft, from.angleRight, from.angleUp,
                              from.angleDown, to.angleLeft, to.angleRight, to.angleUp, to.angleDown);
+            }
+        }
+    }
+
+    {
+        // Debug knobs (see DebugDumpTexture): OXRSYS_DEBUG_DUMP_FRAME=N dumps the N-th encoded
+        // frame; OXRSYS_DEBUG_DUMP_QUADS=1 dumps the 45th frame after every change in the number
+        // of quad layers (loading screens, menus). Each dump has the projection eyes as submitted,
+        // the composed eyes as encoded, and every quad image.
+        static const long dumpFrame = [] {
+            const char* value = std::getenv("OXRSYS_DEBUG_DUMP_FRAME");
+            return value != nullptr ? std::strtol(value, nullptr, 10) : 0L;
+        }();
+        static const bool dumpOnQuadChange = [] {
+            const char* value = std::getenv("OXRSYS_DEBUG_DUMP_QUADS");
+            return value != nullptr && value[0] == '1';
+        }();
+        static std::atomic<long> encodedFrames{0};
+        static std::atomic<size_t> lastQuadCount{0};
+        static std::atomic<long> framesSinceQuadChange{0};
+        static std::atomic<int> dumpSequence{0};
+        const long frameIndex = encodedFrames.fetch_add(1) + 1;
+        bool dumpNow = dumpFrame > 0 && frameIndex == dumpFrame;
+        // On demand: `touch /tmp/oxrsys_dump_request` (only when a dump knob is set).
+        if ((dumpFrame > 0 || dumpOnQuadChange) && (frameIndex % 30) == 0 &&
+            std::remove("/tmp/oxrsys_dump_request") == 0)
+        {
+            dumpNow = true;
+        }
+        if (dumpOnQuadChange)
+        {
+            if (lastQuadCount.exchange(frameSource.quads.size()) != frameSource.quads.size())
+            {
+                framesSinceQuadChange.store(0);
+            }
+            if (framesSinceQuadChange.fetch_add(1) + 1 == 45)
+            {
+                dumpNow = true;
+            }
+        }
+        if (dumpNow)
+        {
+            const std::string prefix = "/tmp/oxrsys_dump" + std::to_string(dumpSequence.fetch_add(1)) + "_";
+            spdlog::info("VideoEncoder: debug dump {}* at encoded frame {} with {} quad layer(s)", prefix,
+                         frameIndex, frameSource.quads.size());
+            DebugDumpTexture(cmdBuf, (__bridge id<MTLTexture>)frameSource.left.GetImage(),
+                             prefix + "submitted_left.ppm", true);
+            DebugDumpTexture(cmdBuf, leftTex, prefix + "encoded_left.ppm", false);
+            if (stereo)
+            {
+                DebugDumpTexture(cmdBuf, (__bridge id<MTLTexture>)frameSource.right.GetImage(),
+                                 prefix + "submitted_right.ppm", true);
+                DebugDumpTexture(cmdBuf, rightTex, prefix + "encoded_right.ppm", false);
+            }
+            for (size_t i = 0; i < frameSource.quads.size(); ++i)
+            {
+                DebugDumpTexture(cmdBuf, (__bridge id<MTLTexture>)frameSource.quads[i].image.GetImage(),
+                                 prefix + "quad" + std::to_string(i) + ".ppm", true);
             }
         }
     }
