@@ -180,6 +180,7 @@ void InputManager::SetTrackingReceiver(TrackingReceiver* receiver)
     if (receiver == nullptr)
     {
         streamingControllerActive_.fill(false);
+        streamingControllerPresent_.fill(false);
         for (auto& handState : streamingHands_)
         {
             handState.active = false;
@@ -281,6 +282,16 @@ void InputManager::UpdateFromStreaming()
     const bool previousRightControllerActive = streamingControllerActive_[HandIndex(Hand::Right)];
     streamingControllerActive_[HandIndex(Hand::Left)] = leftControllerActive;
     streamingControllerActive_[HandIndex(Hand::Right)] = rightControllerActive;
+    if (leftControllerActive && !streamingControllerPresent_[HandIndex(Hand::Left)])
+    {
+        streamingControllerPresent_[HandIndex(Hand::Left)] = true;
+        spdlog::info("InputManager: left controller present for this connection");
+    }
+    if (rightControllerActive && !streamingControllerPresent_[HandIndex(Hand::Right)])
+    {
+        streamingControllerPresent_[HandIndex(Hand::Right)] = true;
+        spdlog::info("InputManager: right controller present for this connection");
+    }
     if (leftControllerActive != previousLeftControllerActive)
     {
         spdlog::info("InputManager: left controller {} flags=0x{:x}",
@@ -743,6 +754,16 @@ bool InputManager::IsControllerTrackingActive(Hand hand) const
     return false;
 }
 
+bool InputManager::IsControllerPresent(Hand hand) const
+{
+    if (IsStreaming())
+    {
+        return streamingControllerPresent_[HandIndex(hand)] || streamingControllerActive_[HandIndex(hand)];
+    }
+
+    return false;
+}
+
 bool InputManager::IsHandTrackingActive(Hand hand) const
 {
     if (IsStreaming())
@@ -785,6 +806,15 @@ std::vector<std::string> InputManager::GetCurrentInteractionProfileCandidates(Ha
         return {kHandInteractionProfile};
     }
 
+    // Untracked for the moment but still connected: keep its profile rather than reporting no
+    // device, which made OpenVR games (through OpenComposite) drop the controllers and their
+    // controller type, and lose button glyphs and bindings.
+    if (IsControllerPresent(hand))
+    {
+        return {streamingControllerProfile_.empty() ? kOculusTouchProfile
+                                                    : streamingControllerProfile_};
+    }
+
     if (IsStreaming())
     {
         return {};
@@ -805,7 +835,7 @@ std::vector<std::string> InputManager::GetActiveInteractionProfiles(Hand hand) c
         return profiles;
     }
 
-    if (IsControllerTrackingActive(hand))
+    if (IsControllerTrackingActive(hand) || (IsControllerPresent(hand) && !IsHandTrackingActive(hand)))
     {
         if (currentProfile.find("/interaction_profiles/meta/") == 0 ||
             currentProfile == kOculusTouchProfile)

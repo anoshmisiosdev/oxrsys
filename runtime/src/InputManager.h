@@ -108,6 +108,11 @@ public:
     bool GetButtonClick(Hand hand, const std::string& componentPath) const;
     bool IsInputDeviceActive(Hand hand) const;
     bool IsControllerTrackingActive(Hand hand) const;
+    // The client has reported this controller during the current streaming connection. A
+    // controller whose pose is momentarily untracked (held still, out of the cameras' view)
+    // is still connected: the interaction profile and its buttons and axes stay available;
+    // only its pose becomes invalid.
+    bool IsControllerPresent(Hand hand) const;
     bool IsHandTrackingActive(Hand hand) const;
     std::string GetCurrentInteractionProfile(Hand hand) const;
     std::vector<std::string> GetCurrentInteractionProfileCandidates(Hand hand) const;
@@ -200,6 +205,7 @@ private:
     XrVector2f rightThumbstick_ = {0.0f, 0.0f};
     uint32_t buttonState_ = 0;
     std::array<bool, 2> streamingControllerActive_ = {false, false};
+    std::array<bool, 2> streamingControllerPresent_ = {false, false};
     std::string streamingClientName_;
     std::string streamingControllerProfile_;
 

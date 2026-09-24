@@ -1747,7 +1747,7 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
     {
         id<MTLTexture> composed = (__bridge id<MTLTexture>)quadRenderer_.ComposeEye(
             (__bridge void*)cmdBuf, (__bridge void*)leftTex, frameSource, true,
-            &slot.leftQuadTexture);
+            &slot.leftQuadTexture, eyeWidth_, height_);
         if (composed == nil)
         {
             return dropAcquiredSlot("failed to composite left eye quad layers");
@@ -1758,7 +1758,7 @@ bool VideoEncoder::EncodeInternal(FrameSource frameSource, bool stereo,
     {
         id<MTLTexture> composed = (__bridge id<MTLTexture>)quadRenderer_.ComposeEye(
             (__bridge void*)cmdBuf, (__bridge void*)rightTex, frameSource, false,
-            &slot.rightQuadTexture);
+            &slot.rightQuadTexture, eyeWidth_, height_);
         if (composed == nil)
         {
             return dropAcquiredSlot("failed to composite right eye quad layers");

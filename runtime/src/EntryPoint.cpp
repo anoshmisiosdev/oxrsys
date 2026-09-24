@@ -2201,9 +2201,20 @@ static void AccumulateBindingState(const InputManager& inputManager, const Sugge
     bool deviceActive = inputManager.IsInputDeviceActive(hand);
     if (inputManager.IsStreaming())
     {
-        deviceActive = binding.profilePathString == "/interaction_profiles/ext/hand_interaction_ext"
-                           ? inputManager.IsHandTrackingActive(hand)
-                           : inputManager.IsControllerTrackingActive(hand);
+        // Buttons and axes follow the controller being connected; poses follow it being tracked.
+        if (binding.profilePathString == "/interaction_profiles/ext/hand_interaction_ext")
+        {
+            deviceActive = inputManager.IsHandTrackingActive(hand);
+        }
+        else if (action->GetType() == XR_ACTION_TYPE_POSE_INPUT)
+        {
+            deviceActive = inputManager.IsControllerTrackingActive(hand);
+        }
+        else
+        {
+            deviceActive = inputManager.IsControllerTrackingActive(hand) ||
+                           (inputManager.IsControllerPresent(hand) && !inputManager.IsHandTrackingActive(hand));
+        }
     }
     if (!deviceActive)
     {

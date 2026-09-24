@@ -46,8 +46,13 @@ public:
     // `commandBuffer` is an id<MTLCommandBuffer>; `cachedTexture` points at a
     // caller-owned slot holding the reusable destination texture, reallocated
     // here when the eye size or format changes.
+    //
+    // The composite is at least `minWidth` x `minHeight` (the encoded eye size). An eye image
+    // smaller than that is scaled up first, so quads keep their resolution: OpenVR games show
+    // loading screens and cutscenes as an overlay over 1x1 black eye textures (HITMAN 3), and
+    // composing at the eye image's own size reduced the whole overlay to a single texel.
     void* ComposeEye(void* commandBuffer, void* eyeTexture, const FrameSource& frameSource,
-                     bool leftEye, void** cachedTexture);
+                     bool leftEye, void** cachedTexture, uint32_t minWidth = 0, uint32_t minHeight = 0);
 
     // True when at least one quad in `frameSource` would be drawn for this eye.
     static bool HasWorkForEye(const FrameSource& frameSource, bool leftEye);

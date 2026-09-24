@@ -733,3 +733,50 @@ TEST_CASE("The quad texture is not flipped or transposed")
     [background release];
     [quadTexture release];
 }
+
+TEST_CASE("A quad over a 1x1 eye image composites at the encoded eye size")
+{
+    // HITMAN 3 (through OpenComposite) shows loading screens and cutscenes as an overlay over
+    // 1x1 black eye textures. Composing at the eye image's own size reduced the whole overlay to
+    // one texel, so the headset showed black. The encoder passes its eye size as the minimum.
+    MetalFixture fixture = MakeFixture();
+    if (!fixture.Available())
+    {
+        SUCCEED("No Metal device available");
+        return;
+    }
+
+    QuadLayerRenderer renderer;
+    id<MTLTexture> tinyEye = MakeSolidTexture(fixture.device, 1, 1, Rgba{0, 0, kBackgroundBlue, 255});
+    id<MTLTexture> quadTexture = MakeSolidTexture(fixture.device, 16, 16, Rgba{255, 0, 0, 255});
+    REQUIRE(tinyEye != nil);
+    REQUIRE(quadTexture != nil);
+
+    FrameSource frameSource = MakeFrameSource();
+    frameSource.quads.push_back(MakeQuad(quadTexture, PoseAt(0.0f, 0.0f, -1.0f), 1.0f, 1.0f));
+
+    void* cached = nullptr;
+    id<MTLCommandBuffer> cmd = [fixture.queue commandBuffer];
+    void* composed = renderer.ComposeEye((__bridge void*)cmd, (__bridge void*)tinyEye, frameSource,
+                                         true, &cached, kEyeSize, kEyeSize);
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    REQUIRE(composed != nullptr);
+    id<MTLTexture> composedTexture = (__bridge id<MTLTexture>)composed;
+    CHECK(composedTexture.width == kEyeSize);
+    CHECK(composedTexture.height == kEyeSize);
+
+    const std::vector<Rgba> pixels = ReadBack(fixture.device, fixture.queue, composedTexture);
+    // The quad at full resolution, the 1x1 eye stretched behind it.
+    CHECK(At(pixels, 32, 32).r == 255);
+    CHECK(At(pixels, 17, 32).r == 255);
+    CHECK(At(pixels, 46, 46).r == 255);
+    CHECK(At(pixels, 14, 32).b == kBackgroundBlue);
+    CHECK(At(pixels, 0, 0).b == kBackgroundBlue);
+    CHECK(At(pixels, 63, 63).b == kBackgroundBlue);
+    CHECK(At(pixels, 63, 63).r == 0);
+
+    ReleaseCached(cached);
+    [tinyEye release];
+    [quadTexture release];
+}
