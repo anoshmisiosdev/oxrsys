@@ -111,6 +111,14 @@ public:
     // Diagnostics (and tests): pid of the live out-of-process encoder helper
     // frames are currently sent to, or -1 when they are encoded in-process.
     int EncoderHelperPid() const;
+    // Diagnostics (and tests): whether the in-process VideoToolbox session
+    // Initialize() created is hardware-accelerated. A software session is fed a
+    // video-range 4:2:0 conversion of each frame (EncoderSessionColor.h).
+    bool InProcessSessionUsesHardware() const { return inProcessSessionHardware_; }
+    // Tests only, before Initialize(): create the in-process session on the
+    // software encoder and never start the helper, so the software path the
+    // helper-death fallback lands on under Rosetta can be exercised anywhere.
+    void SetForceSoftwareEncoderForTesting(bool enabled) { forceSoftwareForTesting_ = enabled; }
     static bool SupportsFoveatedEncoding(const GraphicsContext& graphicsContext);
     static BackendCapabilities QueryBackendCapabilities(const GraphicsContext* graphicsContext = nullptr);
     static bool SupportsCodec(oxr::protocol::VideoCodec codec);
@@ -164,6 +172,12 @@ private:
     void ReleaseSlot(size_t slotIndex);
     void DestroySlots();
 
+    // Software in-process sessions only (EncoderSessionColor.h): sets up, and
+    // per frame performs, the BGRA -> video-range 4:2:0 conversion. Convert
+    // returns a +1 CVPixelBufferRef, or nullptr to encode the BGRA slot as is.
+    bool CreateVideoRangeConversion(uint32_t width, uint32_t height);
+    void* ConvertToVideoRange(void* bgraPixelBuffer);
+
     // Native-arm64 hardware encoder helper integration. When the helper starts and
     // reports the hardware encoder, the per-frame VideoToolbox encode is
     // delegated to it (out-of-process, native arm64); the in-process session
@@ -199,6 +213,9 @@ private:
         void* copySampler = nullptr;       // id<MTLSamplerState>
         void* foveationPipeline = nullptr; // id<MTLComputePipelineState>
         void* foveationSampler = nullptr;  // id<MTLSamplerState>
+        // Software sessions only: BGRA -> video-range 4:2:0 before encode.
+        void* videoRangeTransfer = nullptr; // VTPixelTransferSessionRef
+        void* videoRangePool = nullptr;     // CVPixelBufferPoolRef
     };
 
     GraphicsContext graphicsContext_ = {};
@@ -216,6 +233,8 @@ private:
     // Reprojects an eye image submitted with a fov other than the display's (see EyeFovRemap.h).
     oxrsys::video::EyeFovReprojector fovReprojector_;
     bool tenBit_ = false;
+    bool forceSoftwareForTesting_ = false;
+    bool inProcessSessionHardware_ = false;
 
     // Which process encodes, and why — decided once in Initialize() from an
     // actual VideoToolbox hardware-encoder query plus the encoder_helper
@@ -240,6 +259,7 @@ private:
     std::atomic<bool> forceKeyframe_{false};
     std::atomic<bool> shuttingDown_{false};
     std::atomic<bool> foveationValidationWarningLogged_{false};
+    std::atomic<bool> videoRangeConversionWarningLogged_{false};
     std::atomic<uint32_t> droppedFrameCount_{0};
     std::atomic<uint32_t> inFlightFrameCount_{0};
     std::atomic<uint64_t> frameNumberCounter_{0};

@@ -117,11 +117,19 @@ none of them and emitted an SPS with no VUI at all, so its stream could decode
 with different colours from the in-process one; `TestEncoderHelperClient.mm`
 now parses the helper's SPS and checks the colour description.
 
-VideoToolbox offers no property for the range flag. Every hardware encoder
-(the helper's, and the in-process one on arm64 or for H.264 under Rosetta)
-signals video range; the software HEVC encoder a Rosetta process falls back to
-signals full range. The helper is hardware-only, so it always matches the
-in-process hardware session.
+Every path signals video (limited) range. VideoToolbox offers no property for
+the range flag; a session takes it from its source. Every hardware encoder (the
+helper's, and the in-process one on arm64 or for H.264 under Rosetta) writes
+video range for the BGRA compose surface. The software HEVC encoder, which a
+Rosetta process falls back to when the helper dies, writes **full** range for a
+BGRA source once HEVC Main is requested. So an in-process software session is
+never handed BGRA: each frame is first converted with a `VTPixelTransferSession`
+into an explicitly video-range `420YpCbCr8BiPlanarVideoRange` buffer with the
+same BT.709 matrix (about 0.3 ms at 2272x1264 under Rosetta, against 20-34 ms
+for the software encode itself). The helper is hardware-only and needs no
+conversion. `TestVideoToolboxEncoder.mm` pins a software session on any machine
+and checks the range for H.264, HEVC Main and HEVC Main10, and checks it again
+on the frames encoded after the helper is killed mid-stream.
 
 ## Build
 
