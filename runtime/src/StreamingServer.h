@@ -306,6 +306,9 @@ private:
     std::atomic<bool> audioActive_{false};
     std::atomic<uint32_t> audioSendQueueDrops_{0};
     std::atomic<uint64_t> audioFramesSent_{0};
+    // Source of the most recent audio buffer: a string literal ("tap",
+    // "loopback" or "none") so the status writer can read it lock-free.
+    std::atomic<const char*> audioSourceName_{"none"};
     StreamingFrameQueue frameQueue_;
     std::shared_ptr<PacketDispatchState> packetDispatchState_;
     std::atomic<uint32_t> pendingFrameDepthMax_{0};

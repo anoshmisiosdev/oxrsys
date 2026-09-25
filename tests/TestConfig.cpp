@@ -34,6 +34,7 @@ passthrough_enabled = true
 app_alpha_blend_passthrough = true
 occlusion_mode = "environment_depth"
 headset_audio = true
+headset_audio_source = "tap"
 
 [spatial]
 enabled = true
@@ -69,6 +70,7 @@ quest_logcat = yes
     CHECK(values.appAlphaBlendPassthrough == true);
     CHECK(values.occlusionMode == "environment_depth");
     CHECK(values.headsetAudio == true);
+    CHECK(values.headsetAudioSource == "tap");
     CHECK(values.spatialEnabled == true);
     CHECK(values.spatialAnchors == true);
     CHECK(values.spatialScene == true);
@@ -248,4 +250,16 @@ TEST_CASE("Config singleton initializes with bounded Quest logcat clear", "[conf
     CHECK(values.bitrateMbps >= 1);
 
     Config::Get().Shutdown();
+}
+
+TEST_CASE("Config headset_audio_source defaults to auto and rejects unknown values", "[config]")
+{
+    std::istringstream defaults("[streaming]\nheadset_audio = true\n");
+    CHECK(ParseConfigToml(defaults).headsetAudioSource == "auto");
+
+    std::istringstream invalid("[streaming]\nheadset_audio_source = \"blackhole\"\n");
+    CHECK(ParseConfigToml(invalid).headsetAudioSource == "auto");
+
+    std::istringstream loopback("[streaming]\nheadset_audio_source = \"loopback\"\n");
+    CHECK(ParseConfigToml(loopback).headsetAudioSource == "loopback");
 }

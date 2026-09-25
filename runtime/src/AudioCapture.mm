@@ -5,22 +5,29 @@
 #import <Foundation/Foundation.h>
 
 #include <spdlog/spdlog.h>
+#include "AudioRingReader.h"
+
+#include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <thread>
+#include <time.h>
 #include <string>
 #include <vector>
 
 // AudioCapture — capture the game's audio on macOS and deliver interleaved
 // stereo float32 PCM to a callback.
 //
-// Core Audio process/system taps do NOT work under CrossOver: capturing audio
-// outside our own process needs the "System Audio Recording" TCC permission, and
-// CrossOver's Info.plist has no NSAudioCaptureUsageDescription, so a tap only
-// ever yields silence. Instead we capture from a loopback INPUT device
-// (BlackHole): the user routes the game's output to it, and we read it back as an
-// input device — which uses CrossOver's Microphone permission (it HAS that).
+// Core Audio process/system taps do NOT work from inside CrossOver: capturing
+// audio needs the "System Audio Recording" TCC permission, and CrossOver's
+// Info.plist has no NSAudioCaptureUsageDescription, so a tap created here only
+// ever yields silence. Two sources work instead:
 //
-// Route the bottle's audio output to BlackHole (or a Multi-Output that includes
-// it), and this reads the same samples the game produced.
+//  * Tap ring: the OXRSys launcher (a separate app that holds the permission)
+//    taps the game's Wine process and writes PCM into a shared-memory ring that
+//    AudioRingReader maps read-only. No virtual device or output routing needed.
+//  * Loopback: a loopback INPUT device (BlackHole) that the bottle's output is
+//    routed to, read back with CrossOver's Microphone permission (it has that).
 
 namespace oxrsys
 {
@@ -128,11 +135,19 @@ AudioObjectID FindLoopbackInputDevice(std::string& outName)
 
 struct AudioCapture::Impl
 {
+    // Loopback device path.
     AudioUnit unit = nullptr;
-    SampleCallback callback;
     uint32_t sampleRateHz = 48000;
     uint16_t channels = 2;
     std::vector<uint8_t> renderBuffer; // AudioBufferList + interleaved float storage
+    std::atomic<bool> loopbackRunning{false};
+
+    // Tap ring path.
+    std::thread ringThread;
+    std::atomic<bool> ringThreadRunning{false};
+    std::atomic<bool> ringLive{false};
+
+    SampleCallback callback;
     std::atomic<bool> running{false};
 };
 
@@ -143,7 +158,7 @@ OSStatus InputCallback(void* inRefCon, AudioUnitRenderActionFlags* ioActionFlags
                        UInt32 inNumberFrames, AudioBufferList* /*ioData*/)
 {
     auto* impl = static_cast<AudioCapture::Impl*>(inRefCon);
-    if (!impl->running.load() || impl->unit == nullptr)
+    if (!impl->loopbackRunning.load() || impl->unit == nullptr)
     {
         return noErr;
     }
@@ -166,32 +181,112 @@ OSStatus InputCallback(void* inRefCon, AudioUnitRenderActionFlags* ioActionFlags
     {
         return status;
     }
+    // The tap ring wins while its writer is live (auto mode).
+    if (impl->ringLive.load(std::memory_order_relaxed))
+    {
+        return noErr;
+    }
     impl->callback(static_cast<const float*>(list->mBuffers[0].mData), inNumberFrames,
-                   impl->sampleRateHz, impl->channels);
+                   impl->sampleRateHz, impl->channels, "loopback");
     return noErr;
 }
-} // namespace
 
-AudioCapture::AudioCapture() : impl_(std::make_unique<Impl>()) {}
-AudioCapture::~AudioCapture() { Stop(); }
-bool AudioCapture::IsRunning() const { return impl_ && impl_->running.load(); }
-
-bool AudioCapture::Start(SampleCallback callback)
+uint64_t RealtimeNowNs()
 {
-    if (impl_->running.load())
-    {
-        return true;
-    }
-    impl_->callback = std::move(callback);
+    timespec ts = {};
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<uint64_t>(ts.tv_nsec);
+}
 
+// Polls the tap ring and forwards new PCM, resampled to the stream rate, in
+// bounded chunks. Never blocks on the writer: a missing or stale ring just
+// means nothing is delivered (and the loopback path takes over in auto mode).
+void RingThreadMain(AudioCapture::Impl* impl)
+{
+    AudioRingReader reader(AudioRingReader::DefaultPath());
+    LinearResampler resampler;
+    std::vector<float> block;
+    std::vector<float> converted;
+    constexpr uint32_t kChunkFrames = 480; // 10 ms at 48 kHz
+    AudioRingReader::State lastState = AudioRingReader::State::NoRing;
+    uint64_t lastOverruns = 0;
+    uint64_t lastSkips = 0;
+    auto lastDiagLog = std::chrono::steady_clock::now();
+
+    while (impl->ringThreadRunning.load())
+    {
+        uint32_t rate = 0;
+        uint16_t channels = 0;
+        const AudioRingReader::State state = reader.Poll(RealtimeNowNs(), block, rate, channels);
+        const bool live = state == AudioRingReader::State::Live;
+        if (state != lastState)
+        {
+            if (live)
+            {
+                spdlog::info("AudioCapture: launcher tap ring live ({} Hz, {} ch, scope={}); "
+                             "streaming tapped audio",
+                             rate, channels,
+                             reader.Scope() == 1 ? "game" : reader.Scope() == 2 ? "system" : "?");
+            }
+            else if (lastState == AudioRingReader::State::Live)
+            {
+                spdlog::info("AudioCapture: launcher tap ring stopped");
+                resampler.Reset();
+            }
+            lastState = state;
+        }
+        impl->ringLive.store(live, std::memory_order_relaxed);
+
+        if (live && !block.empty() && channels > 0)
+        {
+            converted.clear();
+            resampler.Process(block.data(), block.size() / channels, rate,
+                              AudioCapture::kStreamSampleRateHz, channels, converted);
+            const size_t frames = converted.size() / channels;
+            for (size_t offset = 0; offset < frames; offset += kChunkFrames)
+            {
+                const uint32_t n =
+                    static_cast<uint32_t>(std::min<size_t>(kChunkFrames, frames - offset));
+                impl->callback(converted.data() + offset * channels, n,
+                               AudioCapture::kStreamSampleRateHz, channels, "tap");
+            }
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        if (now - lastDiagLog > std::chrono::seconds(10))
+        {
+            if (reader.OverrunCount() != lastOverruns || reader.SkipCount() != lastSkips)
+            {
+                spdlog::info("AudioCapture: tap ring overruns={} backlog skips={}",
+                             reader.OverrunCount(), reader.SkipCount());
+                lastOverruns = reader.OverrunCount();
+                lastSkips = reader.SkipCount();
+            }
+            lastDiagLog = now;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(live ? 5 : 100));
+    }
+    impl->ringLive.store(false);
+}
+
+bool StartLoopback(AudioCapture::Impl* impl, bool quietIfMissing)
+{
     @autoreleasepool
     {
         std::string deviceName;
         AudioObjectID device = FindLoopbackInputDevice(deviceName);
         if (device == kAudioObjectUnknown)
         {
-            spdlog::warn("AudioCapture: no loopback input device found (install BlackHole and "
-                         "route the bottle's audio output to it); headset audio disabled");
+            if (quietIfMissing)
+            {
+                spdlog::info("AudioCapture: no loopback input device; waiting for the "
+                             "launcher tap ring only");
+            }
+            else
+            {
+                spdlog::warn("AudioCapture: no loopback input device found (install BlackHole "
+                             "and route the bottle's audio output to it)");
+            }
             return false;
         }
 
@@ -200,26 +295,33 @@ bool AudioCapture::Start(SampleCallback callback)
         desc.componentSubType = kAudioUnitSubType_HALOutput;
         desc.componentManufacturer = kAudioUnitManufacturer_Apple;
         AudioComponent comp = AudioComponentFindNext(nullptr, &desc);
-        if (comp == nullptr || AudioComponentInstanceNew(comp, &impl_->unit) != noErr)
+        if (comp == nullptr || AudioComponentInstanceNew(comp, &impl->unit) != noErr)
         {
             spdlog::error("AudioCapture: could not create HAL AudioUnit");
+            impl->unit = nullptr;
             return false;
         }
 
+        auto fail = [impl](const char* message) {
+            spdlog::error("AudioCapture: {}", message);
+            impl->loopbackRunning.store(false);
+            AudioUnitUninitialize(impl->unit);
+            AudioComponentInstanceDispose(impl->unit);
+            impl->unit = nullptr;
+            return false;
+        };
+
         // Enable input (bus 1), disable output (bus 0).
         UInt32 enable = 1, disable = 0;
-        AudioUnitSetProperty(impl_->unit, kAudioOutputUnitProperty_EnableIO,
+        AudioUnitSetProperty(impl->unit, kAudioOutputUnitProperty_EnableIO,
                              kAudioUnitScope_Input, 1, &enable, sizeof(enable));
-        AudioUnitSetProperty(impl_->unit, kAudioOutputUnitProperty_EnableIO,
+        AudioUnitSetProperty(impl->unit, kAudioOutputUnitProperty_EnableIO,
                              kAudioUnitScope_Output, 0, &disable, sizeof(disable));
 
-        // Bind to the loopback device.
-        if (AudioUnitSetProperty(impl_->unit, kAudioOutputUnitProperty_CurrentDevice,
+        if (AudioUnitSetProperty(impl->unit, kAudioOutputUnitProperty_CurrentDevice,
                                  kAudioUnitScope_Global, 0, &device, sizeof(device)) != noErr)
         {
-            spdlog::error("AudioCapture: could not bind AudioUnit to '{}'", deviceName);
-            Stop();
-            return false;
+            return fail("could not bind AudioUnit to the loopback device");
         }
 
         // Ask the device for its input sample rate; keep interleaved stereo float32.
@@ -229,54 +331,107 @@ bool AudioCapture::Start(SampleCallback callback)
                                                kAudioObjectPropertyScopeGlobal,
                                                kAudioObjectPropertyElementMain};
         AudioObjectGetPropertyData(device, &rateAddr, 0, nullptr, &rateSize, &rate);
-        impl_->sampleRateHz = static_cast<uint32_t>(rate + 0.5);
-        impl_->channels = 2;
+        impl->sampleRateHz = static_cast<uint32_t>(rate + 0.5);
+        impl->channels = 2;
 
         AudioStreamBasicDescription format = {};
         format.mSampleRate = rate;
         format.mFormatID = kAudioFormatLinearPCM;
         format.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
-        format.mChannelsPerFrame = impl_->channels;
+        format.mChannelsPerFrame = impl->channels;
         format.mBitsPerChannel = 32;
         format.mFramesPerPacket = 1;
-        format.mBytesPerFrame = sizeof(float) * impl_->channels;
+        format.mBytesPerFrame = sizeof(float) * impl->channels;
         format.mBytesPerPacket = format.mBytesPerFrame;
         // Output scope of the input bus = the format we receive.
-        if (AudioUnitSetProperty(impl_->unit, kAudioUnitProperty_StreamFormat,
+        if (AudioUnitSetProperty(impl->unit, kAudioUnitProperty_StreamFormat,
                                  kAudioUnitScope_Output, 1, &format, sizeof(format)) != noErr)
         {
-            spdlog::error("AudioCapture: could not set capture format");
-            Stop();
-            return false;
+            return fail("could not set capture format");
         }
 
         AURenderCallbackStruct cb = {};
         cb.inputProc = &InputCallback;
-        cb.inputProcRefCon = impl_.get();
-        AudioUnitSetProperty(impl_->unit, kAudioOutputUnitProperty_SetInputCallback,
+        cb.inputProcRefCon = impl;
+        AudioUnitSetProperty(impl->unit, kAudioOutputUnitProperty_SetInputCallback,
                              kAudioUnitScope_Global, 0, &cb, sizeof(cb));
 
-        if (AudioUnitInitialize(impl_->unit) != noErr)
+        if (AudioUnitInitialize(impl->unit) != noErr)
         {
-            spdlog::error("AudioCapture: AudioUnitInitialize failed (Microphone permission for "
-                          "CrossOver may be required)");
-            Stop();
-            return false;
+            return fail("AudioUnitInitialize failed (Microphone permission for CrossOver may "
+                        "be required)");
         }
 
-        impl_->running.store(true);
-        if (AudioOutputUnitStart(impl_->unit) != noErr)
+        impl->loopbackRunning.store(true);
+        if (AudioOutputUnitStart(impl->unit) != noErr)
         {
-            spdlog::error("AudioCapture: AudioOutputUnitStart failed");
-            impl_->running.store(false);
-            Stop();
-            return false;
+            return fail("AudioOutputUnitStart failed");
         }
 
-        spdlog::info("AudioCapture: capturing game audio from '{}' ({} Hz, {} ch)",
-                     deviceName, impl_->sampleRateHz, impl_->channels);
+        spdlog::info("AudioCapture: capturing loopback audio from '{}' ({} Hz, {} ch)",
+                     deviceName, impl->sampleRateHz, impl->channels);
     }
     return true;
+}
+} // namespace
+
+AudioCapture::Source AudioCapture::ParseSource(const std::string& value)
+{
+    if (value == "tap")
+    {
+        return Source::Tap;
+    }
+    if (value == "loopback")
+    {
+        return Source::Loopback;
+    }
+    return Source::Auto;
+}
+
+AudioCapture::AudioCapture() : impl_(std::make_unique<Impl>()) {}
+AudioCapture::~AudioCapture() { Stop(); }
+bool AudioCapture::IsRunning() const { return impl_ && impl_->running.load(); }
+
+const char* AudioCapture::ActiveSourceName() const
+{
+    if (!impl_ || !impl_->running.load())
+    {
+        return "none";
+    }
+    if (impl_->ringLive.load())
+    {
+        return "tap";
+    }
+    return impl_->loopbackRunning.load() ? "loopback" : "none";
+}
+
+bool AudioCapture::Start(SampleCallback callback, Source source)
+{
+    if (impl_->running.load())
+    {
+        return true;
+    }
+    impl_->callback = std::move(callback);
+
+    bool anyStarted = false;
+    if (source != Source::Tap)
+    {
+        anyStarted = StartLoopback(impl_.get(), source == Source::Auto);
+    }
+    if (source != Source::Loopback)
+    {
+        impl_->ringThreadRunning.store(true);
+        impl_->ringThread = std::thread(RingThreadMain, impl_.get());
+        anyStarted = true;
+        spdlog::info("AudioCapture: watching launcher tap ring at {}",
+                     AudioRingReader::DefaultPath());
+    }
+    impl_->running.store(anyStarted);
+    if (!anyStarted)
+    {
+        impl_->callback = nullptr;
+    }
+    return anyStarted;
 }
 
 void AudioCapture::Stop()
@@ -286,6 +441,12 @@ void AudioCapture::Stop()
         return;
     }
     bool was = impl_->running.exchange(false);
+    impl_->ringThreadRunning.store(false);
+    if (impl_->ringThread.joinable())
+    {
+        impl_->ringThread.join();
+    }
+    impl_->loopbackRunning.store(false);
     if (impl_->unit != nullptr)
     {
         AudioOutputUnitStop(impl_->unit);

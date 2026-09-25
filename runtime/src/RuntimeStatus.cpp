@@ -178,6 +178,7 @@ void WriteStreamingStats(std::ofstream& file, const RuntimeStatus::StreamingStat
     file << "    \"occlusion_mode\": \"" << JsonEscape(stats.occlusionMode) << "\",\n";
     file << "    \"spatial_enabled\": " << (stats.spatialEnabled ? "true" : "false") << ",\n";
     file << "    \"headset_audio\": " << (stats.headsetAudio ? "true" : "false") << ",\n";
+    file << "    \"headset_audio_source\": \"" << JsonEscape(stats.headsetAudioSource) << "\",\n";
     file << "    \"latency_ms\": {\n";
     file << "      \"server_pipeline\": " << stats.serverPipelineLatencyMs << ",\n";
     file << "      \"client_pipeline\": " << stats.clientPipelineLatencyMs << ",\n";

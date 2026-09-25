@@ -57,6 +57,7 @@ struct ConfigValues
     bool appAlphaBlendPassthrough = false; // Advertise OpenXR alpha blend for explicit MR apps
     std::string occlusionMode = "off"; // "off", "scene_mesh", "environment_depth"
     bool headsetAudio = false;       // Stream server audio to the headset
+    std::string headsetAudioSource = "auto"; // "auto", "tap" (launcher ring), "loopback"
 
     bool spatialEnabled = false;
     bool spatialAnchors = false;

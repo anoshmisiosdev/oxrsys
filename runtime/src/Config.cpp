@@ -559,6 +559,14 @@ ConfigValues ParseConfigToml(std::istream& input, const ConfigValues& defaults)
             {
                 values.headsetAudio = ParseBool(value);
             }
+            else if (key == "headset_audio_source")
+            {
+                value = ParseString(value);
+                if (value == "auto" || value == "tap" || value == "loopback")
+                {
+                    values.headsetAudioSource = value;
+                }
+            }
             else if (key == "enabled")
             {
                 values.spatialEnabled = ParseBool(value);

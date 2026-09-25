@@ -1618,6 +1618,8 @@ void StreamingServer::EncodeThread()
                     stats.occlusionMode = config.occlusionMode;
                     stats.spatialEnabled = config.spatialEnabled;
                     stats.headsetAudio = server->audioActive_.load();
+                    stats.headsetAudioSource =
+                        stats.headsetAudio ? server->audioSourceName_.load() : "none";
                     stats.serverPipelineLatencyMs = server->serverPipelineLatencyMs_.load();
                     stats.clientPipelineLatencyMs = server->clientPipelineLatencyMs_.load();
                     stats.clientReceiveToSubmitMs = server->clientReceiveToSubmitMs_.load();
@@ -3071,9 +3073,12 @@ void StreamingServer::StartAudioCapture(const oxr::protocol::ClientConnect& clie
     audioSendThread_ = std::thread(&StreamingServer::AudioSendThread, this);
 
     const bool started = audioCapture_->Start(
-        [this](const float* data, uint32_t frames, uint32_t sampleRateHz, uint16_t channels) {
+        [this](const float* data, uint32_t frames, uint32_t sampleRateHz, uint16_t channels,
+               const char* source) {
+            audioSourceName_.store(source, std::memory_order_relaxed);
             EnqueueAudioSamples(data, frames, sampleRateHz, channels);
-        });
+        },
+        oxrsys::AudioCapture::ParseSource(config.headsetAudioSource));
     if (!started)
     {
         spdlog::warn("StreamingServer: audio capture failed to start; headset audio off");
@@ -3091,6 +3096,7 @@ void StreamingServer::StopAudioCapture()
         audioCapture_.reset();
     }
     audioActive_.store(false);
+    audioSourceName_.store("none");
     audioQueueCv_.notify_all();
     if (audioSendThread_.joinable())
     {

@@ -37,6 +37,7 @@ add_library(oxrsys_runtime SHARED
 # no driver linked into the runtime. Headset audio capture for the streaming path.
 target_sources(oxrsys_runtime PRIVATE
     src/AudioCapture.mm
+    src/AudioRingReader.cpp
     src/WiredHeadset.mm
 )
 set_source_files_properties(src/WiredHeadset.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")

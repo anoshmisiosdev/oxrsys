@@ -143,6 +143,7 @@ TEST_CASE("RuntimeStatus writes streaming stats only while streaming", "[runtime
     CHECK(Contains(streamingStatus, "\"occlusion_mode\": \"scene_mesh\""));
     CHECK(Contains(streamingStatus, "\"spatial_enabled\": true"));
     CHECK(Contains(streamingStatus, "\"headset_audio\": false"));
+    CHECK(Contains(streamingStatus, "\"headset_audio_source\": \"none\""));
     CHECK(Contains(streamingStatus, "\"server_pipeline\": 12.5"));
     CHECK(Contains(streamingStatus, "\"displayed_frame_age\": 24.5"));
     CHECK(Contains(streamingStatus, "\"total_p95\": 9.5"));

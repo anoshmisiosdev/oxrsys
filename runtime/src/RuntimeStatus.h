@@ -41,6 +41,7 @@ public:
         std::string occlusionMode;
         bool spatialEnabled = false;
         bool headsetAudio = false;
+        std::string headsetAudioSource = "none"; // "tap", "loopback", "none"
 
         double serverPipelineLatencyMs = 0.0;
         double clientPipelineLatencyMs = 0.0;

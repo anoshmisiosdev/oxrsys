@@ -196,6 +196,7 @@ set(OXRSYS_LOGCAT_TEST_ENV
 )
 
 add_executable(oxrsys_runtime_tests
+    tests/TestAudioRingReader.cpp
     tests/TestBoundedDrain.cpp
     tests/TestClientLiveness.cpp
     tests/TestConfig.cpp
@@ -222,6 +223,7 @@ add_executable(oxrsys_runtime_tests
     tests/TestHeadsetViewStore.cpp
     clients/android-vr/app/src/main/cpp/QuestPassthroughAlphaPolicy.cpp
     clients/android-vr/app/src/main/cpp/QuestShellInteraction.cpp
+    runtime/src/AudioRingReader.cpp
     runtime/src/InputManager.cpp
     runtime/src/HeadsetViewStore.cpp
     runtime/src/TrackingReceiver.cpp
