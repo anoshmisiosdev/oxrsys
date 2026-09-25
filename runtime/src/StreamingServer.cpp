@@ -18,6 +18,8 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -43,6 +45,54 @@ constexpr int kBestEffortSendFlags = MSG_DONTWAIT;
 #else
 constexpr int kBestEffortSendFlags = 0;
 #endif
+
+// Best-effort UDP sends (video, render pose, audio) used to ignore sendto()
+// failures, so a path where every datagram was rejected locally (e.g. macOS
+// Local Network privacy denying the host process, EHOSTUNREACH) looked
+// healthy in the stats. Count them and remember the last errno.
+std::atomic<uint32_t> gUdpSendErrors{0};
+std::atomic<int> gUdpLastSendErrno{0};
+std::atomic<bool> gUdpSendFailing{false};
+
+int SendUdpCounted(SocketHandle socket, const void* data, size_t size, int flags,
+                   const sockaddr* address, oxrsys::runtime_socket::SocketLength addressLength)
+{
+    const int sent = oxrsys::runtime_socket::SendTo(socket, data, size, flags, address,
+                                                    addressLength);
+    if (sent < 0)
+    {
+        const int error = errno;
+        gUdpLastSendErrno.store(error);
+        gUdpSendErrors.fetch_add(1);
+        if (!gUdpSendFailing.exchange(true))
+        {
+            char destText[INET_ADDRSTRLEN] = "?";
+            if (address != nullptr && address->sa_family == AF_INET)
+            {
+                inet_ntop(AF_INET, &reinterpret_cast<const sockaddr_in*>(address)->sin_addr,
+                          destText, sizeof(destText));
+            }
+            if (error == EHOSTUNREACH)
+            {
+                spdlog::warn("StreamingServer: UDP sends to {} are failing (errno {}: {}). On macOS "
+                             "this is almost always Local Network privacy denying the app hosting "
+                             "the runtime: enable it in System Settings > Privacy & Security > "
+                             "Local Network (e.g. CrossOver/Steam for Wine games), then relaunch it",
+                             destText, error, std::strerror(error));
+            }
+            else
+            {
+                spdlog::warn("StreamingServer: UDP sends to {} are failing (errno {}: {})",
+                             destText, error, std::strerror(error));
+            }
+        }
+    }
+    else if (gUdpSendFailing.load(std::memory_order_relaxed) && gUdpSendFailing.exchange(false))
+    {
+        spdlog::info("StreamingServer: UDP sends recovered");
+    }
+    return sent;
+}
 
 constexpr auto kTcpSendDeadline = std::chrono::milliseconds(100);
 constexpr auto kTcpSendRetrySleep = std::chrono::milliseconds(1);
@@ -1620,6 +1670,14 @@ void StreamingServer::EncodeThread()
                     const uint32_t videoTcpFailures = server->videoTcpSendFailures_.exchange(0);
                     const uint32_t udpRetransmits =
                         server->videoUdpRetransmittedPackets_.exchange(0);
+                    const uint32_t udpSendErrors = gUdpSendErrors.exchange(0);
+                    std::string udpSendErrorText;
+                    if (udpSendErrors > 0)
+                    {
+                        const int lastErrno = gUdpLastSendErrno.load();
+                        udpSendErrorText = " (last errno " + std::to_string(lastErrno) + ": " +
+                                           std::strerror(lastErrno) + ")";
+                    }
                     std::string abrModeName;
                     std::string abrStateName;
                     std::string abrProfileName;
@@ -1740,7 +1798,7 @@ void StreamingServer::EncodeThread()
                         "StreamingServer: encode queue(avg/p95={:.2f}/{:.2f}ms) gpu({:.2f}/{:.2f}) "
                         "submit({:.3f}/{:.3f}) callback({:.2f}/{:.2f}) total({:.2f}/{:.2f}) "
                         "replaced={} encDrops={} keyframeReq={} depthMax={} sendDepth={} sendDrops={} "
-                        "tcpFail={} udpRetrans={} abr={}/{} profile={} displayedAge={:.2f}ms reproj={} stale={} poseFallbacks={}",
+                        "tcpFail={} udpRetrans={} udpSendErr={}{} abr={}/{} profile={} displayedAge={:.2f}ms reproj={} stale={} poseFallbacks={}",
                         queueSummary.average, queueSummary.p95,
                         gpuSummary.average, gpuSummary.p95,
                         submitSummary.average, submitSummary.p95,
@@ -1754,6 +1812,8 @@ void StreamingServer::EncodeThread()
                         videoSendDrops,
                         videoTcpFailures,
                         udpRetransmits,
+                        udpSendErrors,
+                        udpSendErrorText,
                         abrModeName,
                         abrStateName,
                         abrProfileName,
@@ -3107,7 +3167,7 @@ void StreamingServer::SendRenderPosePacket(const EncodedVideoFrame& frame)
     destAddr.sin_family = AF_INET;
     destAddr.sin_port = htons(oxr::protocol::VIDEO_PORT);
     inet_pton(AF_INET, clientIp.c_str(), &destAddr.sin_addr);
-    oxrsys::runtime_socket::SendTo(videoSocket,
+    SendUdpCounted(videoSocket,
                                    buf,
                                    sizeof(buf),
                                    kBestEffortSendFlags,
@@ -3392,9 +3452,8 @@ void StreamingServer::SendUdpAudio(const std::vector<uint8_t>& packet,
         memcpy(datagram + sizeof(header), pcm + static_cast<size_t>(offset) * tcpHeader.channels,
                bytes);
         // Non-blocking: a full socket buffer drops this datagram.
-        if (sendto(audioUdpSocket_, reinterpret_cast<const char*>(datagram),
-                   sizeof(header) + bytes, 0, reinterpret_cast<sockaddr*>(&destAddr),
-                   sizeof(destAddr)) > 0)
+        if (SendUdpCounted(audioUdpSocket_, datagram, sizeof(header) + bytes, 0,
+                           reinterpret_cast<sockaddr*>(&destAddr), sizeof(destAddr)) > 0)
         {
             audioFramesSent_.fetch_add(1);
         }
@@ -3542,7 +3601,7 @@ void StreamingServer::SendNalUnit(const std::shared_ptr<PacketDispatchState>& di
         size_t packetSize = sizeof(header) + payloadSize;
         memcpy(packetBuffer, &header, sizeof(header));
         memcpy(packetBuffer + sizeof(header), data + offset, payloadSize);
-        oxrsys::runtime_socket::SendTo(videoSocket,
+        SendUdpCounted(videoSocket,
                                        packetBuffer,
                                        packetSize,
                                        kBestEffortSendFlags,
@@ -3599,7 +3658,7 @@ void StreamingServer::SendNalUnit(const std::shared_ptr<PacketDispatchState>& di
 
             memcpy(packetBuffer, &fecHeader, sizeof(fecHeader));
             memcpy(packetBuffer + sizeof(fecHeader), fecPayload, oxr::protocol::MAX_PACKET_PAYLOAD);
-            oxrsys::runtime_socket::SendTo(
+            SendUdpCounted(
                 videoSocket,
                 packetBuffer,
                 sizeof(fecHeader) + oxr::protocol::MAX_PACKET_PAYLOAD,
@@ -3779,7 +3838,7 @@ void StreamingServer::HandleNackRequest(const oxr::protocol::NackRequest& reques
     uint32_t retransmitted = 0;
     for (const RetransmitPacket& packet : retransmitPackets)
     {
-        oxrsys::runtime_socket::SendTo(videoSocket,
+        SendUdpCounted(videoSocket,
                                        packet.data.data(),
                                        packet.size,
                                        kBestEffortSendFlags,
