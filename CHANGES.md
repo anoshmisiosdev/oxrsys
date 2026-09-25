@@ -6,6 +6,16 @@ This file tracks user-facing, integration-facing, and runtime-relevant changes f
 
 ### Added
 
+- Added headset audio from the OXRSys launcher's Core Audio process tap. Taps created inside
+  CrossOver only ever capture silence (CrossOver cannot hold the System Audio Recording
+  permission), so headset audio needed BlackHole and an output-routing change. The launcher now
+  taps the game's own Wine process (or all Mac audio, optionally muting the Mac) and shares the PCM
+  through a lock-free shared-memory ring that the runtime reads, with bounded latency, overrun and
+  stale-writer detection, and resampling to 48 kHz. New key `headset_audio_source` =
+  `auto`/`tap`/`loopback` (default `auto`: the ring when live, BlackHole otherwise).
+- Added headset audio over Wi-Fi. Clients advertising `CLIENT_CAPABILITY_UDP_AUDIO` receive
+  `AudioPacketHeader` datagrams on UDP 9947; the Quest client does so. Audio was USB-only before.
+
 - Added real controller velocity reporting through `XrSpaceVelocity`. `xrLocateSpace` previously
   answered every velocity query with `velocityFlags = 0` (spec-legal "no data"), so games that read
   controller speed rather than differentiating poses themselves saw no motion — UNDERDOGS and other

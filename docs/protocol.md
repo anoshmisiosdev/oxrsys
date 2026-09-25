@@ -238,10 +238,17 @@ the runtime to the client.
 
 ## Audio Stream
 
-The protocol reserves stereo 48 kHz float PCM speaker audio over UDP `AUDIO_PORT` or TCP `Audio`
-records. The wire structs are present so clients and frontends can parse the protocol safely, but the
-runtime does not advertise `SERVER_FEATURE_HEADSET_AUDIO` until a real capture/playback path is
-attached. Microphone input is out of scope for this speaker-only path.
+Speaker audio is stereo 48 kHz float32 PCM. The runtime advertises `SERVER_FEATURE_HEADSET_AUDIO`
+when `headset_audio = true`, and streams to clients that report `CLIENT_CAPABILITY_AUDIO_OUTPUT`:
+
+- USB: `TcpAudioHeader` + PCM as TCP `Audio` records on the video socket.
+- Wi-Fi: `AudioPacketHeader` (32 bytes) + PCM datagrams to the client's UDP `AUDIO_PORT` (9947),
+  at most 160 frames per datagram so none fragments. `frameIndex` is a per-datagram sequence
+  number for loss accounting; lost datagrams are not retransmitted. Only clients that advertise
+  `CLIENT_CAPABILITY_UDP_AUDIO` (`0x00000800`) receive this stream, so older Wi-Fi clients are
+  unaffected.
+
+Microphone input is out of scope for this speaker-only path.
 
 ## Session Lifecycle
 

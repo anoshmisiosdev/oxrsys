@@ -205,6 +205,7 @@ The structured editor covers the current runtime keys:
 - `streaming.app_alpha_blend_passthrough`
 - `streaming.occlusion_mode`
 - `streaming.headset_audio`
+- `streaming.headset_audio_source`
 - `spatial.enabled`
 - `spatial.anchors`
 - `spatial.scene`
@@ -277,8 +278,14 @@ The Headset Client section owns client-side headset options. `client_foveation_p
 does not send an `XR_FB_foveation` override to the headset client; `off`, `light`, `medium`,
 and `high` explicitly override the Quest/PICO viewer swapchains. This is separate from
 foveated encoding and does not change the desktop OpenXR application's rendering work.
-`client_upscaling` enables the Quest shader upscaling path. `headset_audio` streams game audio
-captured from a loopback input device to the headset over the USB transport.
+`client_upscaling` enables the Quest shader upscaling path. `headset_audio` streams game audio to
+the headset over USB, and over Wi-Fi for clients with UDP audio support. `headset_audio_source`
+picks the capture source: `tap` reads the shared-memory ring that the OXRSys launcher fills from a
+Core Audio process tap on the game (no virtual device or output routing needed; the launcher holds
+the System Audio Recording permission, which CrossOver cannot), `loopback` reads a loopback input
+device such as BlackHole that the bottle's output is routed to, and `auto` (default) uses the ring
+whenever the launcher is writing it and the loopback device otherwise. `runtime_status.json`
+reports the active source as `headset_audio_source`.
 
 `client_reprojection` controls short missing-frame smoothing on the Quest client. The default
 `pose` reuses a recent decoded texture with the matched server render pose; `pose_warp` additionally
