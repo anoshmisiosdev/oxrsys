@@ -128,6 +128,7 @@ enum ClientCapabilityFlags : uint32_t
     CLIENT_CAPABILITY_SPATIAL_ENTITY = 0x00000100,
     CLIENT_CAPABILITY_SCENE_CAPTURE = 0x00000200,
     CLIENT_CAPABILITY_TEN_BIT_ENCODING = 0x00000400, // client can decode HEVC Main10
+    CLIENT_CAPABILITY_UDP_AUDIO = 0x00000800, // client plays AudioPacketHeader datagrams on AUDIO_PORT
 };
 
 enum ClientCodecCapabilityFlags : uint32_t

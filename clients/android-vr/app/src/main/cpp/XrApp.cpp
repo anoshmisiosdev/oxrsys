@@ -2827,6 +2827,7 @@ void XrApp::SendClientConnect(const char* serverIp)
         protocol::CLIENT_CAPABILITY_FOVEATED_ENCODING |
         protocol::CLIENT_CAPABILITY_CLIENT_UPSCALING |
         protocol::CLIENT_CAPABILITY_AUDIO_OUTPUT |
+        protocol::CLIENT_CAPABILITY_UDP_AUDIO |
         protocol::CLIENT_CAPABILITY_STREAM_RECONFIGURE;
     if (foveationAvailable_ && foveationConfigurationAvailable_ && swapchainUpdateAvailable_)
     {

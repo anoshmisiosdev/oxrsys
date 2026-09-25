@@ -3033,15 +3033,20 @@ void StreamingServer::SendRenderPosePacket(const EncodedVideoFrame& frame)
                                    sizeof(destAddr));
 }
 
-// ─── Headset audio (USB/TCP) ────────────────────────────────────────────────
-// Tap the game's audio (Core Audio process tap, same process) and stream it as
-// TcpRecordType::Audio records multiplexed over the video TCP socket. USB only
-// for now: over Wi-Fi the video path is UDP and audio would need the separate
-// UDP AudioPacketHeader path, which is not implemented yet.
+// ─── Headset audio ──────────────────────────────────────────────────────────
+// Capture the game's audio (launcher tap ring or loopback device, see
+// AudioCapture) and stream it to the headset:
+//  * USB: TcpRecordType::Audio records multiplexed over the video TCP socket.
+//  * Wi-Fi: AudioPacketHeader datagrams on a dedicated UDP socket to the
+//    client's AUDIO_PORT, for clients advertising CLIENT_CAPABILITY_UDP_AUDIO.
+//    Loss is tolerated (no retransmit); the client's jitter buffer absorbs gaps.
 
 namespace
 {
 constexpr size_t kMaxAudioQueuePackets = 32; // ~ a few hundred ms; drop oldest past this
+// Frames per UDP audio datagram: 160 stereo float frames = 1280 bytes, within
+// MAX_PACKET_PAYLOAD so a datagram never fragments.
+constexpr uint32_t kUdpAudioFramesPerPacket = 160;
 }
 
 void StreamingServer::StartAudioCapture(const oxr::protocol::ClientConnect& clientConnect)
@@ -3051,12 +3056,6 @@ void StreamingServer::StartAudioCapture(const oxr::protocol::ClientConnect& clie
     {
         return;
     }
-    if (!clientUsesUsbAdb_.load())
-    {
-        spdlog::info("StreamingServer: headset audio requested but only supported on "
-                     "USB transport for now; skipping");
-        return;
-    }
     if ((clientConnect.clientCapabilities &
          oxr::protocol::CLIENT_CAPABILITY_AUDIO_OUTPUT) == 0)
     {
@@ -3064,8 +3063,28 @@ void StreamingServer::StartAudioCapture(const oxr::protocol::ClientConnect& clie
                      "advertise AUDIO_OUTPUT; skipping");
         return;
     }
+    const bool usb = clientUsesUsbAdb_.load();
+    if (!usb && (clientConnect.clientCapabilities &
+                 oxr::protocol::CLIENT_CAPABILITY_UDP_AUDIO) == 0)
+    {
+        spdlog::info("StreamingServer: headset audio over Wi-Fi needs a client with "
+                     "UDP audio support; skipping (update the headset app or use USB)");
+        return;
+    }
 
     StopAudioCapture(); // ensure a clean state
+
+    if (!usb)
+    {
+        audioUdpSocket_ = oxrsys::runtime_socket::Create(AF_INET, SOCK_DGRAM, 0);
+        if (!oxrsys::runtime_socket::IsValid(audioUdpSocket_))
+        {
+            spdlog::warn("StreamingServer: could not create UDP audio socket; headset audio off");
+            return;
+        }
+        // Never let a full socket buffer stall the audio thread.
+        oxrsys::runtime_socket::SetNonBlocking(audioUdpSocket_, true);
+    }
 
     audioCapture_ = std::make_unique<oxrsys::AudioCapture>();
     audioActive_.store(true);
@@ -3101,6 +3120,11 @@ void StreamingServer::StopAudioCapture()
     if (audioSendThread_.joinable())
     {
         audioSendThread_.join();
+    }
+    if (oxrsys::runtime_socket::IsValid(audioUdpSocket_))
+    {
+        oxrsys::runtime_socket::Close(audioUdpSocket_);
+        audioUdpSocket_ = oxrsys::runtime_socket::InvalidSocket;
     }
     {
         std::lock_guard<std::mutex> lock(audioQueueMutex_);
@@ -3161,6 +3185,7 @@ void StreamingServer::AudioSendThread()
     oxrsys::runtime_platform::SetCurrentThreadTimeSensitive();
 
     uint32_t sentCount = 0;
+    uint32_t udpAudioSequence = 0;
     float windowPeak = 0.0f;
     while (audioActive_.load() && running_.load())
     {
@@ -3182,18 +3207,25 @@ void StreamingServer::AudioSendThread()
         SocketHandle videoSocket = oxrsys::runtime_socket::InvalidSocket;
         bool videoUsesTcp = false;
         bool accepting = false;
+        std::string clientIp;
         {
             std::lock_guard<std::mutex> lock(packetDispatchState_->mutex);
             accepting = packetDispatchState_->acceptingPackets;
             videoSocket = packetDispatchState_->videoSocket;
             videoUsesTcp = packetDispatchState_->videoUsesTcp;
+            clientIp = packetDispatchState_->clientIp;
         }
-        if (!accepting || !videoUsesTcp ||
-            !oxrsys::runtime_socket::IsValid(videoSocket))
+        if (accepting && !videoUsesTcp && !clientIp.empty() &&
+            oxrsys::runtime_socket::IsValid(audioUdpSocket_))
         {
-            continue; // no TCP audio path right now; drop this buffer
+            SendUdpAudio(packet, clientIp, udpAudioSequence);
         }
-
+        else if (!accepting || !videoUsesTcp ||
+                 !oxrsys::runtime_socket::IsValid(videoSocket))
+        {
+            continue; // no audio path right now; drop this buffer
+        }
+        else
         {
             std::lock_guard<std::mutex> sendLock(packetDispatchState_->sendMutex);
             if (SendTcpRecord(videoSocket, oxr::protocol::TcpRecordType::Audio,
@@ -3222,6 +3254,67 @@ void StreamingServer::AudioSendThread()
             spdlog::info("AudioCapture: {} buffers sent, peak amplitude={:.4f} "
                          "(0 = silence)", sentCount, windowPeak);
             windowPeak = 0.0f;
+        }
+    }
+}
+
+void StreamingServer::SendUdpAudio(const std::vector<uint8_t>& packet,
+                                   const std::string& clientIp, uint32_t& sequence)
+{
+    // packet = TcpAudioHeader + interleaved float PCM (built on the capture path).
+    if (packet.size() < sizeof(oxr::protocol::TcpAudioHeader))
+    {
+        return;
+    }
+    oxr::protocol::TcpAudioHeader tcpHeader = {};
+    memcpy(&tcpHeader, packet.data(), sizeof(tcpHeader));
+    if (tcpHeader.channels == 0)
+    {
+        return;
+    }
+    const float* pcm =
+        reinterpret_cast<const float*>(packet.data() + sizeof(oxr::protocol::TcpAudioHeader));
+    const uint32_t totalFrames = static_cast<uint32_t>(std::min<size_t>(
+        tcpHeader.frameCount,
+        (packet.size() - sizeof(oxr::protocol::TcpAudioHeader)) /
+            (sizeof(float) * tcpHeader.channels)));
+
+    sockaddr_in destAddr = {};
+    destAddr.sin_family = AF_INET;
+    destAddr.sin_port = htons(oxr::protocol::AUDIO_PORT);
+    if (inet_pton(AF_INET, clientIp.c_str(), &destAddr.sin_addr) != 1)
+    {
+        return;
+    }
+
+    const uint32_t framesPerPacket = std::max<uint32_t>(
+        1, std::min<uint32_t>(kUdpAudioFramesPerPacket,
+                              static_cast<uint32_t>(oxr::protocol::MAX_PACKET_PAYLOAD /
+                                                    (sizeof(float) * tcpHeader.channels))));
+    uint8_t datagram[sizeof(oxr::protocol::AudioPacketHeader) + oxr::protocol::MAX_PACKET_PAYLOAD];
+    const int64_t frameDurationNs =
+        tcpHeader.sampleRateHz ? 1000000000ll / tcpHeader.sampleRateHz : 0;
+    for (uint32_t offset = 0; offset < totalFrames; offset += framesPerPacket)
+    {
+        const uint32_t frames = std::min(framesPerPacket, totalFrames - offset);
+        const size_t bytes = static_cast<size_t>(frames) * tcpHeader.channels * sizeof(float);
+        oxr::protocol::AudioPacketHeader header = {};
+        header.presentationTimeNs = tcpHeader.presentationTimeNs + offset * frameDurationNs;
+        header.frameIndex = sequence++;
+        header.frameCount = frames;
+        header.payloadSize = static_cast<uint32_t>(bytes);
+        header.sampleRateHz = tcpHeader.sampleRateHz;
+        header.channels = tcpHeader.channels;
+        header.format = tcpHeader.format;
+        memcpy(datagram, &header, sizeof(header));
+        memcpy(datagram + sizeof(header), pcm + static_cast<size_t>(offset) * tcpHeader.channels,
+               bytes);
+        // Non-blocking: a full socket buffer drops this datagram.
+        if (sendto(audioUdpSocket_, reinterpret_cast<const char*>(datagram),
+                   sizeof(header) + bytes, 0, reinterpret_cast<sockaddr*>(&destAddr),
+                   sizeof(destAddr)) > 0)
+        {
+            audioFramesSent_.fetch_add(1);
         }
     }
 }

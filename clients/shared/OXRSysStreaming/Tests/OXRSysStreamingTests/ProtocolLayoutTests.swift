@@ -22,6 +22,7 @@ final class ProtocolLayoutTests: XCTestCase {
         XCTAssertEqual(ServerFeatureFlags.streamReconfigure, 0x00000010)
         XCTAssertEqual(ClientCapabilityFlags.streamReconfigure, 0x00000010)
         XCTAssertEqual(ClientCapabilityFlags.tenBitEncoding, 0x00000400)
+        XCTAssertEqual(ClientCapabilityFlags.udpAudio, 0x00000800)
         XCTAssertEqual(VideoCodec.h264.rawValue, 1)
         XCTAssertEqual(ClientCodecCapability.h265, 0x00000001)
         XCTAssertEqual(ClientCodecCapability.h264, 0x00000002)

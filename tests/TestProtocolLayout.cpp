@@ -23,6 +23,8 @@ TEST_CASE("C++ protocol layouts match the documented wire format", "[protocol]")
     STATIC_REQUIRE(CLIENT_CODEC_CAPABILITY_H265 == 0x00000001);
     STATIC_REQUIRE(CLIENT_CODEC_CAPABILITY_H264 == 0x00000002);
     STATIC_REQUIRE(CLIENT_CAPABILITY_TEN_BIT_ENCODING == 0x00000400);
+    STATIC_REQUIRE(CLIENT_CAPABILITY_UDP_AUDIO == 0x00000800);
+    STATIC_REQUIRE(sizeof(AudioPacketHeader) == 32);
     STATIC_REQUIRE(sizeof(VideoPacketHeader) == 24);
     STATIC_REQUIRE(offsetof(VideoPacketHeader, fecGroupLastPacketPayloadSize) == 12);
     STATIC_REQUIRE(offsetof(VideoPacketHeader, reserved) == 14);

@@ -86,6 +86,7 @@ private:
     void DiscoveryThread(OnServerFoundCallback callback);
     void ReceiveThread(OnNalUnitCallback callback);
     void ReceiveTcpThread(OnNalUnitCallback callback);
+    void AudioReceiveThread();
     void ReassembleFrame(const protocol::VideoPacketHeader& header,
                          const uint8_t* payload, size_t payloadSize);
     bool TryFecRecovery();
@@ -99,6 +100,9 @@ private:
 
     std::thread discoveryThread_;
     std::thread receiveThread_;
+    // Wi-Fi headset audio: AudioPacketHeader datagrams on AUDIO_PORT.
+    int audioSocket_ = -1;
+    std::thread audioThread_;
     std::atomic<bool> receiving_{false};
     std::atomic<bool> discovering_{false};
 

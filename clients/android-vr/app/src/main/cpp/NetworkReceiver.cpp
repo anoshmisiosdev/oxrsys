@@ -193,7 +193,71 @@ bool NetworkReceiver::StartReceiving(const char* serverIp, uint16_t videoPort,
     receiving_.store(true);
     receiveThread_ = std::thread(&NetworkReceiver::ReceiveThread, this, nalCallback_);
     LOGI("Video receiver started on port %d", videoPort);
+
+    // Headset audio over Wi-Fi (optional: video works without it).
+    audioSocket_ = socket(AF_INET, SOCK_DGRAM, 0);
+    if (audioSocket_ >= 0)
+    {
+        sockaddr_in audioAddr = {};
+        audioAddr.sin_family = AF_INET;
+        audioAddr.sin_port = htons(protocol::AUDIO_PORT);
+        audioAddr.sin_addr.s_addr = INADDR_ANY;
+        if (bind(audioSocket_, (sockaddr*)&audioAddr, sizeof(audioAddr)) == 0)
+        {
+            audioThread_ = std::thread(&NetworkReceiver::AudioReceiveThread, this);
+            LOGI("Audio receiver started on port %d", protocol::AUDIO_PORT);
+        }
+        else
+        {
+            LOGE("Failed to bind audio socket on port %d; Wi-Fi headset audio off",
+                 protocol::AUDIO_PORT);
+            close(audioSocket_);
+            audioSocket_ = -1;
+        }
+    }
     return true;
+}
+
+void NetworkReceiver::AudioReceiveThread()
+{
+    uint8_t buffer[sizeof(protocol::AudioPacketHeader) + protocol::MAX_PACKET_PAYLOAD];
+    timeval tv = {0, 20000}; // 20 ms so Stop() is observed promptly
+    setsockopt(audioSocket_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    uint32_t expectedIndex = 0;
+    uint32_t lost = 0;
+    uint32_t received = 0;
+    while (receiving_.load())
+    {
+        ssize_t bytes = recv(audioSocket_, buffer, sizeof(buffer), 0);
+        if (bytes < (ssize_t)sizeof(protocol::AudioPacketHeader))
+        {
+            continue;
+        }
+        protocol::AudioPacketHeader header = {};
+        memcpy(&header, buffer, sizeof(header));
+        if (header.format != static_cast<uint16_t>(protocol::AudioSampleFormat::Float32) ||
+            header.channels == 0)
+        {
+            continue;
+        }
+        size_t pcmBytes = static_cast<size_t>(bytes) - sizeof(header);
+        if (pcmBytes > header.payloadSize)
+        {
+            pcmBytes = header.payloadSize;
+        }
+        if (received > 0 && header.frameIndex > expectedIndex)
+        {
+            lost += header.frameIndex - expectedIndex;
+        }
+        expectedIndex = header.frameIndex + 1;
+        if (++received % 3000 == 0) // ~10 s at 160 frames/packet
+        {
+            LOGI("Wi-Fi audio: %u packets received, %u lost", received, lost);
+        }
+        audioPlayer_.Write(reinterpret_cast<const float*>(buffer + sizeof(header)),
+                           static_cast<uint32_t>(pcmBytes / sizeof(float)),
+                           header.sampleRateHz, header.channels);
+    }
 }
 
 bool NetworkReceiver::StartReceivingTcp(uint16_t videoPort, OnNalUnitCallback callback,
@@ -758,7 +822,6 @@ void NetworkReceiver::Stop()
 {
     discovering_.store(false);
     receiving_.store(false);
-    audioPlayer_.Stop();
 
     if (discoverySocket_ >= 0)
     {
@@ -779,6 +842,17 @@ void NetworkReceiver::Stop()
     {
         receiveThread_.join();
     }
+    if (audioThread_.joinable())
+    {
+        audioThread_.join();
+    }
+    if (audioSocket_ >= 0)
+    {
+        close(audioSocket_);
+        audioSocket_ = -1;
+    }
+    // After the receive threads (the only AudioPlayer writers) have exited.
+    audioPlayer_.Stop();
 
     {
         std::lock_guard<std::mutex> lock(renderPoseMutex_);

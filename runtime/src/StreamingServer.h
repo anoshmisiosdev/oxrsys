@@ -205,6 +205,8 @@ private:
     void StartAudioCapture(const oxr::protocol::ClientConnect& clientConnect);
     void StopAudioCapture();
     void AudioSendThread();
+    void SendUdpAudio(const std::vector<uint8_t>& packet, const std::string& clientIp,
+                      uint32_t& sequence);
     void EnqueueAudioSamples(const float* data, uint32_t frames,
                              uint32_t sampleRateHz, uint16_t channels);
     bool StartUsbTcpListeners();
@@ -309,6 +311,9 @@ private:
     // Source of the most recent audio buffer: a string literal ("tap",
     // "loopback" or "none") so the status writer can read it lock-free.
     std::atomic<const char*> audioSourceName_{"none"};
+    // Wi-Fi headset audio: dedicated non-blocking UDP socket, owned by
+    // Start/StopAudioCapture and used only by AudioSendThread.
+    SocketHandle audioUdpSocket_ = oxrsys::runtime_socket::InvalidSocket;
     StreamingFrameQueue frameQueue_;
     std::shared_ptr<PacketDispatchState> packetDispatchState_;
     std::atomic<uint32_t> pendingFrameDepthMax_{0};
