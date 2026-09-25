@@ -261,6 +261,16 @@ private:
     SocketHandle broadcastSocket_ = oxrsys::runtime_socket::InvalidSocket;
     SocketHandle controlSocket_ = oxrsys::runtime_socket::InvalidSocket;
     SocketHandle videoSocket_ = oxrsys::runtime_socket::InvalidSocket;
+    // Wi-Fi UDP send socket for the current client, created fresh per
+    // connection and bound to the local address on the client's subnet.
+    // Replaced sockets are retired (closed a few connections later or on
+    // Stop) because the send threads copy the handle outside the lock.
+    std::mutex wifiSendSocketMutex_;
+    SocketHandle wifiVideoSocket_ = oxrsys::runtime_socket::InvalidSocket;
+    uint32_t wifiLocalAddress_ = 0; // network byte order; 0 = unbound
+    std::vector<SocketHandle> retiredWifiSockets_;
+    SocketHandle AcquireWifiVideoSocket(const sockaddr_in& clientAddr);
+    void CloseWifiSendSockets();
     SocketHandle tcpControlListenSocket_ = oxrsys::runtime_socket::InvalidSocket;
     SocketHandle tcpVideoListenSocket_ = oxrsys::runtime_socket::InvalidSocket;
     SocketHandle tcpTrackingListenSocket_ = oxrsys::runtime_socket::InvalidSocket;

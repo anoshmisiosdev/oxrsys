@@ -96,6 +96,28 @@ std::vector<DiscoveryBroadcastTarget> ComputeDiscoveryBroadcastTargets(
     return targets;
 }
 
+uint32_t FindLocalAddressForPeer(const std::vector<Ipv4InterfaceAddress>& interfaces,
+                                 uint32_t peer)
+{
+    for (const Ipv4InterfaceAddress& iface : interfaces)
+    {
+        const unsigned int required = IFF_UP | IFF_RUNNING;
+        if ((iface.flags & required) != required || (iface.flags & IFF_LOOPBACK) != 0)
+        {
+            continue;
+        }
+        if (!IsUsableUnicast(iface.address) || iface.netmask == 0 || peer == iface.address)
+        {
+            continue;
+        }
+        if ((iface.address & iface.netmask) == (peer & iface.netmask))
+        {
+            return iface.address;
+        }
+    }
+    return 0;
+}
+
 std::vector<Ipv4InterfaceAddress> EnumerateIpv4Interfaces()
 {
     std::vector<Ipv4InterfaceAddress> result;

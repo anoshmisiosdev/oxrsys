@@ -850,6 +850,7 @@ bool StreamingServer::Stop(std::chrono::nanoseconds timeout)
     oxrsys::runtime_socket::Close(broadcastSocket_);
     oxrsys::runtime_socket::Close(controlSocket_);
     oxrsys::runtime_socket::Close(videoSocket_);
+    CloseWifiSendSockets();
 
     {
         std::lock_guard<std::mutex> broadcastLock(broadcastThreadMutex_);
@@ -1872,10 +1873,11 @@ void StreamingServer::HandleClientConnect(const oxr::protocol::ClientConnect& cl
         spdlog::warn("StreamingServer: client '{}' did not advertise passthrough support; app alpha/source-alpha frames will be streamed without headset passthrough",
                      clientName);
     }
+    const SocketHandle wifiSocket = AcquireWifiVideoSocket(clientAddr);
     {
         std::lock_guard<std::mutex> lock(packetDispatchState_->mutex);
         packetDispatchState_->clientIp = ipStr;
-        packetDispatchState_->videoSocket = videoSocket_;
+        packetDispatchState_->videoSocket = wifiSocket;
         packetDispatchState_->videoUsesTcp = false;
         packetDispatchState_->acceptingPackets = true;
     }
@@ -3226,6 +3228,23 @@ void StreamingServer::StartAudioCapture(const oxr::protocol::ClientConnect& clie
         }
         // Never let a full socket buffer stall the audio thread.
         oxrsys::runtime_socket::SetNonBlocking(audioUdpSocket_, true);
+        // Send from the address on the client's subnet, like the video socket.
+        uint32_t localAddress = 0;
+        {
+            std::lock_guard<std::mutex> lock(wifiSendSocketMutex_);
+            localAddress = wifiLocalAddress_;
+        }
+        if (localAddress != 0)
+        {
+            sockaddr_in local = {};
+            local.sin_family = AF_INET;
+            local.sin_addr.s_addr = localAddress;
+            if (bind(audioUdpSocket_, reinterpret_cast<const sockaddr*>(&local), sizeof(local)) < 0)
+            {
+                spdlog::warn("StreamingServer: could not bind UDP audio socket to the client's "
+                             "subnet address: {}", oxrsys::runtime_socket::LastErrorText());
+            }
+        }
     }
 
     audioCapture_ = std::make_unique<oxrsys::AudioCapture>();
@@ -3854,6 +3873,83 @@ void StreamingServer::HandleNackRequest(const oxr::protocol::NackRequest& reques
                       retransmitted, std::popcount(request.missingBitmask),
                       request.frameIndex);
     }
+}
+
+SocketHandle StreamingServer::AcquireWifiVideoSocket(const sockaddr_in& clientAddr)
+{
+    // A fresh socket per Wi-Fi connection, bound to the local address on the
+    // client's subnet. On a multi-homed Mac this pins the source address the
+    // client expects; it also avoids reusing a long-lived socket whose sends
+    // were rejected (observed as EHOSTUNREACH on every datagram from a Wine
+    // host process while the per-interface bound discovery sockets worked).
+    const uint32_t localAddress =
+        oxrsys::FindLocalAddressForPeer(oxrsys::EnumerateIpv4Interfaces(),
+                                        clientAddr.sin_addr.s_addr);
+    SocketHandle socket = oxrsys::runtime_socket::Create(AF_INET, SOCK_DGRAM, 0);
+    if (!oxrsys::runtime_socket::IsValid(socket))
+    {
+        spdlog::warn("StreamingServer: could not create Wi-Fi video socket ({}); using the shared one",
+                     oxrsys::runtime_socket::LastErrorText());
+        return videoSocket_;
+    }
+    oxrsys::runtime_socket::SetSendBuffer(socket, 4 * 1024 * 1024);
+
+    char clientText[INET_ADDRSTRLEN] = {};
+    inet_ntop(AF_INET, &clientAddr.sin_addr, clientText, sizeof(clientText));
+    uint32_t boundAddress = 0;
+    if (localAddress != 0)
+    {
+        sockaddr_in local = {};
+        local.sin_family = AF_INET;
+        local.sin_addr.s_addr = localAddress;
+        char localText[INET_ADDRSTRLEN] = {};
+        inet_ntop(AF_INET, &local.sin_addr, localText, sizeof(localText));
+        if (bind(socket, reinterpret_cast<const sockaddr*>(&local), sizeof(local)) == 0)
+        {
+            boundAddress = localAddress;
+            spdlog::info("StreamingServer: Wi-Fi video/audio for {} sent from {}", clientText,
+                         localText);
+        }
+        else
+        {
+            spdlog::warn("StreamingServer: could not bind Wi-Fi video socket to {} ({}); sending unbound",
+                         localText, oxrsys::runtime_socket::LastErrorText());
+        }
+    }
+    else
+    {
+        spdlog::info("StreamingServer: no local interface shares a subnet with {}; Wi-Fi video "
+                     "socket left unbound (routed)", clientText);
+    }
+
+    std::lock_guard<std::mutex> lock(wifiSendSocketMutex_);
+    if (oxrsys::runtime_socket::IsValid(wifiVideoSocket_))
+    {
+        retiredWifiSockets_.push_back(wifiVideoSocket_);
+    }
+    // Keep a few retired sockets open: a send thread may still hold a copied
+    // handle for the frame in flight. Older ones are long unused.
+    constexpr size_t kMaxRetiredWifiSockets = 4;
+    while (retiredWifiSockets_.size() > kMaxRetiredWifiSockets)
+    {
+        oxrsys::runtime_socket::Close(retiredWifiSockets_.front());
+        retiredWifiSockets_.erase(retiredWifiSockets_.begin());
+    }
+    wifiVideoSocket_ = socket;
+    wifiLocalAddress_ = boundAddress;
+    return socket;
+}
+
+void StreamingServer::CloseWifiSendSockets()
+{
+    std::lock_guard<std::mutex> lock(wifiSendSocketMutex_);
+    oxrsys::runtime_socket::Close(wifiVideoSocket_);
+    for (SocketHandle& socket : retiredWifiSockets_)
+    {
+        oxrsys::runtime_socket::Close(socket);
+    }
+    retiredWifiSockets_.clear();
+    wifiLocalAddress_ = 0;
 }
 
 std::string StreamingServer::GetClientName() const

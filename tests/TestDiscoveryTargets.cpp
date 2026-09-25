@@ -98,3 +98,18 @@ TEST_CASE("Discovery targets: live enumeration never yields loopback", "[discove
         CHECK(target.broadcastAddress != target.localAddress);
     }
 }
+
+TEST_CASE("Discovery targets: local address for a peer follows its subnet", "[discovery]")
+{
+    const std::vector<Ipv4InterfaceAddress> interfaces = {
+        Iface("lo0", "127.0.0.1", "255.0.0.0", nullptr, IFF_UP | IFF_RUNNING | IFF_LOOPBACK),
+        Iface("en12", "10.56.18.0", "255.255.252.0", "10.56.19.255"),
+        Iface("bridge100", "192.168.2.1", "255.255.255.0", "192.168.2.255"),
+        Iface("en7", "172.20.0.5", "255.255.0.0", "172.20.255.255", IFF_BROADCAST), // down
+    };
+    CHECK(oxrsys::FindLocalAddressForPeer(interfaces, Ip("192.168.2.5")) == Ip("192.168.2.1"));
+    CHECK(oxrsys::FindLocalAddressForPeer(interfaces, Ip("10.56.17.9")) == Ip("10.56.18.0"));
+    CHECK(oxrsys::FindLocalAddressForPeer(interfaces, Ip("172.20.0.9")) == 0);
+    CHECK(oxrsys::FindLocalAddressForPeer(interfaces, Ip("8.8.8.8")) == 0);
+    CHECK(oxrsys::FindLocalAddressForPeer(interfaces, Ip("127.0.0.1")) == 0);
+}

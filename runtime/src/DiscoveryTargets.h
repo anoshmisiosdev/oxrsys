@@ -49,6 +49,12 @@ std::vector<DiscoveryBroadcastTarget> ComputeDiscoveryBroadcastTargets(
 // Enumerates the host's IPv4 interface addresses via getifaddrs().
 std::vector<Ipv4InterfaceAddress> EnumerateIpv4Interfaces();
 
+// Pure: the local interface address on the same IPv4 subnet as `peer` (all
+// network byte order), considering only up+running, non-loopback interfaces.
+// Returns 0 when no interface subnet contains the peer (e.g. routed peer).
+uint32_t FindLocalAddressForPeer(const std::vector<Ipv4InterfaceAddress>& interfaces,
+                                 uint32_t peer);
+
 // "en0 192.168.2.1 -> 192.168.2.255, en12 ..." for logging.
 std::string DescribeDiscoveryTargets(const std::vector<DiscoveryBroadcastTarget>& targets);
 
