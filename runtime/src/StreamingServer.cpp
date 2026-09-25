@@ -74,10 +74,14 @@ int SendUdpCounted(SocketHandle socket, const void* data, size_t size, int flags
             }
             if (error == EHOSTUNREACH)
             {
-                spdlog::warn("StreamingServer: UDP sends to {} are failing (errno {}: {}). On macOS "
-                             "this is almost always Local Network privacy denying the app hosting "
-                             "the runtime: enable it in System Settings > Privacy & Security > "
-                             "Local Network (e.g. CrossOver/Steam for Wine games), then relaunch it",
+                spdlog::warn("StreamingServer: UDP sends to {} are failing (errno {}: {}), so the "
+                             "headset gets no Wi-Fi video/audio. On macOS this is almost always "
+                             "Local Network privacy denying the app the game runs under. For Wine "
+                             "games that is a CrossOver helper identity: every "
+                             "~/Applications/CrossOver/<bottle>/*.app menu helper shares one "
+                             "executable UUID, so a single denied entry (e.g. 'SteamVR') blocks "
+                             "them all. Turn every CrossOver-created entry ON in System Settings > "
+                             "Privacy & Security > Local Network, then relaunch the game",
                              destText, error, std::strerror(error));
             }
             else
