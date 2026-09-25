@@ -200,6 +200,7 @@ add_executable(oxrsys_runtime_tests
     tests/TestBoundedDrain.cpp
     tests/TestClientLiveness.cpp
     tests/TestConfig.cpp
+    tests/TestDiscoveryTargets.cpp
     tests/TestControllerVelocity.cpp
     tests/TestEncoderHelperIpc.cpp
     tests/TestEncoderPathPolicy.cpp
@@ -230,6 +231,7 @@ add_executable(oxrsys_runtime_tests
     runtime/src/Config.cpp
     runtime/src/RuntimePlatform.cpp
     runtime/src/RuntimeSockets.cpp
+    runtime/src/DiscoveryTargets.cpp
     runtime/src/StreamingFrameQueue.cpp
     runtime/src/VideoCodecSelection.cpp
     runtime/src/EncoderPathPolicy.cpp

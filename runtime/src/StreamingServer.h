@@ -168,7 +168,6 @@ private:
     void TcpVideoThread();
     void TcpTrackingThread();
     void TcpSpatialThread();
-    std::string GetLocalIpAddress() const;
     oxr::protocol::ServerAnnounce BuildServerAnnounce(bool reliableControlTransport) const;
     void ReleaseStreamingFrame(StreamingFrame& frame);
     void HandleClientConnect(const oxr::protocol::ClientConnect& clientConnect,

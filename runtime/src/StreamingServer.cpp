@@ -3,6 +3,7 @@
 #include "StreamingServer.h"
 #include "ClientLiveness.h"
 #include "Config.h"
+#include "DiscoveryTargets.h"
 #include "RuntimePlatform.h"
 #include "RuntimeSockets.h"
 #include "RuntimeStatus.h"
@@ -29,7 +30,6 @@
 #include <thread>
 #include <utility>
 
-#include <ifaddrs.h>
 #include <net/if.h>
 
 namespace
@@ -753,10 +753,11 @@ bool StreamingServer::Start(uint32_t renderWidth, uint32_t renderHeight, uint32_
     videoSendThread_ = std::thread(&StreamingServer::VideoSendThread, this);
     encodeThread_ = std::thread(&StreamingServer::EncodeThread, this);
 
-    std::string ip = GetLocalIpAddress();
+    const std::string interfaces = oxrsys::DescribeDiscoveryTargets(
+        oxrsys::ComputeDiscoveryBroadcastTargets(oxrsys::EnumerateIpv4Interfaces()));
     spdlog::info("StreamingServer: Started transport={} wifi={} usb_adb={} on {} ({}x{} @ {}Hz)",
                   config.streamingTransport, wifiEnabled_, usbAdbEnabled_,
-                  ip, renderWidth_, renderHeight_, refreshRateHz_);
+                  interfaces, renderWidth_, renderHeight_, refreshRateHz_);
     return true;
 }
 
@@ -838,9 +839,6 @@ void StreamingServer::BroadcastThread()
 {
     oxr::protocol::ServerAnnounce announce = BuildServerAnnounce(false);
 
-    // Beacon to the subnet broadcast and to loopback: macOS does not loop a
-    // 255.255.255.255 broadcast back to local listeners, so a same-machine
-    // client (e.g. the simulator) needs the explicit loopback copy.
     auto makeTarget = [](uint32_t addr) {
         sockaddr_in sa = {};
         sa.sin_family = AF_INET;
@@ -848,14 +846,97 @@ void StreamingServer::BroadcastThread()
         sa.sin_addr.s_addr = addr;
         return sa;
     };
-    const sockaddr_in targets[] = {
+
+    // The limited broadcast (255.255.255.255) only leaves through the
+    // default-route interface on macOS, so a Mac with several interfaces
+    // (e.g. wired uplink + Internet Sharing hotspot on bridge100) would never
+    // reach clients on the non-default subnets. Beacon to every interface's
+    // directed broadcast address from a socket bound to that interface's own
+    // address: the client connects to the announce's source address, which is
+    // then guaranteed to be on its subnet. The limited broadcast is kept as a
+    // harmless extra, plus loopback because macOS does not loop broadcasts back
+    // to local listeners (simulator on the same machine).
+    struct BoundTarget
+    {
+        oxrsys::DiscoveryBroadcastTarget target;
+        SocketHandle socket = oxrsys::runtime_socket::InvalidSocket;
+    };
+    std::vector<BoundTarget> boundTargets;
+    std::vector<oxrsys::DiscoveryBroadcastTarget> currentTargets;
+    bool firstEnumeration = true;
+
+    auto closeBoundTargets = [&boundTargets]() {
+        for (BoundTarget& bound : boundTargets)
+        {
+            oxrsys::runtime_socket::Close(bound.socket);
+        }
+        boundTargets.clear();
+    };
+
+    auto refreshTargets = [&]() {
+        std::vector<oxrsys::DiscoveryBroadcastTarget> targets =
+            oxrsys::ComputeDiscoveryBroadcastTargets(oxrsys::EnumerateIpv4Interfaces());
+        if (!firstEnumeration && targets == currentTargets)
+        {
+            return;
+        }
+        firstEnumeration = false;
+        closeBoundTargets();
+        currentTargets = targets;
+        for (const oxrsys::DiscoveryBroadcastTarget& target : targets)
+        {
+            BoundTarget bound;
+            bound.target = target;
+            bound.socket = oxrsys::runtime_socket::Create(AF_INET, SOCK_DGRAM, 0);
+            if (!oxrsys::runtime_socket::IsValid(bound.socket))
+            {
+                continue;
+            }
+            oxrsys::runtime_socket::SetBroadcast(bound.socket);
+            sockaddr_in local = {};
+            local.sin_family = AF_INET;
+            local.sin_port = 0;
+            local.sin_addr.s_addr = target.localAddress;
+            if (bind(bound.socket, reinterpret_cast<const sockaddr*>(&local), sizeof(local)) < 0)
+            {
+                spdlog::warn("StreamingServer: discovery bind to {} failed: {}",
+                             oxrsys::DescribeDiscoveryTargets({target}),
+                             oxrsys::runtime_socket::LastErrorText());
+                oxrsys::runtime_socket::Close(bound.socket);
+                continue;
+            }
+            boundTargets.push_back(bound);
+        }
+        spdlog::info("StreamingServer: Wi-Fi discovery announcing on {} (+255.255.255.255, loopback)",
+                     oxrsys::DescribeDiscoveryTargets(currentTargets));
+    };
+
+    const sockaddr_in fallbackTargets[] = {
         makeTarget(INADDR_BROADCAST),
         makeTarget(htonl(INADDR_LOOPBACK)),
     };
 
+    constexpr int kReenumerateEveryBeacons = 5; // beacons are ~1 s apart
+    int beaconCount = 0;
     while (running_.load() && state_.load() == State::Broadcasting)
     {
-        for (const sockaddr_in& target : targets)
+        if (beaconCount % kReenumerateEveryBeacons == 0)
+        {
+            refreshTargets();
+        }
+        ++beaconCount;
+
+        for (const BoundTarget& bound : boundTargets)
+        {
+            const sockaddr_in target = makeTarget(bound.target.broadcastAddress);
+            oxrsys::runtime_socket::SendTo(bound.socket,
+                                           &announce,
+                                           sizeof(announce),
+                                           0,
+                                           (const sockaddr*)&target,
+                                           sizeof(target));
+        }
+        for (const sockaddr_in& target : fallbackTargets)
         {
             oxrsys::runtime_socket::SendTo(broadcastSocket_,
                                            &announce,
@@ -871,6 +952,7 @@ void StreamingServer::BroadcastThread()
         }
     }
 
+    closeBoundTargets();
     spdlog::info("StreamingServer: Broadcast thread ended");
 }
 
@@ -3721,42 +3803,3 @@ std::string StreamingServer::GetClientName() const
     return clientName_;
 }
 
-std::string StreamingServer::GetLocalIpAddress() const
-{
-    struct ifaddrs* ifas = nullptr;
-    if (getifaddrs(&ifas) != 0)
-    {
-        return "0.0.0.0";
-    }
-
-    std::string result = "0.0.0.0";
-    for (struct ifaddrs* ifa = ifas; ifa != nullptr; ifa = ifa->ifa_next)
-    {
-        if (ifa->ifa_addr == nullptr || ifa->ifa_addr->sa_family != AF_INET)
-        {
-            continue;
-        }
-        if (ifa->ifa_flags & IFF_LOOPBACK)
-        {
-            continue;
-        }
-
-        auto* addr = reinterpret_cast<sockaddr_in*>(ifa->ifa_addr);
-        char ipStr[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &addr->sin_addr, ipStr, sizeof(ipStr));
-
-        std::string ifName(ifa->ifa_name);
-        if (ifName == "en0")
-        {
-            result = ipStr;
-            break;
-        }
-        if (result == "0.0.0.0")
-        {
-            result = ipStr;
-        }
-    }
-
-    freeifaddrs(ifas);
-    return result;
-}
